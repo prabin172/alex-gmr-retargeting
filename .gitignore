@@ -1,0 +1,59 @@
+__pycache__/
+*.pyc
+.venv/
+
+data/
+outputs/
+
+*.npz
+*.npy
+*.pkl
+*.mp4
+*.gif
+*.log
+# ==============================
+# Python / environment artifacts
+# ==============================
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local virtual/conda environments
+.venv/
+venv/
+env/
+*.env
+
+# ==============================
+# Temporary local experiment code
+# ==============================
+temp_codes/
+scripts/temp_*.py
+
+# ==============================
+# Outputs / generated files
+# ==============================
+outputs/
+data/processed/
+data/source_motions/
+data/*.npz
+*.npz
+*.pkl
+*.mp4
+*.avi
+*.mov
+*.log
+
+# ==============================
+# Alex / IHMC internal assets
+# Do NOT commit generated/copy-local robot assets.
+# Keep only README/.gitkeep placeholders.
+# ==============================
+assets/alex/*
+!assets/alex/README.md
+!assets/alex/.gitkeep
