@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -36,6 +36,25 @@ MVNX_TO_CANONICAL_SEGMENT = {
 }
 
 
+# Xsens MVNX global frame observed in VTech NMP preview:
+#   left/right separation is mostly MVNX X, with left at negative X.
+# Canonical frame used by this repo:
+#   +X forward, +Y left, +Z up.
+#
+# This maps:
+#   canonical X = MVNX Y
+#   canonical Y = -MVNX X
+#   canonical Z = MVNX Z
+MVNX_ZUP_TO_CANONICAL_R = np.array(
+    [
+        [0.0, 1.0, 0.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ],
+    dtype=float,
+)
+
+
 def strip_ns(tag: str) -> str:
     if "}" in tag:
         return tag.split("}", 1)[1]
@@ -52,6 +71,71 @@ def floats_from_text(text: Optional[str]) -> List[float]:
         except ValueError:
             pass
     return out
+
+
+def normalize_quat_wxyz(q: np.ndarray) -> np.ndarray:
+    q = np.asarray(q, dtype=float)
+    n = float(np.linalg.norm(q))
+    if n < 1e-12:
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+    q = q / n
+    if q[0] < 0:
+        q = -q
+    return q
+
+
+def quat_wxyz_to_matrix(q: np.ndarray) -> np.ndarray:
+    w, x, y, z = normalize_quat_wxyz(q)
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=float,
+    )
+
+
+def matrix_to_quat_wxyz(r: np.ndarray) -> np.ndarray:
+    r = np.asarray(r, dtype=float)
+    trace = float(np.trace(r))
+
+    if trace > 0.0:
+        s = np.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * s
+        x = (r[2, 1] - r[1, 2]) / s
+        y = (r[0, 2] - r[2, 0]) / s
+        z = (r[1, 0] - r[0, 1]) / s
+    elif r[0, 0] > r[1, 1] and r[0, 0] > r[2, 2]:
+        s = np.sqrt(1.0 + r[0, 0] - r[1, 1] - r[2, 2]) * 2.0
+        w = (r[2, 1] - r[1, 2]) / s
+        x = 0.25 * s
+        y = (r[0, 1] + r[1, 0]) / s
+        z = (r[0, 2] + r[2, 0]) / s
+    elif r[1, 1] > r[2, 2]:
+        s = np.sqrt(1.0 + r[1, 1] - r[0, 0] - r[2, 2]) * 2.0
+        w = (r[0, 2] - r[2, 0]) / s
+        x = (r[0, 1] + r[1, 0]) / s
+        y = 0.25 * s
+        z = (r[1, 2] + r[2, 1]) / s
+    else:
+        s = np.sqrt(1.0 + r[2, 2] - r[0, 0] - r[1, 1]) * 2.0
+        w = (r[1, 0] - r[0, 1]) / s
+        x = (r[0, 2] + r[2, 0]) / s
+        y = (r[1, 2] + r[2, 1]) / s
+        z = 0.25 * s
+
+    return normalize_quat_wxyz(np.array([w, x, y, z], dtype=float))
+
+
+def mvnx_position_to_canonical(pos: np.ndarray) -> np.ndarray:
+    return MVNX_ZUP_TO_CANONICAL_R @ np.asarray(pos, dtype=float)
+
+
+def mvnx_quat_to_canonical(quat_wxyz: np.ndarray) -> np.ndarray:
+    old_r = quat_wxyz_to_matrix(quat_wxyz)
+    new_r = MVNX_ZUP_TO_CANONICAL_R @ old_r
+    return matrix_to_quat_wxyz(new_r)
 
 
 def read_mvnx_header(mvnx_path: Path) -> dict:
@@ -108,6 +192,7 @@ def read_mvnx_header(mvnx_path: Path) -> dict:
         "frame_rate": frame_rate,
     }
 
+
 def iter_mvnx_raw_frames(
     mvnx_path: Path,
     frame_type: str = "normal",
@@ -128,12 +213,11 @@ def iter_mvnx_raw_frames(
 
     for event, elem in ET.iterparse(mvnx_path, events=("end",)):
         tag = strip_ns(elem.tag)
+
         if tag != "frame":
-            # Do not clear child elements here.
-            # In iterparse, <position> and <orientation> reach their "end"
-            # event before the enclosing <frame>. If we clear them now,
-            # the parent frame will later see empty text.
-            # Clearing the whole <frame> after processing is enough.
+            # Do not clear child elements here. In iterparse, <position> and
+            # <orientation> end before their parent <frame>. Clearing them here
+            # would erase the text before the frame is processed.
             continue
 
         current_type = elem.attrib.get("type", "normal")
@@ -168,7 +252,11 @@ def iter_mvnx_raw_frames(
             break
 
 
-def raw_frame_to_segment_arrays(raw_frame: dict, segment_labels: List[str]) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+def raw_frame_to_segment_arrays(
+    raw_frame: dict,
+    segment_labels: List[str],
+    canonicalize_axes: bool = True,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
     values = raw_frame["values"]
     n_segments = len(segment_labels)
 
@@ -195,8 +283,17 @@ def raw_frame_to_segment_arrays(raw_frame: dict, segment_labels: List[str]) -> T
     orientations = {}
 
     for i, label in enumerate(segment_labels):
-        positions[label] = pos_arr[i]
-        orientations[label] = quat_arr[i]
+        pos = pos_arr[i]
+        quat = quat_arr[i]
+
+        if canonicalize_axes:
+            pos = mvnx_position_to_canonical(pos)
+            quat = mvnx_quat_to_canonical(quat)
+        else:
+            quat = normalize_quat_wxyz(quat)
+
+        positions[label] = pos
+        orientations[label] = quat
 
     return positions, orientations
 
@@ -205,8 +302,13 @@ def mvnx_raw_frame_to_canonical(
     raw_frame: dict,
     segment_labels: List[str],
     mapping: Dict[str, str] = MVNX_TO_CANONICAL_SEGMENT,
+    canonicalize_axes: bool = True,
 ) -> CanonicalHumanFrame:
-    positions, orientations = raw_frame_to_segment_arrays(raw_frame, segment_labels)
+    positions, orientations = raw_frame_to_segment_arrays(
+        raw_frame=raw_frame,
+        segment_labels=segment_labels,
+        canonicalize_axes=canonicalize_axes,
+    )
 
     frame: CanonicalHumanFrame = {}
 
@@ -223,8 +325,6 @@ def mvnx_raw_frame_to_canonical(
         pos = positions[mvnx_segment]
         quat = orientations[mvnx_segment]
 
-        # MVNX orientations are quaternion values in wxyz order in this file:
-        # identity frame starts as [1, 0, 0, 0].
         frame[canonical_name] = {
             "pos": [float(x) for x in pos],
             "quat_wxyz": [float(x) for x in quat],
@@ -240,6 +340,7 @@ def read_mvnx_canonical_frames(
     start_frame: int = 0,
     stride: int = 1,
     max_frames: Optional[int] = None,
+    canonicalize_axes: bool = True,
 ) -> Tuple[List[CanonicalHumanFrame], dict]:
     header = read_mvnx_header(mvnx_path)
     segment_labels = header["segment_labels"]
@@ -254,7 +355,13 @@ def read_mvnx_canonical_frames(
         stride=stride,
         max_frames=max_frames,
     ):
-        frames.append(mvnx_raw_frame_to_canonical(raw_frame, segment_labels))
+        frames.append(
+            mvnx_raw_frame_to_canonical(
+                raw_frame=raw_frame,
+                segment_labels=segment_labels,
+                canonicalize_axes=canonicalize_axes,
+            )
+        )
         raw_indices.append(raw_frame["matched_frame_index"])
 
     metadata = {
@@ -265,10 +372,11 @@ def read_mvnx_canonical_frames(
         "max_frames": max_frames,
         "loaded_frames": len(frames),
         "matched_frame_indices": raw_indices,
+        "canonicalize_axes": canonicalize_axes,
         "coordinate_assumption": {
-            "x": "forward",
-            "y": "left",
-            "z": "up",
+            "source_mvnx": "observed VTech MVNX: +X roughly subject-right, +Z up",
+            "canonical": "+X forward, +Y left, +Z up",
+            "position_mapping": "canonical_xyz = [mvnx_y, -mvnx_x, mvnx_z]",
             "units": "meters",
             "quat_order": "wxyz",
         },
