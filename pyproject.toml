@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alex-gmr-retargeting"
+version = "0.1.0"
+description = "Alex-first humanoid motion retargeting utilities built around MuJoCo/GMR-style IK."
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+include = ["general_motion_retargeting*"]
