@@ -41,6 +41,7 @@ scripts/temp_*.py
 outputs/
 data/processed/
 data/source_motions/
+data/raw/
 data/*.npz
 *.npz
 *.pkl
