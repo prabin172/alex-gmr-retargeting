@@ -390,6 +390,90 @@ def apply_human_orientation_costs_to_tasks(tasks, roles, args):
     return applied
 
 
+def joint_qpos_width(model, joint_id):
+    joint_type = int(model.jnt_type[joint_id])
+    if joint_type == int(mujoco.mjtJoint.mjJNT_FREE):
+        return 7
+    if joint_type == int(mujoco.mjtJoint.mjJNT_BALL):
+        return 4
+    return 1
+
+
+def output_step_cap_for_joint_name(name, args):
+    """Return the configured output-frame cap for an Alex joint, or None."""
+    upper = name.upper()
+    if "SPINE" in upper or "NECK" in upper:
+        return args.max_spine_neck_step_rad
+    if "HIP" in upper or "KNEE" in upper or "ANKLE" in upper:
+        return args.max_leg_step_rad
+    if any(token in upper for token in ("SHOULDER", "ELBOW", "WRIST", "GRIPPER", "FINGER", "THUMB", "INDEX", "MIDDLE", "RING", "PINKY")):
+        return args.max_arm_step_rad
+    return args.max_other_step_rad
+
+
+def build_output_joint_step_caps(model, joint_names, args):
+    """Build an nq-sized cap vector; inf means no output-frame cap."""
+    caps = np.full(model.nq, np.inf, dtype=float)
+    for name in joint_names:
+        cap = output_step_cap_for_joint_name(name, args)
+        if cap is None or cap <= 0.0:
+            continue
+        joint_id = model.joint(name).id
+        qpos_adr = int(model.jnt_qposadr[joint_id])
+        qpos_width = joint_qpos_width(model, joint_id)
+        caps[qpos_adr:qpos_adr + qpos_width] = float(cap)
+    return caps if np.any(np.isfinite(caps)) else None
+
+
+def build_output_joint_velocity_limit(model, joint_names, output_joint_step_caps, max_iter):
+    """
+    Convert output-frame step caps into conservative per-QP velocity limits.
+
+    solve_frame integrates ``max_iter`` steps of size model.opt.timestep. A
+    cap of d radians per 30 Hz output frame therefore maps to d / (N * dt)
+    rad/s inside each QP. This makes intermediate candidates available for the
+    temporal selector instead of letting the first QP step leap past the cap.
+    """
+    if output_joint_step_caps is None:
+        return None, {}
+    if max_iter <= 0:
+        raise ValueError("max_iter must be positive when output-frame caps are enabled")
+
+    velocities = {}
+    for name in joint_names:
+        joint_id = model.joint(name).id
+        if joint_qpos_width(model, joint_id) != 1:
+            continue
+        qpos_adr = int(model.jnt_qposadr[joint_id])
+        cap = float(output_joint_step_caps[qpos_adr])
+        if np.isfinite(cap):
+            velocities[name] = cap / (float(max_iter) * float(model.opt.timestep))
+
+    if not velocities:
+        return None, {}
+    return S.mink.VelocityLimit(model, velocities=velocities), velocities
+
+
+def joint_limit_margins(model, qpos, joint_names):
+    """Return lower, upper, and nearest-limit margins for the requested joints."""
+    lower = np.full(len(joint_names), np.inf, dtype=float)
+    upper = np.full(len(joint_names), np.inf, dtype=float)
+
+    for index, name in enumerate(joint_names):
+        joint_id = model.joint(name).id
+        if not bool(model.jnt_limited[joint_id]):
+            continue
+        if joint_qpos_width(model, joint_id) != 1:
+            continue
+        qpos_adr = int(model.jnt_qposadr[joint_id])
+        value = float(qpos[qpos_adr])
+        qmin, qmax = np.asarray(model.jnt_range[joint_id], dtype=float)
+        lower[index] = value - qmin
+        upper[index] = qmax - value
+
+    return lower, upper, np.minimum(lower, upper)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Retarget canonical human role positions to Alex IK.")
     parser.add_argument("canonical_npz", type=Path)
@@ -402,6 +486,31 @@ def main():
     parser.add_argument("--stride", type=int, default=4)
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--max-ik-iter", type=int, default=50)
+
+    parser.add_argument(
+        "--candidate-selection",
+        choices=["position_only", "position_tiebreak", "combined"],
+        default="position_only",
+        help="How to select among inner IK iterates. position_only preserves the baseline.",
+    )
+    parser.add_argument(
+        "--candidate-position-tolerance",
+        type=float,
+        default=0.0,
+        help="Relative position-score tolerance for position_tiebreak, e.g. 0.05 for 5%%.",
+    )
+    parser.add_argument("--candidate-orientation-weight", type=float, default=1.0)
+    parser.add_argument("--candidate-temporal-weight", type=float, default=1.0)
+    parser.add_argument("--max-leg-step-rad", type=float, default=None)
+    parser.add_argument("--max-spine-neck-step-rad", type=float, default=None)
+    parser.add_argument("--max-arm-step-rad", type=float, default=None)
+    parser.add_argument("--max-other-step-rad", type=float, default=None)
+    parser.add_argument(
+        "--joint-limit-warning-margin-rad",
+        type=float,
+        default=0.05,
+        help="Report output frames with a joint this close to a hard position limit.",
+    )
 
     parser.add_argument("--posture-cost", type=float, default=0.0)
     parser.add_argument("--posture-neutral-blend", type=float, default=0.02)
@@ -525,6 +634,33 @@ def main():
 
     limits = [S.mink.ConfigurationLimit(model)]
     tasks = S.make_tasks(model, robot_cfg)
+    output_joint_step_caps = build_output_joint_step_caps(
+        model,
+        robot_cfg["actuated_joint_order"],
+        args,
+    )
+    output_joint_velocity_limit, output_joint_velocity_limits = build_output_joint_velocity_limit(
+        model,
+        robot_cfg["actuated_joint_order"],
+        output_joint_step_caps,
+        args.max_ik_iter,
+    )
+    motion_limits = list(limits)
+    if output_joint_velocity_limit is not None:
+        motion_limits.append(output_joint_velocity_limit)
+    if output_joint_step_caps is not None:
+        capped = []
+        for name in robot_cfg["actuated_joint_order"]:
+            joint_id = model.joint(name).id
+            qpos_adr = int(model.jnt_qposadr[joint_id])
+            cap = output_joint_step_caps[qpos_adr]
+            if np.isfinite(cap):
+                capped.append(f"{name}={cap:.3f}")
+        print("Output-frame joint-step caps (rad):", ", ".join(capped))
+        print(
+            "Derived inner-QP velocity limits (rad/s):",
+            ", ".join(f"{name}={value:.3f}" for name, value in output_joint_velocity_limits.items()),
+        )
     human_orientation_roles = [r.strip() for r in args.human_orientation_roles.split(",") if r.strip()]
     human_orientation_costs = {}
 
@@ -644,6 +780,10 @@ def main():
     solved_ik_positions = []
     target_orientations_wxyz = []
     solved_ik_orientations_wxyz = []
+    joint_limit_lower_margins = []
+    joint_limit_upper_margins = []
+    joint_limit_nearest_margins_by_frame = []
+    selection_diagnostics = []
 
     for frame_idx, source_frame in enumerate(source_frames):
         if args.target_generation == "morphology-delta":
@@ -699,15 +839,21 @@ def main():
             )
             S.set_posture_target(posture_task, configuration, q_ref)
 
-        qpos, score, errors, solved_positions = S.solve_frame(
+        qpos, score, errors, solved_positions, selection_info = S.solve_frame(
             model=model,
             configuration=configuration,
             tasks=tasks,
             target_by_role=target_by_role,
             solver=solver,
-            limits=limits,
+            limits=motion_limits,
             max_iter=args.max_ik_iter,
             posture_task=posture_task,
+            candidate_selection=args.candidate_selection,
+            candidate_position_tolerance=args.candidate_position_tolerance,
+            candidate_orientation_weight=args.candidate_orientation_weight,
+            candidate_temporal_weight=args.candidate_temporal_weight,
+            output_joint_step_caps=output_joint_step_caps,
+            return_diagnostics=True,
         )
 
         q_prev = qpos.copy()
@@ -731,6 +877,20 @@ def main():
             )
             for role in IK_ROLES
         ])
+        lower_margin, upper_margin, nearest_margin = joint_limit_margins(
+            model,
+            qpos,
+            robot_cfg["actuated_joint_order"],
+        )
+        joint_limit_lower_margins.append(lower_margin)
+        joint_limit_upper_margins.append(upper_margin)
+        joint_limit_nearest_margins_by_frame.append(nearest_margin)
+        selection_diagnostics.append(selection_info)
+
+        nearest_index = int(np.argmin(nearest_margin))
+        nearest_joint = robot_cfg["actuated_joint_order"][nearest_index]
+        nearest_value = float(nearest_margin[nearest_index])
+        nearest_side = "lower" if lower_margin[nearest_index] <= upper_margin[nearest_index] else "upper"
 
         hand_err = []
         for role in ("left_hand", "right_hand"):
@@ -755,6 +915,18 @@ def main():
             "root_x": float(qpos[0]),
             "root_y": float(qpos[1]),
             "root_z": float(qpos[2]),
+            "nearest_joint_limit": nearest_joint,
+            "nearest_joint_limit_side": nearest_side,
+            "nearest_joint_limit_margin_rad": nearest_value,
+            "num_joints_within_limit_margin": int(np.sum(nearest_margin <= args.joint_limit_warning_margin_rad)),
+            "selection_position_score": float(selection_info["selected_position_score"]),
+            "selection_orientation_score": float(selection_info["selected_orientation_score"]),
+            "selection_temporal_displacement": float(selection_info["selected_temporal_displacement"]),
+            "selection_max_actuated_step_rad": float(selection_info["selected_max_actuated_step_rad"]),
+            "selection_candidate_count": int(selection_info["candidate_count"]),
+            "selection_eligible_candidate_count": int(selection_info["eligible_candidate_count"]),
+            "selection_rejected_candidate_count": int(selection_info["rejected_candidate_count"]),
+            "selection_iteration": int(selection_info["selected_iteration"]),
         }
         rows.append(row)
 
@@ -764,7 +936,8 @@ def main():
                 f"score={score:.4f}, "
                 f"pelvis={row['pelvis_error_m']:.3f}, "
                 f"feet={row['mean_foot_error_m']:.3f}, "
-                f"hands={row['mean_hand_error_m']:.3f}"
+                f"hands={row['mean_hand_error_m']:.3f}, "
+                f"limit={nearest_joint}:{nearest_value:.3f}"
             )
 
     qpos_traj = np.asarray(qpos_traj, dtype=float)
@@ -773,6 +946,9 @@ def main():
     solved_ik_positions = np.asarray(solved_ik_positions, dtype=float)
     target_orientations_wxyz = np.asarray(target_orientations_wxyz, dtype=float)
     solved_ik_orientations_wxyz = np.asarray(solved_ik_orientations_wxyz, dtype=float)
+    joint_limit_lower_margins = np.asarray(joint_limit_lower_margins, dtype=float)
+    joint_limit_upper_margins = np.asarray(joint_limit_upper_margins, dtype=float)
+    joint_limit_nearest_margins_by_frame = np.asarray(joint_limit_nearest_margins_by_frame, dtype=float)
 
     joint_delta = np.diff(qpos_traj[:, 7:], axis=0)
     root_delta = np.diff(qpos_traj[:, 0:3], axis=0)
@@ -813,6 +989,19 @@ def main():
         "human_orientation_transfer_mode": args.human_orientation_transfer_mode,
         "human_orientation_costs": human_orientation_costs,
         "orientation_tracking_active": bool(human_orientation_roles),
+        "candidate_selection": args.candidate_selection,
+        "candidate_position_tolerance": args.candidate_position_tolerance,
+        "candidate_orientation_weight": args.candidate_orientation_weight,
+        "candidate_temporal_weight": args.candidate_temporal_weight,
+        "max_leg_step_rad": args.max_leg_step_rad,
+        "max_spine_neck_step_rad": args.max_spine_neck_step_rad,
+        "max_arm_step_rad": args.max_arm_step_rad,
+        "max_other_step_rad": args.max_other_step_rad,
+        "output_step_velocity_limit_enabled": output_joint_velocity_limit is not None,
+        "output_joint_velocity_limits_rad_s": output_joint_velocity_limits,
+        "joint_limit_warning_margin_rad": args.joint_limit_warning_margin_rad,
+        "num_frames_near_joint_limit": int(np.sum(np.min(joint_limit_nearest_margins_by_frame, axis=1) <= args.joint_limit_warning_margin_rad)),
+        "min_joint_limit_margin_rad": float(np.min(joint_limit_nearest_margins_by_frame)),
         "morphology_scales": morphology_scales,
         "rest_alignment_score": None if rest_score is None else float(rest_score),
         "rest_alignment_errors_m": rest_errors,
@@ -848,6 +1037,19 @@ def main():
         source_frame_ids=np.asarray(source_meta["source_frame_ids"], dtype=int),
         human_orientation_roles=np.asarray(human_orientation_roles, dtype=object),
         human_orientation_transfer_mode=np.asarray(args.human_orientation_transfer_mode, dtype=object),
+        joint_limit_joint_names=np.asarray(robot_cfg["actuated_joint_order"], dtype=object),
+        joint_limit_lower_margin_rad=joint_limit_lower_margins,
+        joint_limit_upper_margin_rad=joint_limit_upper_margins,
+        joint_limit_margin_rad=joint_limit_nearest_margins_by_frame,
+        output_joint_step_caps_rad=(
+            np.full(len(robot_cfg["actuated_joint_order"]), np.inf, dtype=float)
+            if output_joint_step_caps is None
+            else np.asarray(output_joint_step_caps[7:], dtype=float)
+        ),
+        output_joint_velocity_limits_rad_s=np.asarray(
+            [output_joint_velocity_limits.get(name, np.inf) for name in robot_cfg["actuated_joint_order"]],
+            dtype=float,
+        ),
         robot_config_path=np.asarray(str(robot_cfg_path), dtype=object),
     )
 

@@ -142,6 +142,33 @@ def frame_pos(model, data, frame_name, frame_type):
     raise ValueError(f"Unsupported frame_type: {frame_type}")
 
 
+def frame_rotation(model, data, frame_name, frame_type):
+    """Return the world rotation matrix of a MuJoCo body or site frame."""
+    if frame_type == "site":
+        sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, frame_name)
+        if sid < 0:
+            raise RuntimeError(f"Missing site: {frame_name}")
+        return np.asarray(data.site_xmat[sid], dtype=float).reshape(3, 3).copy()
+    if frame_type == "body":
+        bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, frame_name)
+        if bid < 0:
+            raise RuntimeError(f"Missing body: {frame_name}")
+        return np.asarray(data.xmat[bid], dtype=float).reshape(3, 3).copy()
+    raise ValueError(f"Unsupported frame_type: {frame_type}")
+
+
+def quat_wxyz_to_rotmat(quat_wxyz):
+    """Convert a scalar-first quaternion to a 3x3 rotation matrix."""
+    q = np.asarray(quat_wxyz, dtype=float)
+    q = q / max(float(np.linalg.norm(q)), 1e-12)
+    w, x, y, z = q
+    return np.array([
+        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w),       2.0 * (x * z + y * w)],
+        [2.0 * (x * y + z * w),       1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+        [2.0 * (x * z - y * w),       2.0 * (y * z + x * w),       1.0 - 2.0 * (x * x + y * y)],
+    ], dtype=float)
+
+
 def role_pos(model, data, robot_cfg, role):
     frame_name, frame_type = role_frame_name_and_type(robot_cfg, role)
     return frame_pos(model, data, frame_name, frame_type)
@@ -431,6 +458,7 @@ def set_task_targets(tasks, scaled_frame, robot_cfg):
             "robot_frame": frame_name,
             "frame_type": frame_type,
             "target_pos": target_pos.tolist(),
+            "target_quat_wxyz": target_quat.tolist(),
         }
 
     return target_by_role
@@ -446,14 +474,110 @@ def position_error_score(model, data, target_by_role):
     return float(np.linalg.norm(np.asarray(terms, dtype=float)))
 
 
-def solve_frame(model, configuration, tasks, target_by_role, solver, limits, max_iter, posture_task=None):
+def orientation_error_score(model, data, tasks, target_by_role):
+    """Weighted SO(3) target error for tasks with active orientation cost."""
+    terms = []
+    for role, info in target_by_role.items():
+        if "target_quat_wxyz" not in info:
+            continue
+
+        task = tasks[role]
+        cost = np.asarray(getattr(task, "cost", np.zeros(6)), dtype=float)
+        if cost.shape[0] < 6:
+            continue
+        orientation_cost = float(np.mean(cost[3:]))
+        if orientation_cost <= 0.0:
+            continue
+
+        R_target = quat_wxyz_to_rotmat(info["target_quat_wxyz"])
+        R_solved = frame_rotation(model, data, info["robot_frame"], info["frame_type"])
+        cos_angle = float(np.clip((np.trace(R_target.T @ R_solved) - 1.0) * 0.5, -1.0, 1.0))
+        angle = float(np.arccos(cos_angle))
+        terms.append(np.sqrt(orientation_cost) * angle)
+
+    return float(np.linalg.norm(np.asarray(terms, dtype=float))) if terms else 0.0
+
+
+def _candidate_metrics(model, configuration, tasks, target_by_role, reference_qpos, output_joint_step_caps):
+    qpos = np.asarray(configuration.data.qpos, dtype=float).copy()
+    q_delta = qpos - reference_qpos
+    actuated_delta = q_delta[7:]
+
+    if output_joint_step_caps is None:
+        within_step_caps = True
+        max_step_cap_ratio = 0.0
+    else:
+        caps = np.asarray(output_joint_step_caps, dtype=float)
+        if caps.shape != qpos.shape:
+            raise ValueError(
+                "output_joint_step_caps must have the same shape as qpos: "
+                f"{caps.shape} vs {qpos.shape}"
+            )
+        finite = np.isfinite(caps)
+        within_step_caps = bool(np.all(np.abs(q_delta[finite]) <= caps[finite] + 1e-12))
+        ratios = np.abs(q_delta[finite]) / caps[finite] if np.any(finite) else np.zeros(0)
+        max_step_cap_ratio = float(np.max(ratios)) if len(ratios) else 0.0
+
+    return {
+        "qpos": qpos,
+        "position_score": position_error_score(model, configuration.data, target_by_role),
+        "orientation_score": orientation_error_score(model, configuration.data, tasks, target_by_role),
+        "temporal_displacement": float(np.linalg.norm(actuated_delta)),
+        "max_actuated_step_rad": float(np.max(np.abs(actuated_delta))) if len(actuated_delta) else 0.0,
+        "within_step_caps": within_step_caps,
+        "max_step_cap_ratio": max_step_cap_ratio,
+    }
+
+
+def solve_frame(
+    model,
+    configuration,
+    tasks,
+    target_by_role,
+    solver,
+    limits,
+    max_iter,
+    posture_task=None,
+    candidate_selection="position_only",
+    candidate_position_tolerance=0.0,
+    candidate_orientation_weight=1.0,
+    candidate_temporal_weight=1.0,
+    output_joint_step_caps=None,
+    return_diagnostics=False,
+):
+    """
+    Solve one output-frame IK problem and select a temporally valid iterate.
+
+    ``position_only`` preserves historical behavior. ``position_tiebreak``
+    keeps candidates within a relative position-score tolerance of the best
+    candidate, then prefers lower weighted orientation error and displacement
+    from the previous output pose. ``combined`` minimizes all three terms
+    directly. When output_joint_step_caps is provided, candidates outside the
+    per-output-frame caps are rejected; the initial pose is always a valid
+    zero-step candidate.
+    """
+    if candidate_selection not in {"position_only", "position_tiebreak", "combined"}:
+        raise ValueError(f"Unknown candidate_selection: {candidate_selection}")
+    if candidate_position_tolerance < 0.0:
+        raise ValueError("candidate_position_tolerance must be nonnegative")
+
     dt = model.opt.timestep
     damping = 1e-4
+    reference_qpos = np.asarray(configuration.data.qpos, dtype=float).copy()
 
-    best_score = position_error_score(model, configuration.data, target_by_role)
-    best_qpos = np.asarray(configuration.data.qpos, dtype=float).copy()
+    candidates = []
+    initial = _candidate_metrics(
+        model,
+        configuration,
+        tasks,
+        target_by_role,
+        reference_qpos,
+        output_joint_step_caps,
+    )
+    initial["iteration"] = 0
+    candidates.append(initial)
 
-    for _ in range(max_iter):
+    for iteration in range(1, max_iter + 1):
         active_tasks = list(tasks.values())
         if posture_task is not None:
             active_tasks.append(posture_task)
@@ -468,12 +592,52 @@ def solve_frame(model, configuration, tasks, target_by_role, solver, limits, max
         )
 
         configuration.integrate_inplace(vel, dt)
-        score = position_error_score(model, configuration.data, target_by_role)
+        candidate = _candidate_metrics(
+            model,
+            configuration,
+            tasks,
+            target_by_role,
+            reference_qpos,
+            output_joint_step_caps,
+        )
+        candidate["iteration"] = iteration
+        candidates.append(candidate)
 
-        if score < best_score:
-            best_score = score
-            best_qpos = np.asarray(configuration.data.qpos, dtype=float).copy()
+    eligible = [candidate for candidate in candidates if candidate["within_step_caps"]]
+    if not eligible:
+        # The initial configuration has zero displacement, so this is only
+        # reachable with malformed caps. Keep the failure explicit.
+        raise RuntimeError("No IK candidate satisfied the output-frame joint-step caps")
 
+    best_position_score = min(candidate["position_score"] for candidate in eligible)
+    if candidate_selection == "position_only":
+        selected = min(eligible, key=lambda candidate: (candidate["position_score"], candidate["iteration"]))
+    elif candidate_selection == "position_tiebreak":
+        threshold = best_position_score * (1.0 + candidate_position_tolerance) + 1e-12
+        near_best = [candidate for candidate in eligible if candidate["position_score"] <= threshold]
+        selected = min(
+            near_best,
+            key=lambda candidate: (
+                candidate_orientation_weight * candidate["orientation_score"]
+                + candidate_temporal_weight * candidate["temporal_displacement"],
+                candidate["position_score"],
+                candidate["iteration"],
+            ),
+        )
+    else:  # combined
+        selected = min(
+            eligible,
+            key=lambda candidate: (
+                candidate["position_score"]
+                + candidate_orientation_weight * candidate["orientation_score"]
+                + candidate_temporal_weight * candidate["temporal_displacement"],
+                candidate["position_score"],
+                candidate["iteration"],
+            ),
+        )
+
+    best_qpos = selected["qpos"]
+    best_score = float(selected["position_score"])
     configuration.update(best_qpos)
     mujoco.mj_forward(model, configuration.data)
 
@@ -486,6 +650,21 @@ def solve_frame(model, configuration, tasks, target_by_role, solver, limits, max
         errors[role] = float(np.linalg.norm(solved - target))
         solved_positions[role] = solved
 
+    diagnostics = {
+        "candidate_selection": candidate_selection,
+        "candidate_count": len(candidates),
+        "eligible_candidate_count": len(eligible),
+        "rejected_candidate_count": len(candidates) - len(eligible),
+        "best_eligible_position_score": float(best_position_score),
+        "selected_iteration": int(selected["iteration"]),
+        "selected_position_score": float(selected["position_score"]),
+        "selected_orientation_score": float(selected["orientation_score"]),
+        "selected_temporal_displacement": float(selected["temporal_displacement"]),
+        "selected_max_actuated_step_rad": float(selected["max_actuated_step_rad"]),
+        "selected_max_step_cap_ratio": float(selected["max_step_cap_ratio"]),
+    }
+    if return_diagnostics:
+        return best_qpos.copy(), best_score, errors, solved_positions, diagnostics
     return best_qpos.copy(), best_score, errors, solved_positions
 
 def main():
