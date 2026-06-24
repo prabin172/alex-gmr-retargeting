@@ -254,29 +254,19 @@ def rotmat_to_quat_wxyz_single(R):
 
 def get_frame_world_rotation_from_task_target(configuration, task):
     """Return current world rotation of the task frame/site/body at the rest configuration."""
-    # Pink FrameTask usually exposes frame and frame_type.
-    frame = getattr(task, "frame", None)
+    # Mink FrameTask stores the task frame under frame_name/frame_type.  Do not
+    # silently fall back to identity here: doing so makes relative orientation
+    # transfer independent of Alex's actual task-frame convention.
+    frame_name = getattr(task, "frame_name", None)
     frame_type = getattr(task, "frame_type", None)
+    if frame_name is None or frame_type is None:
+        raise AttributeError(
+            "Mink FrameTask must expose frame_name and frame_type to capture "
+            "the Alex rest orientation."
+        )
 
-    if frame is None:
-        return np.eye(3)
-
-    # configuration is Pink Configuration around pinocchio model.
-    # Try common frame transform APIs.
-    try:
-        T = configuration.get_transform_frame_to_world(frame)
-        return np.asarray(T.rotation, dtype=float)
-    except Exception:
-        pass
-
-    try:
-        T = configuration.get_transform(frame, "world")
-        return np.asarray(T.rotation, dtype=float)
-    except Exception:
-        pass
-
-    print(f"WARNING: could not read rest orientation for task frame {frame}; using identity.")
-    return np.eye(3)
+    transform = configuration.get_transform_frame_to_world(frame_name, frame_type)
+    return np.asarray(transform.rotation().as_matrix(), dtype=float)
 
 
 def load_human_role_quats_for_solver(canonical_npz_path, source_frame_ids, roles):
@@ -372,13 +362,22 @@ def apply_human_orientation_costs_to_tasks(tasks, roles, args):
         cost = float(role_to_cost.get(role, 0.0))
         task = tasks[role]
 
-        if hasattr(task, "orientation_cost"):
-            task.orientation_cost = cost
-        elif hasattr(task, "cost") and len(task.cost) >= 2:
-            task.cost[1] = cost
-        else:
-            print(f"WARNING: could not set orientation cost for {role}; task has no orientation_cost/cost field.")
-            continue
+        if not hasattr(task, "set_orientation_cost"):
+            raise AttributeError(
+                f"Task for role {role} does not expose set_orientation_cost(); "
+                "do not assign orientation_cost directly."
+            )
+
+        # FrameTask stores the actual orientation weights in task.cost[3:].
+        # Assigning task.orientation_cost only changes an attribute and does
+        # not update the QP objective in Mink.
+        task.set_orientation_cost(cost)
+        effective_cost = np.asarray(task.cost[3:], dtype=float)
+        if not np.allclose(effective_cost, cost):
+            raise RuntimeError(
+                f"Failed to apply orientation cost for {role}: "
+                f"expected {cost}, got {effective_cost.tolist()}"
+            )
 
         applied[role] = cost
 
@@ -386,7 +385,7 @@ def apply_human_orientation_costs_to_tasks(tasks, roles, args):
     print("Applied HUMAN segment orientation costs:")
     for role in roles:
         if role in applied:
-            print(f"  {role:14s}: {applied[role]:.4f}")
+            print(f"  {role:14s}: {applied[role]:.4f} | task.cost={tasks[role].cost}")
 
     return applied
 
@@ -549,8 +548,9 @@ def main():
         for role in human_orientation_roles:
             human_rest_R[role] = quat_wxyz_to_rotmat(human_quats_by_role[role][0])
 
-        # Robot rest rotations after rest alignment is available; filled below.
-        human_orientation_costs = apply_human_orientation_costs_to_tasks(tasks, human_orientation_roles, args)
+        # Keep orientation costs at zero for rest alignment.  source_frames
+        # intentionally carry identity quaternions; applying human orientation
+        # costs before rest alignment would incorrectly target world identity.
 
     posture_task = S.make_posture_task(model, args)
 
@@ -600,6 +600,29 @@ def main():
 
     q_neutral = q_prev.copy()
 
+    if human_orientation_roles:
+        print()
+        print("Capturing Alex rest task orientations after position-only rest alignment...")
+        for role in human_orientation_roles:
+            if role not in tasks:
+                print(f"  {role:14s}: missing task")
+                continue
+            robot_rest_R[role] = get_frame_world_rotation_from_task_target(configuration, tasks[role])
+            print(f"  {role:14s}: captured")
+
+        missing_rest_frames = sorted(set(human_orientation_roles) - set(robot_rest_R))
+        if missing_rest_frames:
+            raise RuntimeError(
+                "Cannot enable human orientation tracking without Alex rest task frames: "
+                f"{missing_rest_frames}"
+            )
+
+        human_orientation_costs = apply_human_orientation_costs_to_tasks(
+            tasks,
+            human_orientation_roles,
+            args,
+        )
+
     morphology_scales = None
     if args.target_generation == "morphology-delta":
         morphology = S.compute_morphology_scales(
@@ -619,6 +642,8 @@ def main():
     rows = []
     target_positions = []
     solved_ik_positions = []
+    target_orientations_wxyz = []
+    solved_ik_orientations_wxyz = []
 
     for frame_idx, source_frame in enumerate(source_frames):
         if args.target_generation == "morphology-delta":
@@ -654,16 +679,6 @@ def main():
             )
 
         if human_quats_by_role is not None:
-            if not robot_rest_R:
-                print()
-                print("Capturing Alex rest task orientations for human-relative orientation transfer...")
-                for role in human_orientation_roles:
-                    if role in tasks:
-                        robot_rest_R[role] = get_frame_world_rotation_from_task_target(configuration, tasks[role])
-                        print(f"  {role:14s}: captured")
-                    else:
-                        print(f"  {role:14s}: missing task")
-
             scaled_frame = apply_human_relative_orientations_to_frame(
                 frame=scaled_frame,
                 frame_idx=frame_idx,
@@ -706,6 +721,16 @@ def main():
             np.asarray(solved_positions[role], dtype=float)
             for role in IK_ROLES
         ])
+        target_orientations_wxyz.append([
+            np.asarray(scaled_frame[role]["quat_wxyz"], dtype=float)
+            for role in IK_ROLES
+        ])
+        solved_ik_orientations_wxyz.append([
+            rotmat_to_quat_wxyz_single(
+                get_frame_world_rotation_from_task_target(configuration, tasks[role])
+            )
+            for role in IK_ROLES
+        ])
 
         hand_err = []
         for role in ("left_hand", "right_hand"):
@@ -746,6 +771,8 @@ def main():
     source_positions = S.frame_positions_array(source_frames, CANONICAL_BODY_NAMES)
     target_positions = np.asarray(target_positions, dtype=float)
     solved_ik_positions = np.asarray(solved_ik_positions, dtype=float)
+    target_orientations_wxyz = np.asarray(target_orientations_wxyz, dtype=float)
+    solved_ik_orientations_wxyz = np.asarray(solved_ik_orientations_wxyz, dtype=float)
 
     joint_delta = np.diff(qpos_traj[:, 7:], axis=0)
     root_delta = np.diff(qpos_traj[:, 0:3], axis=0)
@@ -785,6 +812,7 @@ def main():
         "human_orientation_roles": human_orientation_roles,
         "human_orientation_transfer_mode": args.human_orientation_transfer_mode,
         "human_orientation_costs": human_orientation_costs,
+        "orientation_tracking_active": bool(human_orientation_roles),
         "morphology_scales": morphology_scales,
         "rest_alignment_score": None if rest_score is None else float(rest_score),
         "rest_alignment_errors_m": rest_errors,
@@ -814,7 +842,12 @@ def main():
         source_roles=np.asarray(CANONICAL_BODY_NAMES, dtype=object),
         target_positions=target_positions,
         solved_ik_positions=solved_ik_positions,
+        target_orientations_wxyz=target_orientations_wxyz,
+        solved_ik_orientations_wxyz=solved_ik_orientations_wxyz,
         ik_roles=np.asarray(IK_ROLES, dtype=object),
+        source_frame_ids=np.asarray(source_meta["source_frame_ids"], dtype=int),
+        human_orientation_roles=np.asarray(human_orientation_roles, dtype=object),
+        human_orientation_transfer_mode=np.asarray(args.human_orientation_transfer_mode, dtype=object),
         robot_config_path=np.asarray(str(robot_cfg_path), dtype=object),
     )
 
