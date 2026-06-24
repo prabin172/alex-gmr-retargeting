@@ -1,0 +1,87 @@
+{
+  "robot_name": "alex",
+  "model_path": "assets/alex/alex_floating_base_with_sites.xml",
+  "source_asset_note": "Generated locally from IHMC Alex assets. Do not commit generated URDF or meshes.",
+  "floating_base": {
+    "enabled": true,
+    "root_joint_name": "ROOT_FLOATING_BASE",
+    "root_body": "PELVIS_LINK",
+    "qpos_layout": [
+      "base_x",
+      "base_y",
+      "base_z",
+      "base_qw",
+      "base_qx",
+      "base_qy",
+      "base_qz",
+      "29_actuated_joint_positions"
+    ],
+    "expected_nq": 36,
+    "expected_nv": 35
+  },
+  "expected_counts": {
+    "nbody": 31,
+    "njnt": 30,
+    "actuated_joints": 29
+  },
+  "actuated_joint_order": [
+    "LEFT_HIP_X",
+    "LEFT_HIP_Z",
+    "LEFT_HIP_Y",
+    "LEFT_KNEE_Y",
+    "LEFT_ANKLE_Y",
+    "LEFT_ANKLE_X",
+    "RIGHT_HIP_X",
+    "RIGHT_HIP_Z",
+    "RIGHT_HIP_Y",
+    "RIGHT_KNEE_Y",
+    "RIGHT_ANKLE_Y",
+    "RIGHT_ANKLE_X",
+    "SPINE_Z",
+    "NECK_Z",
+    "NECK_Y",
+    "LEFT_SHOULDER_Y",
+    "LEFT_SHOULDER_X",
+    "LEFT_SHOULDER_Z",
+    "LEFT_ELBOW_Y",
+    "LEFT_WRIST_Z",
+    "LEFT_WRIST_X",
+    "LEFT_GRIPPER_Z",
+    "RIGHT_SHOULDER_Y",
+    "RIGHT_SHOULDER_X",
+    "RIGHT_SHOULDER_Z",
+    "RIGHT_ELBOW_Y",
+    "RIGHT_WRIST_Z",
+    "RIGHT_WRIST_X",
+    "RIGHT_GRIPPER_Z"
+  ],
+  "retarget_body_names": {
+    "pelvis": "PELVIS_LINK",
+    "torso": "TORSO_LINK",
+    "head": "HEAD_LINK",
+    "left_hip": "LEFT_HIP_X_LINK",
+    "left_knee": "LEFT_SHIN",
+    "left_foot": "LEFT_FOOT",
+    "right_hip": "RIGHT_HIP_X_LINK",
+    "right_knee": "RIGHT_SHIN",
+    "right_foot": "RIGHT_FOOT",
+    "left_shoulder": "LEFT_SHOULDER_Y_LINK",
+    "left_elbow": "LEFT_ELBOW_Y_LINK",
+    "left_wrist": "LEFT_WRIST_X_LINK",
+    "left_hand": "LEFT_GRIPPER_Z_LINK",
+    "right_shoulder": "RIGHT_SHOULDER_Y_LINK",
+    "right_elbow": "RIGHT_ELBOW_Y_LINK",
+    "right_wrist": "RIGHT_WRIST_X_LINK",
+    "right_hand": "RIGHT_GRIPPER_Z_LINK"
+  },
+  "retarget_site_names": {
+    "pelvis": "alex_pelvis_site",
+    "head": "alex_head_site",
+    "left_foot": "alex_left_sole_site",
+    "right_foot": "alex_right_sole_site"
+  },
+  "optional_retarget_site_names": {
+    "left_hand_tip": "alex_left_hand_tip_site",
+    "right_hand_tip": "alex_right_hand_tip_site"
+  }
+}

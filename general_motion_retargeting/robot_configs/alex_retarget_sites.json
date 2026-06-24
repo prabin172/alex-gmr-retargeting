@@ -1,0 +1,180 @@
+{
+  "sites": [
+    {
+      "name": "alex_pelvis_site",
+      "parent_body": "PELVIS_LINK",
+      "pos": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "quat": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "size": 0.035,
+      "rgba": [
+        1.0,
+        0.2,
+        0.2,
+        1.0
+      ]
+    },
+    {
+      "name": "alex_head_site",
+      "parent_body": "HEAD_LINK",
+      "pos": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "quat": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "size": 0.035,
+      "rgba": [
+        1.0,
+        0.2,
+        0.2,
+        1.0
+      ]
+    },
+    {
+      "name": "alex_left_sole_site",
+      "parent_body": "LEFT_FOOT",
+      "pos": [
+        0.08,
+        0.0,
+        -0.035
+      ],
+      "quat": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "size": 0.03,
+      "rgba": [
+        0.1,
+        0.8,
+        0.1,
+        1.0
+      ]
+    },
+    {
+      "name": "alex_right_sole_site",
+      "parent_body": "RIGHT_FOOT",
+      "pos": [
+        0.08,
+        0.0,
+        -0.035
+      ],
+      "quat": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "size": 0.03,
+      "rgba": [
+        0.1,
+        0.8,
+        0.1,
+        1.0
+      ]
+    },
+    {
+      "name": "alex_left_palm_site",
+      "parent_body": "LEFT_WRIST_X_LINK",
+      "pos": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "quat": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "size": 0.03,
+      "rgba": [
+        0.1,
+        0.3,
+        1.0,
+        1.0
+      ]
+    },
+    {
+      "name": "alex_right_palm_site",
+      "parent_body": "RIGHT_WRIST_X_LINK",
+      "pos": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "quat": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "size": 0.03,
+      "rgba": [
+        0.1,
+        0.3,
+        1.0,
+        1.0
+      ]
+    },
+    {
+      "name": "alex_left_hand_tip_site",
+      "parent_body": "LEFT_GRIPPER_Z_LINK",
+      "pos": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "quat": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "size": 0.02,
+      "rgba": [
+        0.8,
+        0.3,
+        1.0,
+        1.0
+      ]
+    },
+    {
+      "name": "alex_right_hand_tip_site",
+      "parent_body": "RIGHT_GRIPPER_Z_LINK",
+      "pos": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "quat": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "size": 0.02,
+      "rgba": [
+        0.8,
+        0.3,
+        1.0,
+        1.0
+      ]
+    }
+  ]
+}
