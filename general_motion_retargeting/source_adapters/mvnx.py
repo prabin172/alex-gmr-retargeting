@@ -334,6 +334,123 @@ def mvnx_raw_frame_to_canonical(
     return frame
 
 
+def _frame_pos(frame: CanonicalHumanFrame, role: str) -> np.ndarray:
+    return np.asarray(frame[role]["pos"], dtype=float)
+
+
+def estimate_heading_rotation_from_frame(frame: CanonicalHumanFrame) -> np.ndarray:
+    """
+    Estimate a horizontal heading-canonicalization rotation.
+
+    The input frame is already in a Z-up canonical-like coordinate system.
+    This function estimates the subject's initial left direction from hips and
+    shoulders, then defines forward = left x up.
+
+    Returned R maps old coordinates into heading-canonical coordinates:
+      new_x = dot(old, initial_forward)
+      new_y = dot(old, initial_left)
+      new_z = dot(old, up)
+    """
+    up = np.array([0.0, 0.0, 1.0], dtype=float)
+
+    left_vecs = []
+
+    for left_role, right_role in [
+        ("left_hip", "right_hip"),
+        ("left_shoulder", "right_shoulder"),
+    ]:
+        left_vec = _frame_pos(frame, left_role) - _frame_pos(frame, right_role)
+        left_vec[2] = 0.0
+        if np.linalg.norm(left_vec) > 1e-8:
+            left_vecs.append(left_vec)
+
+    if not left_vecs:
+        raise ValueError("Could not estimate heading: hip/shoulder left-right vectors are degenerate.")
+
+    left = np.mean(np.stack(left_vecs, axis=0), axis=0)
+    left[2] = 0.0
+    left_norm = np.linalg.norm(left)
+    if left_norm < 1e-8:
+        raise ValueError("Could not estimate heading: averaged left vector is degenerate.")
+    left = left / left_norm
+
+    forward = np.cross(left, up)
+    forward[2] = 0.0
+    forward_norm = np.linalg.norm(forward)
+    if forward_norm < 1e-8:
+        raise ValueError("Could not estimate heading: forward vector is degenerate.")
+    forward = forward / forward_norm
+
+    # Re-orthogonalize left so the basis is clean.
+    left = np.cross(up, forward)
+    left = left / np.linalg.norm(left)
+
+    return np.stack([forward, left, up], axis=0)
+
+
+def apply_heading_rotation_to_frame(
+    frame: CanonicalHumanFrame,
+    rotation_old_to_new: np.ndarray,
+    origin: np.ndarray,
+) -> CanonicalHumanFrame:
+    """
+    Rotate positions around origin and rotate orientations into the new frame.
+    """
+    out: CanonicalHumanFrame = {}
+
+    for role in CANONICAL_BODY_NAMES:
+        pos_old = np.asarray(frame[role]["pos"], dtype=float)
+        quat_old = np.asarray(frame[role]["quat_wxyz"], dtype=float)
+
+        pos_new = rotation_old_to_new @ (pos_old - origin) + origin
+
+        rot_old = quat_wxyz_to_matrix(quat_old)
+        rot_new = rotation_old_to_new @ rot_old
+        quat_new = matrix_to_quat_wxyz(rot_new)
+
+        out[role] = {
+            "pos": [float(x) for x in pos_new],
+            "quat_wxyz": [float(x) for x in quat_new],
+        }
+
+    validate_canonical_human_frame(out)
+    return out
+
+
+def canonicalize_initial_heading(
+    frames: List[CanonicalHumanFrame],
+    reference_frame: Optional[CanonicalHumanFrame] = None,
+) -> Tuple[List[CanonicalHumanFrame], dict]:
+    """
+    Rotate a sequence so the reference frame faces canonical +X.
+
+    This removes dependence on the Xsens subject's initial yaw/global heading.
+    """
+    if not frames:
+        return frames, {
+            "enabled": True,
+            "applied": False,
+            "reason": "no frames",
+        }
+
+    ref = reference_frame if reference_frame is not None else frames[0]
+    origin = _frame_pos(ref, "pelvis")
+    rotation = estimate_heading_rotation_from_frame(ref)
+
+    out = [
+        apply_heading_rotation_to_frame(frame, rotation, origin)
+        for frame in frames
+    ]
+
+    return out, {
+        "enabled": True,
+        "applied": True,
+        "origin_pelvis_xyz": [float(x) for x in origin],
+        "rotation_old_to_new": rotation.tolist(),
+        "definition": "new_x=initial_forward, new_y=initial_left, new_z=up",
+    }
+
+
 def read_mvnx_canonical_frames(
     mvnx_path: Path,
     frame_type: str = "normal",
@@ -341,6 +458,8 @@ def read_mvnx_canonical_frames(
     stride: int = 1,
     max_frames: Optional[int] = None,
     canonicalize_axes: bool = True,
+    canonicalize_heading: bool = False,
+    heading_reference_frame: Optional[CanonicalHumanFrame] = None,
 ) -> Tuple[List[CanonicalHumanFrame], dict]:
     header = read_mvnx_header(mvnx_path)
     segment_labels = header["segment_labels"]
@@ -364,6 +483,16 @@ def read_mvnx_canonical_frames(
         )
         raw_indices.append(raw_frame["matched_frame_index"])
 
+    heading_metadata = {
+        "enabled": bool(canonicalize_heading),
+        "applied": False,
+    }
+    if canonicalize_heading:
+        frames, heading_metadata = canonicalize_initial_heading(
+            frames=frames,
+            reference_frame=heading_reference_frame,
+        )
+
     metadata = {
         **header,
         "frame_type": frame_type,
@@ -373,6 +502,8 @@ def read_mvnx_canonical_frames(
         "loaded_frames": len(frames),
         "matched_frame_indices": raw_indices,
         "canonicalize_axes": canonicalize_axes,
+        "canonicalize_heading": bool(canonicalize_heading),
+        "heading_canonicalization": heading_metadata,
         "coordinate_assumption": {
             "source_mvnx": "observed VTech MVNX: +X roughly subject-right, +Z up",
             "canonical": "+X forward, +Y left, +Z up",
