@@ -83,13 +83,17 @@ EDGE_NAMES: List[Tuple[str, str]] = [
     ("pelvis", "left_hip"),
     ("left_hip", "left_knee"),
     ("left_knee", "left_ankle"),
-    ("left_ankle", "left_foot"),
+    ("left_ankle", "left_heel"),
+    ("left_ankle", "left_toe"),
+    ("left_heel", "left_toe"),
     ("left_foot", "left_heel"),
     ("left_foot", "left_toe"),
     ("pelvis", "right_hip"),
     ("right_hip", "right_knee"),
     ("right_knee", "right_ankle"),
-    ("right_ankle", "right_foot"),
+    ("right_ankle", "right_heel"),
+    ("right_ankle", "right_toe"),
+    ("right_heel", "right_toe"),
     ("right_foot", "right_heel"),
     ("right_foot", "right_toe"),
 ]
@@ -521,6 +525,12 @@ def derive_points(points: Mapping[str, np.ndarray]) -> Tuple[Dict[str, np.ndarra
     status: Dict[str, Dict[str, Any]] = {}
 
     for role in V2_ROLES:
+        # In FBX skeletons, "LeftFoot"/"RightFoot" are ankle/foot-link joints.
+        # Do not direct-map canonical left_foot/right_foot to those names,
+        # otherwise ankle->foot becomes zero-length.  Canonical foot center is
+        # derived below from heel/toe when possible, with explicit fallback.
+        if role in {"left_foot", "right_foot"}:
+            continue
         direct = direct_role_point(points, role)
         if direct is not None:
             source_name, value = direct
@@ -553,9 +563,21 @@ def derive_points(points: Mapping[str, np.ndarray]) -> Tuple[Dict[str, np.ndarra
         toe_candidates = [x for x in (toe, mt1, mt5) if x is not None]
         if toe_candidates:
             put(f"{prefix}_toe", np.mean(np.stack(toe_candidates, axis=0), axis=0), "derived", "mean(toe/metatarsal markers)")
-        sole_candidates = [x for x in (heel, toe, mt1, mt5) if x is not None]
-        if sole_candidates:
-            put(f"{prefix}_foot", np.mean(np.stack(sole_candidates, axis=0), axis=0), "derived", "mean(heel/toe/metatarsal markers)")
+        foot_role = f"{prefix}_foot"
+        heel_role = f"{prefix}_heel"
+        toe_role = f"{prefix}_toe"
+        if heel_role in out and toe_role in out:
+            out[foot_role] = 0.5 * (out[heel_role] + out[toe_role])
+            status[foot_role] = {"kind": "derived", "source": f"midpoint({heel_role},{toe_role})"}
+        else:
+            direct_foot = direct_role_point(points, foot_role)
+            if direct_foot is not None:
+                source_name, value = direct_foot
+                out[foot_role] = value
+                status[foot_role] = {"kind": "fallback", "source": f"{source_name} (heel/toe unavailable)"}
+            elif f"{prefix}_ankle" in out:
+                out[foot_role] = out[f"{prefix}_ankle"]
+                status[foot_role] = {"kind": "fallback", "source": "ankle (heel/toe unavailable)"}
         if f"{prefix}_ankle" not in out and f"{prefix}_foot" in out:
             put(f"{prefix}_ankle", out[f"{prefix}_foot"], "approximate", "fallback_to_foot_center")
 
