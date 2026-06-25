@@ -20,6 +20,8 @@ S = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(S)
 
 CANONICAL_BODY_NAMES = list(S.CANONICAL_BODY_NAMES)
+PALM_ROLES = ["left_palm", "right_palm"]
+SOLE_ROLES = ["left_sole", "right_sole"]
 
 EDGES = [
     ("pelvis", "torso"), ("torso", "head"),
@@ -27,6 +29,14 @@ EDGES = [
     ("pelvis", "right_hip"), ("right_hip", "right_knee"), ("right_knee", "right_foot"),
     ("torso", "left_shoulder"), ("left_shoulder", "left_elbow"), ("left_elbow", "left_hand"),
     ("torso", "right_shoulder"), ("right_shoulder", "right_elbow"), ("right_elbow", "right_hand"),
+]
+
+ROBOT_EDGES = [
+    ("pelvis", "torso"), ("torso", "head"),
+    ("pelvis", "left_hip"), ("left_hip", "left_knee"), ("left_knee", "left_sole"),
+    ("pelvis", "right_hip"), ("right_hip", "right_knee"), ("right_knee", "right_sole"),
+    ("torso", "left_shoulder"), ("left_shoulder", "left_elbow"), ("left_elbow", "left_palm"),
+    ("torso", "right_shoulder"), ("right_shoulder", "right_elbow"), ("right_elbow", "right_palm"),
 ]
 
 
@@ -64,8 +74,10 @@ def merge_robot_config(robot_cfg_path):
         "head": "alex_head_site",
         "left_foot": "alex_left_sole_site",
         "right_foot": "alex_right_sole_site",
-        "left_hand": "alex_left_palm_site",
-        "right_hand": "alex_right_palm_site",
+        "left_sole": "alex_left_sole_contact_site",
+        "right_sole": "alex_right_sole_contact_site",
+        "left_palm": "alex_left_palm_contact_site",
+        "right_palm": "alex_right_palm_contact_site",
     }
 
     for role, site_name in candidates.items():
@@ -120,10 +132,10 @@ def role_index(roles):
     return {r: i for i, r in enumerate(roles)}
 
 
-def draw_skeleton_3d(ax, positions, roles, title, annotate=False):
+def draw_skeleton_3d(ax, positions, roles, title, annotate=False, edges=EDGES):
     idx = role_index(roles)
 
-    for a, b in EDGES:
+    for a, b in edges:
         if a not in idx or b not in idx:
             continue
         pa = positions[idx[a]]
@@ -186,7 +198,11 @@ def main():
 
     model = mujoco.MjModel.from_xml_path(str(model_path))
 
-    robot_roles = list(CANONICAL_BODY_NAMES)
+    robot_roles = [
+        role
+        for role in CANONICAL_BODY_NAMES
+        if role not in {"left_foot", "right_foot", "left_hand", "right_hand"}
+    ] + SOLE_ROLES + PALM_ROLES
     robot_positions = compute_robot_positions(
         model=model,
         qpos_traj=qpos,
@@ -233,6 +249,7 @@ def main():
             source_roles,
             title=f"Canonical human | frame {t}",
             annotate=args.annotate,
+            edges=EDGES,
         )
         draw_skeleton_3d(
             ax_robot,
@@ -240,6 +257,7 @@ def main():
             robot_roles,
             title=f"Alex IK | frame {t}",
             annotate=args.annotate,
+            edges=ROBOT_EDGES,
         )
 
         set_equal_3d_limits(ax_human, center, half)
