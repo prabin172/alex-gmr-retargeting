@@ -33,6 +33,19 @@ CANONICAL_BODY_NAMES = [
     "right_hand",
 ]
 
+# These are semantic end-effectors rather than skeleton-joint roles.  Keep
+# them separate from CANONICAL_BODY_NAMES so legacy skeleton adapters and
+# visualizers remain valid, while canonical NPZs can carry physically matched
+# palm/sole targets for contact-aware retargeting.
+CANONICAL_AUXILIARY_BODY_NAMES = [
+    "left_palm",
+    "right_palm",
+    "left_sole",
+    "right_sole",
+]
+
+CANONICAL_NPZ_ROLE_NAMES = CANONICAL_BODY_NAMES + CANONICAL_AUXILIARY_BODY_NAMES
+
 
 def _body(x: float, y: float, z: float) -> CanonicalBodyPose:
     return {
@@ -101,9 +114,16 @@ def copy_frame(frame: CanonicalHumanFrame) -> CanonicalHumanFrame:
     return deepcopy(frame)
 
 
-def validate_canonical_human_frame(frame: CanonicalHumanFrame) -> None:
+def validate_canonical_human_frame(
+    frame: CanonicalHumanFrame,
+    *,
+    allow_auxiliary_roles: bool = False,
+) -> None:
     missing = sorted(set(CANONICAL_BODY_NAMES) - set(frame.keys()))
-    extra = sorted(set(frame.keys()) - set(CANONICAL_BODY_NAMES))
+    allowed = set(CANONICAL_BODY_NAMES)
+    if allow_auxiliary_roles:
+        allowed.update(CANONICAL_AUXILIARY_BODY_NAMES)
+    extra = sorted(set(frame.keys()) - allowed)
 
     if missing:
         raise ValueError(f"Missing canonical body names: {missing}")
@@ -111,7 +131,13 @@ def validate_canonical_human_frame(frame: CanonicalHumanFrame) -> None:
     if extra:
         raise ValueError(f"Unexpected canonical body names: {extra}")
 
-    for body_name in CANONICAL_BODY_NAMES:
+    roles_to_validate = list(CANONICAL_BODY_NAMES)
+    if allow_auxiliary_roles:
+        roles_to_validate.extend(
+            role for role in CANONICAL_AUXILIARY_BODY_NAMES if role in frame
+        )
+
+    for body_name in roles_to_validate:
         pose = frame[body_name]
 
         if "pos" not in pose:

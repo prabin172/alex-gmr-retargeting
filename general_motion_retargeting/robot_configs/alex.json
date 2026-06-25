@@ -62,16 +62,20 @@
     "left_hip": "LEFT_HIP_X_LINK",
     "left_knee": "LEFT_SHIN",
     "left_foot": "LEFT_FOOT",
+    "left_sole": "LEFT_FOOT",
     "right_hip": "RIGHT_HIP_X_LINK",
     "right_knee": "RIGHT_SHIN",
     "right_foot": "RIGHT_FOOT",
+    "right_sole": "RIGHT_FOOT",
     "left_shoulder": "LEFT_SHOULDER_Y_LINK",
     "left_elbow": "LEFT_ELBOW_Y_LINK",
     "left_wrist": "LEFT_WRIST_X_LINK",
     "left_hand": "LEFT_GRIPPER_Z_LINK",
+    "left_palm": "LEFT_GRIPPER_Z_LINK",
     "right_shoulder": "RIGHT_SHOULDER_Y_LINK",
     "right_elbow": "RIGHT_ELBOW_Y_LINK",
     "right_wrist": "RIGHT_WRIST_X_LINK",
-    "right_hand": "RIGHT_GRIPPER_Z_LINK"
+    "right_hand": "RIGHT_GRIPPER_Z_LINK",
+    "right_palm": "RIGHT_GRIPPER_Z_LINK"
   }
 }

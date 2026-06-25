@@ -89,12 +89,12 @@
       ]
     },
     {
-      "name": "alex_left_palm_site",
-      "parent_body": "LEFT_WRIST_X_LINK",
+      "name": "alex_left_sole_contact_site",
+      "parent_body": "LEFT_FOOT",
       "pos": [
+        0.05,
         0.0,
-        0.0,
-        0.0
+        -0.07
       ],
       "quat": [
         1.0,
@@ -102,21 +102,85 @@
         0.0,
         0.0
       ],
-      "size": 0.03,
+      "size": [
+        0.1,
+        0.045,
+        0.002
+      ],
+      "type": "box",
       "rgba": [
         0.1,
-        0.3,
+        0.9,
+        0.1,
+        0.65
+      ],
+      "semantic_axes": {
+        "x": "toe_forward",
+        "y": "body_left_sole_width",
+        "z": "sole_contact_normal_up"
+      }
+    },
+    {
+      "name": "alex_right_sole_contact_site",
+      "parent_body": "RIGHT_FOOT",
+      "pos": [
+        0.05,
+        0.0,
+        -0.07
+      ],
+      "quat": [
         1.0,
-        1.0
+        0.0,
+        0.0,
+        0.0
+      ],
+      "size": [
+        0.1,
+        0.045,
+        0.002
+      ],
+      "type": "box",
+      "rgba": [
+        0.1,
+        0.9,
+        0.1,
+        0.65
+      ],
+      "semantic_axes": {
+        "x": "toe_forward",
+        "y": "body_left_sole_width",
+        "z": "sole_contact_normal_up"
+      }
+    },
+    {
+      "name": "alex_left_sole_corner_toe_body_left_site",
+      "parent_body": "LEFT_FOOT",
+      "pos": [
+        0.16,
+        0.05,
+        -0.07
+      ],
+      "quat": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "size": 0.012,
+      "rgba": [
+        0.2,
+        1.0,
+        0.2,
+        0.9
       ]
     },
     {
-      "name": "alex_right_palm_site",
-      "parent_body": "RIGHT_WRIST_X_LINK",
+      "name": "alex_left_sole_corner_toe_body_right_site",
+      "parent_body": "LEFT_FOOT",
       "pos": [
-        0.0,
-        0.0,
-        0.0
+        0.16,
+        -0.05,
+        -0.07
       ],
       "quat": [
         1.0,
@@ -124,13 +188,211 @@
         0.0,
         0.0
       ],
-      "size": 0.03,
+      "size": 0.012,
+      "rgba": [
+        0.2,
+        1.0,
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "name": "alex_left_sole_corner_heel_body_left_site",
+      "parent_body": "LEFT_FOOT",
+      "pos": [
+        -0.06,
+        0.05,
+        -0.07
+      ],
+      "quat": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "size": 0.012,
+      "rgba": [
+        0.2,
+        1.0,
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "name": "alex_left_sole_corner_heel_body_right_site",
+      "parent_body": "LEFT_FOOT",
+      "pos": [
+        -0.06,
+        -0.05,
+        -0.07
+      ],
+      "quat": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "size": 0.012,
+      "rgba": [
+        0.2,
+        1.0,
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "name": "alex_right_sole_corner_toe_body_left_site",
+      "parent_body": "RIGHT_FOOT",
+      "pos": [
+        0.16,
+        0.05,
+        -0.07
+      ],
+      "quat": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "size": 0.012,
+      "rgba": [
+        0.2,
+        1.0,
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "name": "alex_right_sole_corner_toe_body_right_site",
+      "parent_body": "RIGHT_FOOT",
+      "pos": [
+        0.16,
+        -0.05,
+        -0.07
+      ],
+      "quat": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "size": 0.012,
+      "rgba": [
+        0.2,
+        1.0,
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "name": "alex_right_sole_corner_heel_body_left_site",
+      "parent_body": "RIGHT_FOOT",
+      "pos": [
+        -0.06,
+        0.05,
+        -0.07
+      ],
+      "quat": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "size": 0.012,
+      "rgba": [
+        0.2,
+        1.0,
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "name": "alex_right_sole_corner_heel_body_right_site",
+      "parent_body": "RIGHT_FOOT",
+      "pos": [
+        -0.06,
+        -0.05,
+        -0.07
+      ],
+      "quat": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "size": 0.012,
+      "rgba": [
+        0.2,
+        1.0,
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "name": "alex_left_palm_contact_site",
+      "parent_body": "LEFT_GRIPPER_Z_LINK",
+      "pos": [
+        0.039306155,
+        -0.011246511,
+        -0.073823097
+      ],
+      "quat": [
+        0.697532226,
+        0.046261709,
+        0.713627319,
+        0.045218326
+      ],
+      "size": [
+        0.045,
+        0.018,
+        0.002
+      ],
+      "type": "box",
       "rgba": [
         0.1,
         0.3,
         1.0,
-        1.0
-      ]
+        0.75
+      ],
+      "semantic_axes": {
+        "x": "finger_forward",
+        "y": "body_left_palm_width",
+        "z": "palmar_contact_normal"
+      },
+      "contact_normal_offset_m": 0.04
+    },
+    {
+      "name": "alex_right_palm_contact_site",
+      "parent_body": "RIGHT_GRIPPER_Z_LINK",
+      "pos": [
+        0.039305502,
+        0.011246527,
+        -0.073851064
+      ],
+      "quat": [
+        0.697282707,
+        -0.046276407,
+        0.713871266,
+        -0.045201061
+      ],
+      "size": [
+        0.045,
+        0.018,
+        0.002
+      ],
+      "type": "box",
+      "rgba": [
+        0.1,
+        0.3,
+        1.0,
+        0.75
+      ],
+      "semantic_axes": {
+        "x": "finger_forward",
+        "y": "body_left_palm_width",
+        "z": "palmar_contact_normal"
+      },
+      "contact_normal_offset_m": 0.04
     },
     {
       "name": "alex_left_hand_tip_site",
