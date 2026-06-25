@@ -100,20 +100,20 @@ EDGE_NAMES: List[Tuple[str, str]] = [
 # compare cleanly.
 ROLE_ALIASES: Dict[str, Sequence[str]] = {
     "pelvis": ("pelvis", "hips", "hip", "root"),
-    "torso": ("spine2", "spine1", "spine", "chest", "torso", "upperchest"),
+    "torso": ("spine3", "spine2", "spine1", "spine", "chest", "torso", "upperchest"),
     "neck": ("neck", "neck1"),
     "head": ("head",),
-    "head_top": ("headtop", "headend", "head_end", "head_end_site"),
+    "head_top": ("headtop", "headend", "headtail", "head_tail", "head_end", "head_end_site"),
     "left_shoulder": ("leftshoulder", "leftarm", "lshoulder", "larm", "left_shoulder"),
     "left_elbow": ("leftforearm", "leftelbow", "lforearm", "lelbow", "left_elbow"),
     "left_wrist": ("lefthand", "leftwrist", "lhand", "lwrist", "left_wrist"),
     "left_palm": ("leftpalm", "left_palm"),
-    "left_hand_tip": ("lefthandtip", "leftmiddleend", "lefthandend", "left_hand_tip"),
+    "left_hand_tip": ("lefthandtip", "lefthandtail", "left_hand_tail", "leftmiddleend", "lefthandend", "left_hand_tip"),
     "right_shoulder": ("rightshoulder", "rightarm", "rshoulder", "rarm", "right_shoulder"),
     "right_elbow": ("rightforearm", "rightelbow", "rforearm", "relbow", "right_elbow"),
     "right_wrist": ("righthand", "rightwrist", "rhand", "rwrist", "right_wrist"),
     "right_palm": ("rightpalm", "right_palm"),
-    "right_hand_tip": ("righthandtip", "rightmiddleend", "righthandend", "right_hand_tip"),
+    "right_hand_tip": ("righthandtip", "righthandtail", "right_hand_tail", "rightmiddleend", "righthandend", "right_hand_tip"),
     "left_hip": ("leftupleg", "lefthip", "lhip", "left_hip"),
     "left_knee": ("leftleg", "leftknee", "lknee", "left_knee"),
     "left_ankle": ("leftfoot", "leftankle", "lankle", "left_ankle"),
@@ -305,6 +305,154 @@ def load_pickle_frames(path: Path) -> Tuple[Dict[str, np.ndarray], Dict[str, np.
         if np.all(np.isfinite(vals))
     }
     return point_arrays, frame_arrays, {"input_kind": "pickle_frames", "source_names": names, "fps": None}
+
+
+def blender_module_available() -> bool:
+    try:
+        import bpy  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+def action_frame_range_blender(scene: Any, bpy_module: Any) -> Tuple[int, int]:
+    frames: List[float] = []
+    for action in bpy_module.data.actions:
+        for fc in action.fcurves:
+            for kp in fc.keyframe_points:
+                frames.append(float(kp.co.x))
+    if not frames:
+        return int(scene.frame_start), int(scene.frame_end)
+    return int(np.floor(min(frames))), int(np.ceil(max(frames)))
+
+
+def load_fbx_blender(path: Path, fps: int) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, Any]]:
+    """Load raw FBX through Blender's importer.
+
+    This is the preferred raw-FBX path for the Alex repo.  Normal Python does
+    not reliably understand FBX without Autodesk/PoseLib plumbing; Blender does.
+    Run this script as:
+
+      blender --background --python scripts/build_fbx_kinematic_canonical_v2.py -- motion.fbx --output out.npz
+    """
+    import bpy
+
+    bpy.ops.object.select_all(action="SELECT")
+    bpy.ops.object.delete()
+    bpy.ops.import_scene.fbx(filepath=str(path))
+
+    scene = bpy.context.scene
+    armatures = [obj for obj in scene.objects if obj.type == "ARMATURE"]
+    if not armatures:
+        raise RuntimeError("No armature found after Blender FBX import.")
+
+    arm = armatures[0]
+
+    def clean_name(name: str) -> str:
+        return str(name).split(":")[-1]
+
+    frame_start, frame_end = action_frame_range_blender(scene, bpy)
+    frames = list(range(frame_start, frame_end + 1))
+    if not frames:
+        raise RuntimeError(f"No frames found in FBX: start={frame_start}, end={frame_end}")
+
+    bone_names = [clean_name(pb.name) for pb in arm.pose.bones]
+    raw_roles = bone_names + [f"{name}_tail" for name in bone_names]
+    raw = np.full((len(frames), len(raw_roles), 3), np.nan, dtype=float)
+
+    for ti, frame in enumerate(frames):
+        scene.frame_set(frame)
+        bpy.context.view_layer.update()
+        world = arm.matrix_world
+        for bi, pb in enumerate(arm.pose.bones):
+            head = world @ pb.head
+            tail = world @ pb.tail
+            raw[ti, bi, :] = [float(head.x), float(head.y), float(head.z)]
+            raw[ti, bi + len(bone_names), :] = [float(tail.x), float(tail.y), float(tail.z)]
+
+    # Match the earlier Alex FBX export convention: first-frame pelvis origin,
+    # X forward, Y left, Z Blender/world up.  This is not contact logic; it is
+    # just a stable source-skeleton coordinate convention.
+    role_lookup = index_by_normalized_name(raw_roles)
+    hips_i = role_lookup.get(normalize_name("Hips"))
+    left_hip_i = role_lookup.get(normalize_name("LeftUpLeg"))
+    right_hip_i = role_lookup.get(normalize_name("RightUpLeg"))
+    left_shoulder_i = role_lookup.get(normalize_name("LeftArm"))
+    right_shoulder_i = role_lookup.get(normalize_name("RightArm"))
+
+    transform_kind = "raw"
+    origin = np.zeros(3, dtype=float)
+    forward = np.array([1.0, 0.0, 0.0], dtype=float)
+    left = np.array([0.0, 1.0, 0.0], dtype=float)
+    up = np.array([0.0, 0.0, 1.0], dtype=float)
+
+    if None in (hips_i, left_hip_i, right_hip_i, left_shoulder_i, right_shoulder_i):
+        canonical = raw
+        canonical_note = "Could not estimate FBX heading; kept Blender world coordinates."
+    else:
+        origin = raw[0, int(hips_i)].copy()
+        centered = raw - origin[None, None, :]
+        left_vec = (
+            raw[0, int(left_hip_i)]
+            - raw[0, int(right_hip_i)]
+            + raw[0, int(left_shoulder_i)]
+            - raw[0, int(right_shoulder_i)]
+        )
+        left_vec[2] = 0.0
+        if np.linalg.norm(left_vec) < 1e-8:
+            canonical = centered
+            transform_kind = "centered"
+            canonical_note = "Could not estimate FBX left direction; only centered at first-frame pelvis."
+        else:
+            left = left_vec / np.linalg.norm(left_vec)
+            forward = np.cross(left, up)
+            forward = forward / np.linalg.norm(forward)
+            left = np.cross(up, forward)
+            left = left / np.linalg.norm(left)
+            canonical = np.empty_like(centered)
+            canonical[..., 0] = centered @ forward
+            canonical[..., 1] = centered @ left
+            canonical[..., 2] = centered @ up
+            transform_kind = "heading"
+            canonical_note = "Centered at first-frame Hips; X forward, Y left, Z up from first-frame hips/shoulders."
+
+    points = {name: canonical[:, i, :] for i, name in enumerate(raw_roles)}
+
+    markers = [obj for obj in scene.objects if obj.type == "EMPTY"]
+    if markers:
+        # Marker coordinates must use the exact same source canonical frame as
+        # bones; otherwise palms/heels derived from markers are in a different
+        # coordinate system from the skeleton.
+        for obj in markers:
+            vals = np.full((len(frames), 3), np.nan, dtype=float)
+            for ti, frame in enumerate(frames):
+                scene.frame_set(frame)
+                bpy.context.view_layer.update()
+                p = obj.matrix_world.translation
+                raw_p = np.array([float(p.x), float(p.y), float(p.z)], dtype=float)
+                if transform_kind == "heading":
+                    centered_p = raw_p - origin
+                    vals[ti, 0] = centered_p @ forward
+                    vals[ti, 1] = centered_p @ left
+                    vals[ti, 2] = centered_p @ up
+                elif transform_kind == "centered":
+                    vals[ti] = raw_p - origin
+                else:
+                    vals[ti] = raw_p
+            points[f"marker:{clean_name(obj.name)}"] = vals
+
+    scene_fps = float(scene.render.fps) if scene.render.fps else float(fps)
+    return points, {}, {
+        "input_kind": "fbx_blender",
+        "source_names": raw_roles,
+        "armature": arm.name,
+        "frame_start": frame_start,
+        "frame_end": frame_end,
+        "fps": scene_fps,
+        "coordinate_note": canonical_note,
+        "loader_note": "Loaded directly by Blender bpy importer.",
+    }
 
 
 def load_fbx_poselib(path: Path, root_joint: str, fps: int) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, Any]]:
@@ -606,7 +754,12 @@ def main() -> None:
     parser.add_argument("--output", "-o", type=Path, required=True, help="Output canonical v2 .npz path.")
     parser.add_argument("--fps", type=int, default=120, help="FPS to use for FBX import if source does not provide one.")
     parser.add_argument("--root-joint", default="Hips", help="Root joint name for PoseLib FBX import.")
-    args = parser.parse_args()
+    # Blender passes its own arguments before "--".  Support both normal Python:
+    #   python script.py input.fbx --output out.npz
+    # and Blender:
+    #   blender --background --python script.py -- input.fbx --output out.npz
+    parse_argv = sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else None
+    args = parser.parse_args(parse_argv)
 
     input_path = args.input.expanduser().resolve()
     output_path = args.output.expanduser().resolve()
@@ -615,7 +768,18 @@ def main() -> None:
 
     suffix = input_path.suffix.lower()
     if suffix == ".fbx":
-        points, frames, meta = load_fbx_poselib(input_path, root_joint=args.root_joint, fps=args.fps)
+        if blender_module_available():
+            points, frames, meta = load_fbx_blender(input_path, fps=args.fps)
+        else:
+            try:
+                points, frames, meta = load_fbx_poselib(input_path, root_joint=args.root_joint, fps=args.fps)
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "Raw FBX loading from normal Python failed. For this Alex repo, use Blender for raw FBX:\n\n"
+                    "  blender --background --python scripts/build_fbx_kinematic_canonical_v2.py -- "
+                    f"{input_path} --output {output_path} --fps {args.fps}\n\n"
+                    "Why: Blender provides the FBX importer. Normal Python needs a separate PoseLib/FBX-SDK setup."
+                ) from exc
     elif suffix in {".pkl", ".pickle"}:
         points, frames, meta = load_pickle_frames(input_path)
         meta["fps"] = meta.get("fps") or float(args.fps)
