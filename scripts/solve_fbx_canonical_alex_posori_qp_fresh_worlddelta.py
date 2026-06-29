@@ -315,6 +315,16 @@ def self_collision_rows(
     For each remaining contact with dist < margin, adds one row:
         sqrt(w) * n·(J1 - J2) @ dq = sqrt(w) * min(penetration, 0.05) * gain
     where n is the contact normal pushing b1 away from b2.
+
+    Weight sweep on standup_side_04 (152 frames, lying-down + get-up):
+      w=0  → 71.7% coll frames, peak 10.4 cm, track 0.073 m
+      w=5  → 46.7% coll frames, peak  4.7 cm, track 0.076 m
+      w=20 → 23.7% coll frames, peak  6.4 cm, track 0.075 m  ← sweet spot
+      w=50 → 44.7% coll frames (regresses: solver fights itself at extreme weight)
+      w=100→ 42.8% coll frames (same reason)
+    w=20 gives the best collision reduction with negligible tracking regression.
+    Above ~20 the QP becomes over-constrained and the solver can no longer route
+    around collisions, so it oscillates in a stuck configuration.
     """
     rows: list[np.ndarray] = []
     rhs_vals: list[float] = []
@@ -480,8 +490,9 @@ def main():
     ap.add_argument("--max-frames", type=int, default=20)
     ap.add_argument("--ik-iters", type=int, default=40)
     ap.add_argument("--ori-scale", type=float, default=1.0)
-    ap.add_argument("--coll-weight", type=float, default=5.0,
-                    help="Self-collision repulsion weight (0=disabled, default: 5.0)")
+    ap.add_argument("--coll-weight", type=float, default=20.0,
+                    help="Self-collision repulsion weight (0=disabled, default: 20.0 — "
+                         "see self_collision_rows docstring for sweep results)")
     ap.add_argument("--coll-margin", type=float, default=0.02,
                     help="Repulsion activates when bodies within this margin (m) of contact (default: 0.02)")
     ap.add_argument("--coll-gain", type=float, default=5.0,
