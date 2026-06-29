@@ -1,0 +1,26 @@
+# alex-gmr-retargeting
+
+Human MoCap (FBX/MVNX) → canonical skeleton → MuJoCo QP IK → IHMC Alex biped.
+
+## Layout
+- `general_motion_retargeting/` — library (morphology scaling, source adapters)
+- `scripts/` — pipeline scripts by stage (not importable)
+- `assets/alex/`, `data/`, `outputs/` — git-ignored, local only
+- `experiments/` — scratch; not production
+
+## Conventions (critical)
+- **Coord frame**: +X forward, +Y left, +Z up
+- **Quaternions**: wxyz order everywhere (not xyzw)
+- **Free root qpos**: [x, y, z, qw, qx, qy, qz, 29 joints] — indices 0–6 root, 7–35 actuated
+- **Morphology scaling**: apply only to motion *deltas* from rest pose, never to absolute root/pelvis position
+- **Orientation frames**: semantic (built from landmark positions), not raw FBX rotations — use world-delta transfer
+
+## Active solver
+`scripts/solve_fbx_canonical_alex_posori_qp_fresh_worlddelta.py`
+Uses rest-pose delta targets + world-delta orientation transfer. This is the canonical solver.
+
+## Canonical roles (15 + 4 contact sites)
+`pelvis, torso, head, left_hip, left_knee, left_foot, right_hip, right_knee, right_foot, left_shoulder, left_elbow, left_hand, right_shoulder, right_elbow, right_hand` + `left_palm, right_palm, left_sole, right_sole`
+
+## Alex model
+36-DOF: 7-DOF free root + 29 actuated joints. Model: `assets/alex/alex_floating_base_with_sites.xml`
