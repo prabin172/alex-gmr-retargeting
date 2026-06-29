@@ -276,6 +276,92 @@ def make_orientation_targets_for_frame(src_ori_mats, ori_to_idx, first_src_ori_m
     return targets
 
 
+def _within_k_hops(model: mujoco.MjModel, b1: int, b2: int, k: int) -> bool:
+    """True if b1 is an ancestor of b2 (or vice versa) within k steps in the kinematic tree."""
+    cur = b2
+    for _ in range(k):
+        cur = int(model.body_parentid[cur])
+        if cur == b1:
+            return True
+        if cur == 0:
+            break
+    cur = b1
+    for _ in range(k):
+        cur = int(model.body_parentid[cur])
+        if cur == b2:
+            return True
+        if cur == 0:
+            break
+    return False
+
+
+def self_collision_rows(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    nv: int,
+    weight: float,
+    margin: float,
+    gain: float,
+    exclude_hops: int = 2,
+) -> tuple[list, list]:
+    """
+    Build QP rows that push apart self-colliding body pairs.
+
+    MuJoCo excludes direct parent-child contacts (1 hop) automatically.
+    We also exclude bodies within `exclude_hops` of each other in the kinematic
+    tree — this catches structural near-misses like HEAD↔TORSO (2 hops, always
+    overlapping due to large geom radii, not a real cross-body collision).
+
+    For each remaining contact with dist < margin, adds one row:
+        sqrt(w) * n·(J1 - J2) @ dq = sqrt(w) * min(penetration, 0.05) * gain
+    where n is the contact normal pushing b1 away from b2.
+    """
+    rows: list[np.ndarray] = []
+    rhs_vals: list[float] = []
+
+    sqw = float(np.sqrt(weight))
+
+    for c_idx in range(data.ncon):
+        ct = data.contact[c_idx]
+        b1 = int(model.geom_bodyid[ct.geom1])
+        b2 = int(model.geom_bodyid[ct.geom2])
+
+        # Skip floor/static contacts
+        if b1 == 0 or b2 == 0:
+            continue
+
+        # Skip bodies that are kinematically close (structural near-misses)
+        if _within_k_hops(model, b1, b2, exclude_hops):
+            continue
+
+        penetration = margin - float(ct.dist)   # positive when too close or penetrating
+        if penetration <= 0:
+            continue
+
+        # Contact normal — sign-correct so it pushes b1 away from b2
+        normal = ct.frame[:3].copy()
+        if float(np.dot(normal, data.xpos[b1] - data.xpos[b2])) < 0:
+            normal = -normal
+
+        # Jacobian at the contact point for each body
+        jacp1 = np.zeros((3, nv), dtype=np.float64)
+        jacp2 = np.zeros((3, nv), dtype=np.float64)
+        mujoco.mj_jac(model, data, jacp1, None, ct.pos, b1)
+        mujoco.mj_jac(model, data, jacp2, None, ct.pos, b2)
+
+        jac_sep = normal @ (jacp1 - jacp2)       # (nv,) separation Jacobian
+
+        if np.linalg.norm(jac_sep) < 1e-9:
+            continue
+
+        target = min(penetration, 0.05) * gain   # cap to 5 cm/iter
+
+        rows.append(sqw * jac_sep)
+        rhs_vals.append(sqw * target)
+
+    return rows, rhs_vals
+
+
 def solve_frame_position_ik(
     model,
     data,
@@ -292,6 +378,10 @@ def solve_frame_position_ik(
     max_step_norm=0.20,
     root_reg=1e-3,
     posture_reg=1e-3,
+    coll_weight=0.0,
+    coll_margin=0.02,
+    coll_gain=5.0,
+    coll_hops=2,
 ):
     data.qpos[:] = q_init
     mujoco.mj_forward(model, data)
@@ -341,6 +431,15 @@ def solve_frame_position_ik(
         rows.append(np.sqrt(posture_reg) * np.eye(nv))
         rhs.append(np.sqrt(posture_reg) * desired_dq)
 
+        # Self-collision repulsion: push apart any non-adjacent penetrating body pairs.
+        if coll_weight > 0.0:
+            coll_rows, coll_rhs = self_collision_rows(
+                model, data, nv, coll_weight, coll_margin, coll_gain,
+                exclude_hops=coll_hops,
+            )
+            rows.extend(coll_rows)
+            rhs.extend([np.array([v]) for v in coll_rhs])
+
         A = np.vstack(rows)
         b = np.concatenate(rhs)
 
@@ -381,6 +480,15 @@ def main():
     ap.add_argument("--max-frames", type=int, default=20)
     ap.add_argument("--ik-iters", type=int, default=40)
     ap.add_argument("--ori-scale", type=float, default=1.0)
+    ap.add_argument("--coll-weight", type=float, default=5.0,
+                    help="Self-collision repulsion weight (0=disabled, default: 5.0)")
+    ap.add_argument("--coll-margin", type=float, default=0.02,
+                    help="Repulsion activates when bodies within this margin (m) of contact (default: 0.02)")
+    ap.add_argument("--coll-gain", type=float, default=5.0,
+                    help="Correction speed: target separation per metre of penetration (default: 5.0)")
+    ap.add_argument("--coll-hops", type=int, default=2,
+                    help="Kinematic-tree hop threshold for exclusion beyond MuJoCo's built-in 1-hop filter "
+                         "(default: 2, which also excludes grandparent-grandchild pairs like HEAD↔TORSO)")
     args = ap.parse_args()
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -439,10 +547,20 @@ def main():
     target_ori_list = []
     achieved_ori_list = []
     ori_err_deg_list = []
+    n_self_coll_list = []
 
     q = np.zeros(model.nq)
     q[3] = 1.0  # root quaternion w
 
+    coll_kwargs = dict(
+        coll_weight=args.coll_weight,
+        coll_margin=args.coll_margin,
+        coll_gain=args.coll_gain,
+        coll_hops=args.coll_hops,
+    )
+
+    print(f"Self-collision: weight={args.coll_weight}  margin={args.coll_margin} m  "
+          f"gain={args.coll_gain}  exclude_hops={args.coll_hops}")
     print()
     print("Solving initial Alex rest-alignment pose...")
     initial_targets = make_initial_alignment_targets(first_src_pos, role_to_idx, root_scale)
@@ -453,6 +571,7 @@ def main():
         initial_targets,
         q,
         iters=max(args.ik_iters * 3, 80),
+        **coll_kwargs,
     )
     mujoco.mj_forward(model, data)
 
@@ -508,9 +627,20 @@ def main():
             ori_targets=ori_targets,
             ori_scale=args.ori_scale,
             iters=args.ik_iters,
+            **coll_kwargs,
         )
 
         mujoco.mj_forward(model, data)
+
+        # Count remaining self-collisions post-solve (using same filter as the constraint)
+        n_self_coll = 0
+        for c_idx in range(data.ncon):
+            ct = data.contact[c_idx]
+            cb1 = int(model.geom_bodyid[ct.geom1])
+            cb2 = int(model.geom_bodyid[ct.geom2])
+            if cb1 > 0 and cb2 > 0 and ct.dist < 0:
+                if not _within_k_hops(model, cb1, cb2, args.coll_hops):
+                    n_self_coll += 1
 
         errs = {}
         for role, bid in role_to_body_id.items():
@@ -519,6 +649,7 @@ def main():
 
         qpos_list.append(q.copy())
         err_list.append(errs)
+        n_self_coll_list.append(n_self_coll)
 
         role_order = list(ROLE_TO_ALEX_BODY.keys())
         target_pos_list.append(np.asarray([targets[r] for r in role_order], dtype=np.float64))
@@ -539,7 +670,8 @@ def main():
 
         mean_err = np.mean(list(errs.values()))
         max_err = np.max(list(errs.values()))
-        print(f"frame {ti:04d} source={src_i:04d} mean_err={mean_err:.4f} max_err={max_err:.4f}")
+        coll_str = f"  coll={n_self_coll}" if n_self_coll > 0 else ""
+        print(f"frame {ti:04d} source={src_i:04d} mean_err={mean_err:.4f} max_err={max_err:.4f}{coll_str}")
 
     metadata = {
         "format": "alex_posori_qp_fresh_worlddelta_v2",
@@ -562,10 +694,15 @@ def main():
         ],
     }
 
+    n_coll_arr = np.asarray(n_self_coll_list, dtype=np.int32)
+    print(f"\nSelf-collision summary: {n_coll_arr.sum()} total penetrating frames "
+          f"({(n_coll_arr > 0).mean() * 100:.1f}% of frames)")
+
     np.savez(
         args.out,
         qpos=np.asarray(qpos_list),
         fps=np.float64(fps),
+        self_collision_counts=n_coll_arr,
         target_positions=np.asarray(target_pos_list),
         achieved_positions=np.asarray(achieved_pos_list),
         orientation_role_names=np.asarray(list(ORI_TO_ALEX_BODY.keys()), dtype=object),
