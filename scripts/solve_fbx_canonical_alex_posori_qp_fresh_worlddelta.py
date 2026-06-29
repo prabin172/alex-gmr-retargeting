@@ -565,6 +565,7 @@ def main():
     np.savez(
         args.out,
         qpos=np.asarray(qpos_list),
+        fps=np.float64(fps),
         target_positions=np.asarray(target_pos_list),
         achieved_positions=np.asarray(achieved_pos_list),
         orientation_role_names=np.asarray(list(ORI_TO_ALEX_BODY.keys()), dtype=object),
