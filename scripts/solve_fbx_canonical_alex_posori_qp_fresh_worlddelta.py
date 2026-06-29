@@ -115,16 +115,22 @@ def load_canonical(npz_path: Path):
     return roles, role_to_idx, positions, fps, orientation_roles, ori_to_idx, orientation_mats
 
 
-def estimate_source_scale(first_pos, role_to_idx):
-    """
-    Simple initial scaling from human to Alex-ish size.
-    For the first pass, use human pelvis-to-head height.
-    """
+def measure_alex_pelvis_to_head(model, data, role_to_body_id):
+    """Query Alex's pelvis-to-head distance at the default (all-joints-zero) pose."""
+    q_rest = np.zeros(model.nq)
+    q_rest[3] = 1.0
+    data.qpos[:] = q_rest
+    mujoco.mj_forward(model, data)
+    pelvis_pos = data.xpos[role_to_body_id["pelvis"]].copy()
+    head_pos = data.xpos[role_to_body_id["head"]].copy()
+    return float(np.linalg.norm(head_pos - pelvis_pos))
+
+
+def estimate_source_scale(first_pos, role_to_idx, alex_pelvis_to_head):
+    """Global scale for root translation: ratio of Alex to human pelvis-to-head height."""
     pelvis = first_pos[role_to_idx["pelvis"]]
     head = first_pos[role_to_idx["head"]]
     human_height = np.linalg.norm(head - pelvis)
-    # Alex default pelvis to head is around 0.61 m from earlier inspection.
-    alex_pelvis_to_head = 0.615
     return alex_pelvis_to_head / max(human_height, 1e-6)
 
 
@@ -149,20 +155,47 @@ def make_initial_alignment_targets(first_src_pos, role_to_idx, scale):
     return targets
 
 
-def make_targets_for_frame(src_pos, role_to_idx, first_src_pos, target_rest_positions, scale):
+def compute_per_role_scales(first_src_pos, role_to_idx, target_rest_positions, clamp=(0.4, 2.5)):
     """
-    Rest-aligned morphology-delta target.
+    Per-role scale factors from comparing source vs Alex achieved-rest proportions.
+
+    For each non-root role, we compare the pelvis-relative distance in the human
+    rest frame to the pelvis-relative distance Alex achieved after initial IK.
+    This captures limb-proportion differences (e.g. shorter arms on Alex) that a
+    single global scale misses.
+
+    The global scale is not needed here; the root translation uses its own scale.
+    """
+    src_pelvis = first_src_pos[role_to_idx["pelvis"]]
+    alex_pelvis = target_rest_positions["pelvis"]
+
+    scales = {}
+    for role in ROLE_TO_ALEX_BODY:
+        if role == "pelvis":
+            scales[role] = 1.0
+            continue
+        src_dist = float(np.linalg.norm(first_src_pos[role_to_idx[role]] - src_pelvis))
+        alex_dist = float(np.linalg.norm(target_rest_positions[role] - alex_pelvis))
+        if src_dist < 1e-6:
+            scales[role] = 1.0
+        else:
+            scales[role] = float(np.clip(alex_dist / src_dist, clamp[0], clamp[1]))
+
+    return scales
+
+
+def make_targets_for_frame(src_pos, role_to_idx, first_src_pos, target_rest_positions, root_scale, role_scales):
+    """
+    Rest-aligned morphology-delta target with per-role scales.
 
     For each role:
       target(t) = achieved_alex_rest(role)
-                + scaled pelvis displacement from source rest
-                + scaled role motion relative to pelvis from source rest
-
-    This is much closer to the previous method than direct absolute scaling.
+                + root_scale * pelvis displacement from source rest
+                + role_scales[role] * role motion relative to pelvis from source rest
     """
     src_pelvis0 = first_src_pos[role_to_idx["pelvis"]]
     src_pelvis = src_pos[role_to_idx["pelvis"]]
-    root_delta = scale * (src_pelvis - src_pelvis0)
+    root_delta = root_scale * (src_pelvis - src_pelvis0)
 
     targets = {}
     for role in ROLE_TO_ALEX_BODY:
@@ -171,7 +204,8 @@ def make_targets_for_frame(src_pos, role_to_idx, first_src_pos, target_rest_posi
         else:
             rel0 = first_src_pos[role_to_idx[role]] - src_pelvis0
             rel = src_pos[role_to_idx[role]] - src_pelvis
-            rel_delta = scale * (rel - rel0)
+            s = role_scales.get(role, root_scale)
+            rel_delta = s * (rel - rel0)
             targets[role] = target_rest_positions[role] + root_delta + rel_delta
 
     return targets
@@ -299,9 +333,13 @@ def solve_frame_position_ik(
                 rows.append(np.sqrt(weight) * jacr)
                 rhs.append(np.sqrt(weight) * err_rot)
 
-        # regularize joint velocities
+        # Pull actuated joints toward q_ref (start of this frame's solve).
+        # Root DOFs (0-5) are left at zero — the position/orientation tasks steer them.
+        # Actuated joints: dq[6:35] corresponds to qpos[7:36].
+        desired_dq = np.zeros(nv)
+        desired_dq[6:] = q_ref[7:] - data.qpos[7:]
         rows.append(np.sqrt(posture_reg) * np.eye(nv))
-        rhs.append(np.zeros(nv))
+        rhs.append(np.sqrt(posture_reg) * desired_dq)
 
         A = np.vstack(rows)
         b = np.concatenate(rhs)
@@ -376,13 +414,16 @@ def main():
 
     first_src_pos = src_positions[frame_ids[0]]
     first_src_ori = orientation_mats[frame_ids[0]]
-    scale = estimate_source_scale(first_src_pos, role_to_idx)
+
+    alex_pelvis_to_head = measure_alex_pelvis_to_head(model, data, role_to_body_id)
+    root_scale = estimate_source_scale(first_src_pos, role_to_idx, alex_pelvis_to_head)
 
     print("Canonical:", args.canonical)
     print("Model:", args.model)
     print("Frames:", len(frame_ids), "stride:", args.stride)
     print("Source fps:", fps)
-    print("Estimated human->Alex scale:", scale)
+    print(f"Alex pelvis-to-head (model): {alex_pelvis_to_head:.4f} m")
+    print("Estimated root scale:", root_scale)
     print("Targets:")
     for role, body_name in ROLE_TO_ALEX_BODY.items():
         print(f"  {role:14s} -> {body_name}")
@@ -404,7 +445,7 @@ def main():
 
     print()
     print("Solving initial Alex rest-alignment pose...")
-    initial_targets = make_initial_alignment_targets(first_src_pos, role_to_idx, scale)
+    initial_targets = make_initial_alignment_targets(first_src_pos, role_to_idx, root_scale)
     q = solve_frame_position_ik(
         model,
         data,
@@ -425,6 +466,9 @@ def main():
         for role, bid in ori_role_to_body_id.items()
     }
 
+    # Per-role scales from comparing source vs Alex achieved-rest proportions.
+    role_scales = compute_per_role_scales(first_src_pos, role_to_idx, target_rest_positions)
+
     rest_errs = {
         role: float(np.linalg.norm(initial_targets[role] - data.xpos[bid]))
         for role, bid in role_to_body_id.items()
@@ -433,6 +477,9 @@ def main():
     for role, err in rest_errs.items():
         print(f"  {role:12s} {err:.4f}")
     print(f"  mean={np.mean(list(rest_errs.values())):.4f} max={np.max(list(rest_errs.values())):.4f}")
+    print("Per-role scales:")
+    for role, s in role_scales.items():
+        print(f"  {role:14s} {s:.4f}")
 
     for ti, src_i in enumerate(frame_ids):
         targets = make_targets_for_frame(
@@ -440,7 +487,8 @@ def main():
             role_to_idx,
             first_src_pos,
             target_rest_positions,
-            scale,
+            root_scale,
+            role_scales,
         )
 
         ori_targets = make_orientation_targets_for_frame(
@@ -494,7 +542,7 @@ def main():
         print(f"frame {ti:04d} source={src_i:04d} mean_err={mean_err:.4f} max_err={max_err:.4f}")
 
     metadata = {
-        "format": "alex_posori_qp_fresh_worlddelta_v1",
+        "format": "alex_posori_qp_fresh_worlddelta_v2",
         "canonical": str(args.canonical),
         "model": str(args.model),
         "role_to_alex_body": ROLE_TO_ALEX_BODY,
@@ -502,13 +550,15 @@ def main():
         "orientation_cost": args.ori_scale,
         "ori_to_alex_body": ORI_TO_ALEX_BODY,
         "ori_weights": ORI_WEIGHTS,
-        "scale": scale,
+        "root_scale": root_scale,
+        "role_scales": role_scales,
+        "alex_pelvis_to_head": alex_pelvis_to_head,
         "frame_ids": frame_ids,
         "notes": [
-            "Fresh position-only Alex body IK with initial rest-alignment and rest-pose delta targets.",
-            "No palm/sole/contact sites used.",
-            "No orientation cost used.",
-            "Targets are canonical human role positions mapped to real Alex body origins.",
+            "Position + orientation QP IK with world-delta orientation transfer.",
+            "Per-role morphology scales computed from source vs Alex achieved-rest proportions.",
+            "Root translation uses global pelvis-to-head scale queried from the MuJoCo model.",
+            "Posture regularization pulls actuated joints toward start-of-frame reference.",
         ],
     }
 
