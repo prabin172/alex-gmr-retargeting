@@ -108,6 +108,37 @@ def find_armature():
     return arms[0]
 
 
+def detect_action_frame_range(arm):
+    """
+    Detect the actual animation frame range from the armature's actions.
+
+    Blender's scene.frame_end is often stuck at 250 (the default) even when
+    the imported FBX animation is longer. This scans the actions linked to
+    the armature and returns the true start/end frames.
+    """
+    # Check the directly-active action first.
+    if arm.animation_data and arm.animation_data.action:
+        r = arm.animation_data.action.frame_range
+        if int(r[1]) > 1:
+            return int(r[0]), int(r[1])
+
+    # Scan all actions whose names start with the armature name.
+    prefix = arm.name + "|"
+    best_start, best_end = None, None
+    for action in bpy.data.actions:
+        if action.name.startswith(prefix) and int(action.frame_range[1]) > 1:
+            s, e = int(action.frame_range[0]), int(action.frame_range[1])
+            if best_end is None or e > best_end:
+                best_start, best_end = s, e
+
+    if best_start is not None:
+        return best_start, best_end
+
+    # Fall back to scene range (may be the Blender default 250).
+    print("WARNING: could not detect animation range from actions; using scene frame range.")
+    return int(bpy.context.scene.frame_start), int(bpy.context.scene.frame_end)
+
+
 def blender_to_canonical_xyz(v):
     """
     Convert Blender/FBX coordinates to internal canonical convention.
@@ -161,8 +192,9 @@ def main():
             print(f"  {role}: {bone}")
         raise RuntimeError("Required FBX bones are missing.")
 
-    frame_start = args.start_frame if args.start_frame is not None else int(scene.frame_start)
-    frame_end = args.end_frame if args.end_frame is not None else int(scene.frame_end)
+    anim_start, anim_end = detect_action_frame_range(arm)
+    frame_start = args.start_frame if args.start_frame is not None else anim_start
+    frame_end = args.end_frame if args.end_frame is not None else anim_end
     frames = list(range(frame_start, frame_end + 1, args.stride))
 
     roles = list(ROLE_TO_BONE.keys())
@@ -173,6 +205,7 @@ def main():
     print("FBX:", args.fbx)
     print("Armature:", arm.name)
     print("Scene frames:", scene.frame_start, "to", scene.frame_end)
+    print("Detected animation range:", anim_start, "to", anim_end)
     print("Extracting frames:", frame_start, "to", frame_end, "stride", args.stride)
     print("Roles:", len(roles))
 
