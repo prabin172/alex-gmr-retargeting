@@ -15,7 +15,14 @@ Human MoCap (FBX/MVNX) → canonical skeleton → MuJoCo QP IK → IHMC Alex bip
 - **Morphology scaling**: apply only to motion *deltas* from rest pose, never to absolute root/pelvis position
 - **Orientation frames**: semantic (built from landmark positions), not raw FBX rotations — use world-delta transfer
 
-## Active solver
+## Pipeline (4 stages)
+1. **FBX → positions** — `scripts/build_fbx_canonical_human.py` (Blender)
+2. **Positions → orientation frames** — `scripts/build_canonical_orientation_frames_fresh.py` (auto-detects facing yaw)
+3. **IK solve** — `scripts/solve_fbx_canonical_alex_posori_qp_fresh_worlddelta.py` → `qpos (N,36)` NPZ
+4. **Ground + contact labels** — `scripts/post_process_grounding_contacts.py` → Mimic-ready NPZ (`qpos_grounded`, `contact_labels (N,11)`)
+5. **Render** — `scripts/visualization/render_alex_qp_direct_mp4_fresh.py`
+
+## Active solver (Stage 3)
 `scripts/solve_fbx_canonical_alex_posori_qp_fresh_worlddelta.py`
 Uses rest-pose delta targets + world-delta orientation transfer. This is the canonical solver.
 
