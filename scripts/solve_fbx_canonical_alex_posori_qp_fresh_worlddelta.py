@@ -76,10 +76,10 @@ ORI_WEIGHTS = {
     "pelvis": 0.5,
     "torso": 0.25,
     "head": 0.20,
-    "left_foot": 0.35,
-    "right_foot": 0.35,
-    "left_hand": 0.20,
-    "right_hand": 0.20,
+    "left_foot": 0.70,
+    "right_foot": 0.70,
+    "left_hand": 0.40,
+    "right_hand": 0.40,
 }
 
 
@@ -488,6 +488,9 @@ def main():
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--stride", type=int, default=10)
     ap.add_argument("--max-frames", type=int, default=20)
+    ap.add_argument("--log-every", type=int, default=1,
+                    help="Print a per-frame line every N solved frames (1=all). "
+                         "Final frame + summary always printed. Use >1 to cut log volume.")
     ap.add_argument("--ik-iters", type=int, default=40)
     ap.add_argument("--ori-scale", type=float, default=1.0)
     ap.add_argument("--coll-weight", type=float, default=20.0,
@@ -682,7 +685,8 @@ def main():
         mean_err = np.mean(list(errs.values()))
         max_err = np.max(list(errs.values()))
         coll_str = f"  coll={n_self_coll}" if n_self_coll > 0 else ""
-        print(f"frame {ti:04d} source={src_i:04d} mean_err={mean_err:.4f} max_err={max_err:.4f}{coll_str}")
+        if ti % args.log_every == 0 or ti == len(frame_ids) - 1:
+            print(f"frame {ti:04d} source={src_i:04d} mean_err={mean_err:.4f} max_err={max_err:.4f}{coll_str}")
 
     metadata = {
         "format": "alex_posori_qp_fresh_worlddelta_v2",

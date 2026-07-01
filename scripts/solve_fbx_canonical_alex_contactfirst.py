@@ -710,6 +710,9 @@ def main():
     ap.add_argument("--foot-flat-tilt", type=float, default=40.0,
                     help="Max tilt (deg) of the human foot sole-normal from vertical for a foot to count "
                          "as a flat plantar support (default: 40)")
+    ap.add_argument("--log-every", type=int, default=1,
+                    help="Print a per-frame line every N solved frames (1=all). "
+                         "Final frame + summary always printed. Use >1 to cut log volume.")
     ap.add_argument("--no-contact-first", action="store_true",
                     help="Disable contact-gated foot-flat / fist-down overrides (baseline behaviour)")
     args = ap.parse_args()
@@ -1011,7 +1014,8 @@ def main():
                             + (f"/{palm_pos_err[e]*100:.0f}cm" if e in palm_pos_err else "")
                             for e in active)
             con_str = f"  contact[{angs}]"
-        print(f"frame {ti:04d} source={src_i:04d} mean_err={mean_err:.4f} max_err={max_err:.4f}{coll_str}{con_str}")
+        if ti % args.log_every == 0 or ti == len(frame_ids) - 1:
+            print(f"frame {ti:04d} source={src_i:04d} mean_err={mean_err:.4f} max_err={max_err:.4f}{coll_str}{con_str}")
 
     metadata = {
         "format": "alex_contactfirst_v1",
