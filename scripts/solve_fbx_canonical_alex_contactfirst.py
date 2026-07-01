@@ -172,17 +172,35 @@ CONTACT_POS = {
 }
 CONTACT_POS_WEIGHT = 3.0
 
+# Foot effector -> the position-target role that actually places it (the ankle
+# landmark; there is no separate "foot" position role). Used by the planted-foot
+# position hold to freeze the right target.
+FOOT_POS_ROLE = {"left_foot": "left_ankle", "right_foot": "right_ankle"}
+
+# Foot effector -> the knee position role above it (shank-tilt clamp).
+FOOT_KNEE_ROLE = {"left_foot": "left_knee", "right_foot": "right_knee"}
+
 
 def detect_contacts_from_human(positions, role_to_idx, fps, *,
                                orientation_mats=None, ori_to_idx=None,
                                foot_height=0.07, hand_height=0.08,
-                               speed_thresh=0.4, foot_flat_tilt=40.0, floor_pct=1.0):
+                               speed_thresh=0.4, foot_flat_tilt=40.0, floor_pct=1.0,
+                               on_height_frac=1.0, on_speed_frac=1.0,
+                               onset_max_delay=0.15):
     """Per-frame ground-contact flags for each effector, from human mocap.
 
     An effector is "in contact" at frame t when the lowest of its markers is
     within `*_height` metres of the clip floor AND moving slower than
     `speed_thresh` (m/s). The floor is the low percentile of the feet markers'
     height across the whole clip.
+
+    Onset hysteresis (`on_height_frac`/`on_speed_frac` < 1): the START of each
+    contact interval is delayed until the effector passes STRICTER thresholds
+    (height*frac, speed*frac) — the loose thresholds fire while it is still
+    descending into a pose. The delay is capped at `onset_max_delay` seconds so
+    a crouched plant that hovers under the loose gate without ever passing the
+    strict one is trimmed, never dropped (uncapped hysteresis deleted whole
+    genuine plant intervals on get-up clips). Release unchanged. 1.0/1.0 = off.
 
     For effectors with a `flat_ori_role`, contact additionally requires the
     *human* segment to be near-flat: its canonical frame local-Z (sole normal)
@@ -229,6 +247,24 @@ def detect_contacts_from_human(positions, role_to_idx, fps, *,
             up = orientation_mats[:, ori_to_idx[flat_role], :, 2]  # local-Z (sole normal)
             tilt = np.degrees(np.arccos(np.clip(np.abs(up @ np.array([0.0, 0.0, 1.0])), -1, 1)))
             flag = flag & (tilt < foot_flat_tilt)
+
+        if on_height_frac < 1.0 or on_speed_frac < 1.0:
+            strict = flag & (h < hthr * on_height_frac) & (spd < speed_thresh * on_speed_frac)
+            cap = max(0, int(round(onset_max_delay * fps)))
+            out = np.zeros(N, dtype=bool)
+            t = 0
+            while t < N:
+                if not flag[t]:
+                    t += 1
+                    continue
+                a = t
+                while t < N and flag[t]:
+                    t += 1
+                b = t                                   # loose interval [a, b)
+                s = np.where(strict[a:b])[0]
+                onset = a + (min(int(s[0]), cap) if len(s) else cap)
+                out[min(onset, b - 1):b] = True         # trim the start, never drop
+            flag = out
 
         contacts[eff] = flag
 
@@ -308,6 +344,51 @@ def site_id(model, name):
     if sid < 0:
         raise RuntimeError(f"Missing site in Alex model: {name}")
     return sid
+
+
+def joint_info(model, name):
+    """(qpos address, dof address, (lo, hi) range) of a named hinge joint."""
+    jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+    if jid < 0:
+        raise RuntimeError(f"Missing joint in Alex model: {name}")
+    return int(model.jnt_qposadr[jid]), int(model.jnt_dofadr[jid]), tuple(model.jnt_range[jid])
+
+
+def clamp_shank_tilt(ankle_t, knee_t, fwd_xy, pitch_range, roll_range):
+    """
+    Project the knee position target into the shank-tilt region reachable with a
+    FLAT foot, i.e. within the ankle pitch/roll joint ranges. Retargeting-side
+    feasibility fix: copying the human verbatim demands near/over-limit ankle
+    angles during plants, and no solver weighting can reconcile "foot flat" with
+    an infeasible knee target — so the target itself is made consistent here.
+
+    ankle_t/knee_t: world position targets; fwd_xy: planted-foot heading (unit,
+    ground plane). pitch_range: (min, max) forward-lean angle of the shank;
+    roll_range: (min, max) leftward-lean angle. Returns (knee_target, clamped?).
+    """
+    v = knee_t - ankle_t
+    L = float(np.linalg.norm(v))
+    z = np.array([0.0, 0.0, 1.0])
+    vz = float(v @ z)
+    # Knee not meaningfully above the ankle (deep kneel / data glitch): the
+    # flat-foot tilt decomposition is undefined, leave the target alone.
+    if L < 1e-9 or vz < 0.2 * L:
+        return knee_t, False
+
+    f = np.array([fwd_xy[0], fwd_xy[1], 0.0])
+    f /= np.linalg.norm(f)
+    lat = np.cross(z, f)
+
+    pitch = np.arctan2(float(v @ f), vz)      # shank forward lean over the foot
+    roll = np.arctan2(float(v @ lat), vz)     # shank leftward lean
+    cp = float(np.clip(pitch, *pitch_range))
+    cr = float(np.clip(roll, *roll_range))
+    if cp == pitch and cr == roll:
+        return knee_t, False
+
+    u = f * np.tan(cp) + lat * np.tan(cr) + z
+    u /= np.linalg.norm(u)
+    return ankle_t + L * u, True
 
 
 def load_canonical(npz_path: Path):
@@ -603,6 +684,9 @@ def solve_frame_position_ik(
     skip_pos_roles=None,
     ori_weight_scale=None,
     pos_weight_scale=None,
+    hold_pos_roles=None,
+    hierarchical=True,
+    knee_bias=None,
     iters=30,
     damping=1e-3,
     step_scale=0.7,
@@ -620,9 +704,11 @@ def solve_frame_position_ik(
     nv = model.nv
     q_ref = q_init.copy()
 
+    hold = hold_pos_roles or set()
+
     for _ in range(iters):
-        rows = []
-        rhs = []
+        rows1 = []; rhs1 = []   # level 1: contact tasks (high priority)
+        rows2 = []; rhs2 = []   # level 2: body tracking + regularisers
 
         for role, bid in role_to_body_id.items():
             # Suppressed/faded while the matching hand is in contact: the palm
@@ -642,8 +728,12 @@ def solve_frame_position_ik(
             jacr = np.zeros((3, nv), dtype=np.float64)
             mujoco.mj_jacBody(model, data, jacp, jacr, bid)
 
-            rows.append(np.sqrt(weight) * jacp)
-            rhs.append(np.sqrt(weight) * err)
+            if role in hold:   # planted-foot position hold -> high priority
+                rows1.append(np.sqrt(weight) * jacp)
+                rhs1.append(np.sqrt(weight) * err)
+            else:
+                rows2.append(np.sqrt(weight) * jacp)
+                rhs2.append(np.sqrt(weight) * err)
 
         if ori_role_to_body_id is not None and ori_targets is not None and ori_scale > 0.0:
             for role, bid in ori_role_to_body_id.items():
@@ -667,44 +757,84 @@ def solve_frame_position_ik(
                 jacr = np.zeros((3, nv), dtype=np.float64)
                 mujoco.mj_jacBody(model, data, jacp, jacr, bid)
 
-                rows.append(np.sqrt(weight) * jacr)
-                rhs.append(np.sqrt(weight) * err_rot)
+                rows2.append(np.sqrt(weight) * jacr)
+                rhs2.append(np.sqrt(weight) * err_rot)
 
         # Contact position pin: drive a site (palm contact patch) to a world
-        # target — the fist support location during hand contact.
+        # target — the fist support location during hand contact. Level 2: the
+        # palm pin is best-effort by design (Alex arm shorter than human, the
+        # target is often out of reach) — promoting an infeasible task to hard
+        # priority starves the body tracking in its nullspace.
         if pos_site_constraints:
             for sid, target, weight in pos_site_constraints:
                 cur = data.site_xpos[sid].copy()
                 err = target - cur
                 jacp = np.zeros((3, nv), dtype=np.float64)
                 mujoco.mj_jacSite(model, data, jacp, None, sid)
-                rows.append(np.sqrt(weight) * jacp)
-                rhs.append(np.sqrt(weight) * err)
+                rows2.append(np.sqrt(weight) * jacp)
+                rhs2.append(np.sqrt(weight) * err)
 
         # Contact axis-alignment: drive a body-local axis to a world direction
         # (foot up -> +Z; palm normal -> -Z). Cross product gives the world-frame
         # rotation vector that brings the current axis onto the target, leaving
-        # spin about that axis free.
+        # spin about that axis free. `hard` routes feet to level 1 (achievable,
+        # must not be compromised) and hands to level 2 (best-effort by design).
         if align_constraints:
-            for bid, axis_local, world_dir, weight in align_constraints:
+            for bid, axis_local, world_dir, weight, hard in align_constraints:
                 R_current = body_xmat(data, bid)
                 a_world = R_current @ axis_local
-                err_rot = np.cross(a_world, world_dir)
+                # Well-conditioned axis-alignment error = theta * unit_axis (cost
+                # theta^2, gradient always drives theta->0). The bare cross product
+                # a x d has magnitude sin(theta), whose cost sin^2 has a spurious
+                # stable minimum at 180deg, so a stiff flat term can flip a foot
+                # through the singularity. This form removes that.
+                c = np.cross(a_world, world_dir)
+                s = float(np.linalg.norm(c))
+                dot = float(np.clip(a_world @ world_dir, -1.0, 1.0))
+                theta = float(np.arctan2(s, dot))
+                if s > 1e-6:
+                    err_rot = (theta / s) * c
+                elif dot >= 0.0:
+                    err_rot = np.zeros(3)
+                else:                                   # antipodal: any perpendicular axis
+                    perp = np.cross(a_world, np.array([1.0, 0.0, 0.0]))
+                    if np.linalg.norm(perp) < 1e-6:
+                        perp = np.cross(a_world, np.array([0.0, 1.0, 0.0]))
+                    err_rot = theta * perp / (np.linalg.norm(perp) + 1e-12)
 
                 jacp = np.zeros((3, nv), dtype=np.float64)
                 jacr = np.zeros((3, nv), dtype=np.float64)
                 mujoco.mj_jacBody(model, data, jacp, jacr, bid)
 
-                rows.append(np.sqrt(weight) * jacr)
-                rhs.append(np.sqrt(weight) * err_rot)
+                if hard:
+                    rows1.append(np.sqrt(weight) * jacr)
+                    rhs1.append(np.sqrt(weight) * err_rot)
+                else:
+                    rows2.append(np.sqrt(weight) * jacr)
+                    rhs2.append(np.sqrt(weight) * err_rot)
 
         # Pull actuated joints toward q_ref (start of this frame's solve).
         # Root DOFs (0-5) are left at zero — the position/orientation tasks steer them.
         # Actuated joints: dq[6:35] corresponds to qpos[7:36].
         desired_dq = np.zeros(nv)
         desired_dq[6:] = q_ref[7:] - data.qpos[7:]
-        rows.append(np.sqrt(posture_reg) * np.eye(nv))
-        rhs.append(np.sqrt(posture_reg) * desired_dq)
+        rows2.append(np.sqrt(posture_reg) * np.eye(nv))
+        rhs2.append(np.sqrt(posture_reg) * desired_dq)
+
+        # One-sided knee-flexion bias: KNEE_Y straight (q=0) sits exactly at the
+        # joint's lower limit AND the leg Jacobian singularity. Weakly push any
+        # knee straighter than min_flex back to min_flex; silent once bent, so it
+        # cannot over-constrain tracking — it only breaks the straight-leg lock.
+        if knee_bias is not None:
+            entries, min_flex, kb_weight = knee_bias
+            if kb_weight > 0.0:
+                for qadr, dofadr in entries:
+                    cur = float(data.qpos[qadr])
+                    if cur < min_flex:
+                        row = np.zeros((1, nv))
+                        row[0, dofadr] = np.sqrt(kb_weight)
+                        rows2.append(row)
+                        rhs2.append(np.array([np.sqrt(kb_weight) * (min_flex - cur)]))
 
         # Self-collision repulsion: push apart any non-adjacent penetrating body pairs.
         if coll_weight > 0.0:
@@ -712,19 +842,35 @@ def solve_frame_position_ik(
                 model, data, nv, coll_weight, coll_margin, coll_gain,
                 exclude_hops=coll_hops,
             )
-            rows.extend(coll_rows)
-            rhs.extend([np.array([v]) for v in coll_rhs])
+            rows2.extend(coll_rows)
+            rhs2.extend([np.array([v]) for v in coll_rhs])
 
-        A = np.vstack(rows)
-        b = np.concatenate(rhs)
+        I_nv = np.eye(nv)
 
-        H = A.T @ A + damping * np.eye(nv)
-        g = A.T @ b
+        def _dsolve(H, g):
+            try:
+                return np.linalg.solve(H, g)
+            except np.linalg.LinAlgError:
+                return np.linalg.lstsq(H, g, rcond=None)[0]
 
-        try:
-            dq = np.linalg.solve(H, g)
-        except np.linalg.LinAlgError:
-            dq = np.linalg.lstsq(H, g, rcond=None)[0]
+        if hierarchical and rows1:
+            # Task-priority (nullspace) solve: satisfy the level-1 FOOT contact
+            # tasks (foot-flat/yaw, planted-foot position hold) first, then track
+            # the level-2 targets (body + best-effort hand contacts) ONLY in the
+            # nullspace of level 1 — the pelvis/chain cannot drag a planted foot.
+            A1 = np.vstack(rows1); b1 = np.concatenate(rhs1)
+            A2 = np.vstack(rows2); b2 = np.concatenate(rhs2)
+            H1 = A1.T @ A1 + damping * I_nv
+            d1 = _dsolve(H1, A1.T @ b1)
+            N1 = I_nv - _dsolve(H1, A1.T @ A1)      # damped nullspace projector
+            M = A2 @ N1
+            z = _dsolve(M.T @ M + damping * I_nv, M.T @ (b2 - A2 @ d1))
+            dq = d1 + N1 @ z
+        else:
+            # Single-level (order-independent; identical to the pre-hierarchy solve).
+            A = np.vstack(rows1 + rows2)
+            b = np.concatenate(rhs1 + rhs2)
+            dq = _dsolve(A.T @ A + damping * I_nv, A.T @ b)
 
         n = np.linalg.norm(dq)
         if n > max_step_norm:
@@ -771,6 +917,16 @@ def main():
                     help="Hand marker height (m) above clip floor below which a hand is in contact (default: 0.08)")
     ap.add_argument("--contact-speed", type=float, default=0.4,
                     help="Marker speed (m/s) below which an effector can be in contact (default: 0.4)")
+    ap.add_argument("--contact-on-height-frac", type=float, default=0.7,
+                    help="Onset hysteresis: contact turns ON only below height*frac (stays on under "
+                         "the base threshold). Delays touchdown labelling until genuinely settled. "
+                         "1.0 disables (default: 0.7)")
+    ap.add_argument("--contact-on-speed-frac", type=float, default=0.5,
+                    help="Onset hysteresis: contact turns ON only below speed*frac (stays on under "
+                         "the base threshold). 1.0 disables (default: 0.5)")
+    ap.add_argument("--contact-onset-max-delay", type=float, default=0.15,
+                    help="Cap (s) on the hysteresis onset delay: a plant that never passes the strict "
+                         "gate is trimmed by at most this, never dropped (default: 0.15)")
     ap.add_argument("--foot-flat-tilt", type=float, default=40.0,
                     help="Max tilt (deg) of the human foot sole-normal from vertical for a foot to count "
                          "as a flat plantar support (default: 40)")
@@ -789,6 +945,50 @@ def main():
     ap.add_argument("--contact-preroll", type=int, default=2,
                     help="Look-ahead: begin easing contact constraints in this many solved frames "
                          "BEFORE touchdown so the foot/hand is prepared (default: 2)")
+    ap.add_argument("--foot-hold", dest="foot_hold", action="store_true", default=True,
+                    help="During foot contact, freeze the foot POSITION target at the frame the foot "
+                         "first becomes planted and cross-fade the moving human target onto it, so a "
+                         "flat foot stops sliding while it is down (kills standup plant-slip). Default on.")
+    ap.add_argument("--no-foot-hold", dest="foot_hold", action="store_false",
+                    help="Disable the planted-foot position hold (feet track the moving human target).")
+    ap.add_argument("--foot-hold-latch", type=float, default=0.5,
+                    help="Contact cross-fade weight [0,1] at/above which the foot-hold anchor latches "
+                         "(below it the anchor keeps tracking the descending foot). Default 0.5.")
+    ap.add_argument("--foot-hold-weight", type=float, default=10.0,
+                    help="While held, multiply the foot (ankle) position weight by this so the planted "
+                         "foot resists being dragged by the heavier pelvis/chain targets. Cross-faded "
+                         "by the contact weight. 1.0 = freeze target only (no boost). Default 10.0 "
+                         "(3.0 let the shovel body motion drag the plant 38-72cm; 10 -> 23-38cm and "
+                         "also cuts standup foot drag with no tracking/smoothness cost).")
+    ap.add_argument("--hierarchical", dest="hierarchical", action="store_true", default=False,
+                    help="Task-priority IK: FOOT contact tasks (flat/yaw/hold) at high priority, body "
+                         "+ best-effort hand contacts tracked in their nullspace. Default OFF and NOT "
+                         "used by the unified pipeline: hold-weight 10 + GlobalOPT Stage B reaches "
+                         "lower plant slip (shovel 1.5cm vs 4.7cm) with one config for all actions, "
+                         "and hierarchy still regresses on pivoting get-up contacts (standup_natural_01 "
+                         "tracking +13%, jumps +35% even with hands demoted to soft).")
+    ap.add_argument("--no-hierarchical", dest="hierarchical", action="store_false")
+    ap.add_argument("--foot-flat-weight", type=float, default=3.0,
+                    help="Foot-flat (up-axis->+Z) align weight during contact. NOTE: raising this to "
+                         "out-prioritise the hold backfires - the cross-product orientation error has a "
+                         "spurious 180-deg equilibrium and high stiffness flips a near-limit foot. "
+                         "Proper flatness priority needs a hierarchical/nullspace solve. Default 3.0.")
+    ap.add_argument("--shank-clamp", dest="shank_clamp", action="store_true", default=True,
+                    help="During foot contact, project the KNEE position target into the shank-tilt "
+                         "region reachable with a flat foot (ankle pitch/roll joint ranges, read from "
+                         "the model). Retargeting-side feasibility: removes the near-limit-ankle fight "
+                         "between foot-flat and human leg tracking. Default on.")
+    ap.add_argument("--no-shank-clamp", dest="shank_clamp", action="store_false")
+    ap.add_argument("--shank-margin-deg", type=float, default=5.0,
+                    help="Keep the clamped shank tilt this many degrees INSIDE the ankle joint range "
+                         "(default: 5)")
+    ap.add_argument("--knee-bias-weight", type=float, default=0.5,
+                    help="Weight of the one-sided knee-flexion bias: weakly push a knee straighter than "
+                         "--knee-min-flex-deg back toward it (straight knee = joint lower limit + leg "
+                         "Jacobian singularity; humanoids stand slightly bent). Inactive once the knee "
+                         "is bent, so it cannot over-constrain. 0 disables (default: 0.5)")
+    ap.add_argument("--knee-min-flex-deg", type=float, default=12.0,
+                    help="Knee flexion (deg) below which the knee-bend bias engages (default: 12)")
     ap.add_argument("--log-every", type=int, default=1,
                     help="Print a per-frame line every N solved frames (1=all). "
                          "Final frame + summary always printed. Use >1 to cut log volume.")
@@ -831,6 +1031,9 @@ def main():
         hand_height=args.hand_contact_height,
         speed_thresh=args.contact_speed,
         foot_flat_tilt=args.foot_flat_tilt,
+        on_height_frac=args.contact_on_height_frac,
+        on_speed_frac=args.contact_on_speed_frac,
+        onset_max_delay=args.contact_onset_max_delay,
     )
     effector_body_id = {
         eff: body_id(model, cfg["body"]) for eff, cfg in CONTACT_EFFECTORS.items()
@@ -838,6 +1041,29 @@ def main():
     effector_site_id = {
         eff: site_id(model, cfg["site"]) for eff, cfg in CONTACT_POS.items()
     }
+
+    # Shank-tilt clamp limits from the model's ankle joint ranges. With the foot
+    # flat, shank forward-lean = -ANKLE_Y and leftward-lean = +ANKLE_X (chain:
+    # R_foot = R_shin * Ry(ankle_y) * Rx(ankle_x); shank axis = shin +Z).
+    shank_limits = {}
+    if args.shank_clamp:
+        sm = np.radians(args.shank_margin_deg)
+        for eff, side in (("left_foot", "LEFT"), ("right_foot", "RIGHT")):
+            _, _, (lo_y, hi_y) = joint_info(model, f"{side}_ANKLE_Y")
+            _, _, (lo_x, hi_x) = joint_info(model, f"{side}_ANKLE_X")
+            shank_limits[eff] = (
+                (-hi_y + sm, -lo_y - sm),   # forward-lean range
+                (lo_x + sm, hi_x - sm),     # leftward-lean range
+            )
+
+    # One-sided knee-flexion bias (see solve_frame_position_ik).
+    knee_bias = None
+    if args.knee_bias_weight > 0.0:
+        entries = []
+        for side in ("LEFT", "RIGHT"):
+            qadr, dofadr, _ = joint_info(model, f"{side}_KNEE_Y")
+            entries.append((qadr, dofadr))
+        knee_bias = (entries, np.radians(args.knee_min_flex_deg), args.knee_bias_weight)
     ori_role_body_id = {
         role: body_id(model, ORI_TO_ALEX_BODY[role]) for role in ORI_TO_ALEX_BODY
     }
@@ -880,6 +1106,7 @@ def main():
     qpos_list = []
     err_list = []
     target_pos_list = []
+    human_target_pos_list = []
     achieved_pos_list = []
     target_ori_list = []
     achieved_ori_list = []
@@ -909,6 +1136,7 @@ def main():
         role_to_body_id,
         initial_targets,
         q,
+        knee_bias=knee_bias,
         iters=max(args.ik_iters * 3, 80),
         **coll_kwargs,
     )
@@ -964,6 +1192,13 @@ def main():
     else:
         print("\nContact-first: DISABLED (--no-contact-first)")
 
+    # Per-effector frozen anchor for the planted-foot position hold. Set when a
+    # foot commits to the ground (w_env >= foot_hold_latch), cleared on release.
+    foot_hold_anchor = {}
+
+    # Frames where the knee target needed the shank-tilt feasibility projection.
+    shank_clamp_count = {eff: 0 for eff in FOOT_KNEE_ROLE}
+
     for ti, src_i in enumerate(frame_ids):
         targets = make_targets_for_frame(
             src_positions[src_i],
@@ -973,6 +1208,10 @@ def main():
             root_scale,
             role_scales,
         )
+        # Snapshot BEFORE the contact machinery edits targets (foot-hold freeze,
+        # shank-tilt clamp): the pure morphology-scaled human. Saved separately so
+        # the renderer can overlay "what the human did" vs "what IK aimed at".
+        human_targets = {r: t.copy() for r, t in targets.items()}
 
         ori_targets = make_orientation_targets_for_frame(
             orientation_mats[src_i],
@@ -990,6 +1229,7 @@ def main():
         skip_pos_roles = set()
         ori_weight_scale = {}
         pos_weight_scale = {}
+        hold_pos_roles = set()   # ankle roles under an active planted-foot hold
         frame_contacts = {}
         palm_targets = {}
         if contact_first:
@@ -1003,10 +1243,53 @@ def main():
                 # continuously by w_env so they ease in/out with no snap.
                 frame_contacts[eff] = w_env >= 0.5
                 if w_env <= 0.0:
+                    foot_hold_anchor.pop(eff, None)   # released: drop the frozen anchor
                     continue
                 bid = effector_body_id[eff]
+
+                # Planted-foot position hold: freeze the foot position target (the
+                # ankle role) at the pose where the foot commits to the ground, and
+                # cross-fade the moving human target onto it, so a flat foot stops
+                # sliding. While the foot is still descending (w_env < latch) the
+                # anchor keeps tracking the target; once committed it latches/holds.
+                if args.foot_hold and eff in FOOT_POS_ROLE:
+                    pr = FOOT_POS_ROLE[eff]
+                    if eff not in foot_hold_anchor or w_env < args.foot_hold_latch:
+                        foot_hold_anchor[eff] = targets[pr].copy()
+                    targets[pr] = (1.0 - w_env) * targets[pr] + w_env * foot_hold_anchor[eff]
+                    # Boost the held foot's position weight so the frozen anchor is
+                    # not dragged off by the heavier pelvis/chain targets.
+                    boost = 1.0 + (args.foot_hold_weight - 1.0) * w_env
+                    pos_weight_scale[pr] = max(pos_weight_scale.get(pr, 1.0), boost)
+                    hold_pos_roles.add(pr)   # promote to level-1 in the hierarchical solve
+
+                # Shank-tilt clamp: with the foot flat, only shank tilts inside
+                # the ankle joint range are reachable — project the knee target
+                # into that region (about the held ankle target, along the human
+                # foot heading) and cross-fade the projection in with the contact.
+                # Human targets past the range are *kinematically infeasible*
+                # flat-footed; retargeting yields there by design (RL won't fix
+                # an impossible kinematic demand, so the target must).
+                if args.shank_clamp and eff in FOOT_KNEE_ROLE:
+                    fwd_h = ori_targets[cfg["ori_role"]] @ np.array([1.0, 0.0, 0.0])
+                    n_h = float(np.linalg.norm(fwd_h[:2]))
+                    if n_h > 0.1:   # heading undefined if the human foot points near-vertical
+                        kr = FOOT_KNEE_ROLE[eff]
+                        pitch_rng, roll_rng = shank_limits[eff]
+                        knee_c, was_clamped = clamp_shank_tilt(
+                            targets[FOOT_POS_ROLE[eff]], targets[kr],
+                            fwd_h[:2] / n_h, pitch_rng, roll_rng,
+                        )
+                        if was_clamped:
+                            targets[kr] = (1.0 - w_env) * targets[kr] + w_env * knee_c
+                            shank_clamp_count[eff] += 1
+
+                # Foot-flat weight is kept above the position hold so flatness stays
+                # (near-)dominant: the hold must not tilt the planted foot.
+                flat_w = args.foot_flat_weight if eff in FOOT_POS_ROLE else CONTACT_ALIGN_WEIGHT[eff]
                 align_constraints.append(
-                    (bid, cfg["axis_local"], cfg["world_dir"], CONTACT_ALIGN_WEIGHT[eff] * w_env)
+                    (bid, cfg["axis_local"], cfg["world_dir"], flat_w * w_env,
+                     eff in FOOT_POS_ROLE)   # feet hard (level 1), hands soft
                 )
                 # Cross-fade the human world-delta orientation out as the contact
                 # constraint fades in (weight *= 1-w_env), so the foot eases from
@@ -1027,7 +1310,7 @@ def main():
                     if n_xy > 0.1:   # skip if the human foot points near-vertical
                         align_constraints.append(
                             (bid, np.array([1.0, 0.0, 0.0]), fwd_xy / n_xy,
-                             args.foot_yaw_weight * w_env)
+                             args.foot_yaw_weight * w_env, True)
                         )
 
                 # Hand contact also pins the palm site to the human hand location
@@ -1061,6 +1344,9 @@ def main():
             skip_ori_body_ids=skip_ori_body_ids,
             ori_weight_scale=ori_weight_scale,
             pos_weight_scale=pos_weight_scale,
+            hold_pos_roles=hold_pos_roles,
+            hierarchical=args.hierarchical,
+            knee_bias=knee_bias,
             pos_site_constraints=pos_site_constraints,
             skip_pos_roles=skip_pos_roles,
             iters=args.ik_iters,
@@ -1090,6 +1376,7 @@ def main():
 
         role_order = list(ROLE_TO_ALEX_BODY.keys())
         target_pos_list.append(np.asarray([targets[r] for r in role_order], dtype=np.float64))
+        human_target_pos_list.append(np.asarray([human_targets[r] for r in role_order], dtype=np.float64))
         achieved_pos_list.append(np.asarray([data.xpos[role_to_body_id[r]].copy() for r in role_order], dtype=np.float64))
 
         ori_order = list(ORI_TO_ALEX_BODY.keys())
@@ -1160,7 +1447,15 @@ def main():
             "foot_height": args.foot_contact_height,
             "hand_height": args.hand_contact_height,
             "speed": args.contact_speed,
+            "on_height_frac": args.contact_on_height_frac,
+            "on_speed_frac": args.contact_on_speed_frac,
+            "onset_max_delay": args.contact_onset_max_delay,
         },
+        "shank_clamp": args.shank_clamp,
+        "shank_margin_deg": args.shank_margin_deg,
+        "shank_clamp_frames": shank_clamp_count,
+        "knee_bias_weight": args.knee_bias_weight,
+        "knee_min_flex_deg": args.knee_min_flex_deg,
         "notes": [
             "Contact-first QP IK on Alex V2.",
             "Foot contact -> foot up-axis forced to world +Z (flat); hand contact ->"
@@ -1174,6 +1469,9 @@ def main():
     n_coll_arr = np.asarray(n_self_coll_list, dtype=np.int32)
     print(f"\nSelf-collision summary: {n_coll_arr.sum()} total penetrating frames "
           f"({(n_coll_arr > 0).mean() * 100:.1f}% of frames)")
+    if args.shank_clamp:
+        cc = " ".join(f"{e}:{n}" for e, n in shank_clamp_count.items())
+        print(f"Shank-tilt clamp engaged (frames): {cc}")
 
     np.savez(
         args.out,
@@ -1181,6 +1479,7 @@ def main():
         fps=np.float64(fps),
         self_collision_counts=n_coll_arr,
         target_positions=np.asarray(target_pos_list),
+        human_target_positions=np.asarray(human_target_pos_list),
         achieved_positions=np.asarray(achieved_pos_list),
         orientation_role_names=np.asarray(list(ORI_TO_ALEX_BODY.keys()), dtype=object),
         target_orientations=np.asarray(target_ori_list),

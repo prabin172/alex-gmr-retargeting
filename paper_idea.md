@@ -439,3 +439,16 @@ the kinodynamic-retargeting line.
 ---
 
 *Last updated: June 2026. Next review: after Stage 2 (global refinement) prototype is working.*
+
+
+
+New Idea:
+
+What matters in retargeting?
+-> All the papers we've read evaluate a retargeting method based on downstream mimic policy performance.
+-> But what do we really want in retargeting?
+-> Faithfulness by GMR was a really good metric, and generally I also think the same, retargeting means the new motion looks pretty similar to the original motion.
+-> But is that what we want in humanoids?
+-> Yeah sure, we can get similar motion, and then use those motion as reference frames and again hand tune rewards for robot specific stability, end effector artifacts and other physics that we generally ignore during retargeting?
+-> But a good retargeter would take care of that, would it? or a good retargeter always a combination of motion copying to another domain + phyiscs based filtering with some physics engine. Why not copy motion in a way that physics is respected?
+-> Will downstream performance increase further? Or are the gains not worth it the time spent on retargeting?

@@ -2,7 +2,8 @@
 """Render a contact-first IK NPZ to MP4 with a per-frame contact indicator.
 
 Left panel : Alex V2 robot (MuJoCo EGL).
-Right panel: canonical human stick figure (IK targets), same camera.
+Right panel: canonical human stick figure, with the solver's (contact-edited)
+IK targets overlaid in green where they diverge — same camera.
 Bottom strip: contact status for each effector (foot/hand) — green = in contact
 (constraint active this frame), grey = free — read from `contact_flags` /
 `contact_effector_names` written by solve_fbx_canonical_alex_contactfirst.py.
@@ -71,14 +72,34 @@ def _project(positions, center, right, up, scale, W, H):
     return pts
 
 
-def _draw_human_panel(target_positions, role_to_idx, az, el, W, H, scale):
+IK_TARGET_COLOR = (90, 220, 120)   # solver targets overlay (contact-edited)
+
+
+def _draw_human_panel(human_positions, role_to_idx, az, el, W, H, scale,
+                      ik_target_positions=None):
+    """Stick-figure panel. `human_positions` = pure morphology-scaled human.
+    `ik_target_positions` (optional) = the targets the solver actually chased
+    (foot-hold / shank-clamp edits applied), overlaid in green — where the two
+    coincide the green is hidden under the human skeleton."""
     right, up = _camera_basis(az, el)
-    center = target_positions[role_to_idx["pelvis"]].copy() if "pelvis" in role_to_idx \
-        else target_positions.mean(axis=0)
-    pts = _project(target_positions, center, right, up, scale, W, H)
+    center = human_positions[role_to_idx["pelvis"]].copy() if "pelvis" in role_to_idx \
+        else human_positions.mean(axis=0)
     img = Image.new("RGB", (W, H), color=(18, 18, 28))
     draw = ImageDraw.Draw(img)
     draw.line([(0, H // 2), (W, H // 2)], fill=(60, 80, 60), width=1)
+
+    if ik_target_positions is not None:
+        # IK targets first (underlay): visible only where they diverge from the human.
+        tpts = _project(ik_target_positions, center, right, up, scale, W, H)
+        for ra, rb, _ in SKELETON_EDGES:
+            if ra in role_to_idx and rb in role_to_idx:
+                draw.line([tpts[role_to_idx[ra]], tpts[role_to_idx[rb]]],
+                          fill=IK_TARGET_COLOR, width=2)
+        for role, idx in role_to_idx.items():
+            px, py = tpts[idx]
+            draw.ellipse([px - 3, py - 3, px + 3, py + 3], fill=IK_TARGET_COLOR)
+
+    pts = _project(human_positions, center, right, up, scale, W, H)
     for ra, rb, color in SKELETON_EDGES:
         if ra in role_to_idx and rb in role_to_idx:
             draw.line([pts[role_to_idx[ra]], pts[role_to_idx[rb]]], fill=color, width=3)
@@ -199,6 +220,15 @@ def main():
     show_human = (not args.no_human and "target_positions" in z.files and "role_names" in z.files)
     if show_human:
         target_positions = np.asarray(z["target_positions"], dtype=np.float64)
+        # Pure human (pre contact-edit) if the solver saved it; else the solver
+        # targets double as the human (older NPZs — targets were unedited then).
+        if "human_target_positions" in z.files:
+            human_positions = np.asarray(z["human_target_positions"], dtype=np.float64)
+            panel_label = "Canonical human (color) vs IK targets (green)"
+        else:
+            human_positions = target_positions
+            target_positions = None
+            panel_label = "Canonical human (IK targets)"
         role_names = [str(r) for r in z["role_names"]]
         role_to_idx = {r: i for i, r in enumerate(role_names)}
         human_scale = args.height * 0.6 / 1.5
@@ -257,10 +287,13 @@ def main():
             robot_img = _add_label(renderer.render(), "Alex V2 (contact-first IK)")
 
             if show_human:
-                human_img = _draw_human_panel(target_positions[src_i], role_to_idx,
-                                              float(cam.azimuth), float(cam.elevation),
-                                              args.width, args.height, human_scale)
-                human_img = _add_label(human_img, "Canonical human (IK targets)")
+                human_img = _draw_human_panel(
+                    human_positions[src_i], role_to_idx,
+                    float(cam.azimuth), float(cam.elevation),
+                    args.width, args.height, human_scale,
+                    ik_target_positions=None if target_positions is None else target_positions[src_i],
+                )
+                human_img = _add_label(human_img, panel_label)
                 frame = np.concatenate([robot_img, human_img], axis=1)
             else:
                 frame = robot_img

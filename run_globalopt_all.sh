@@ -15,7 +15,11 @@ set -uo pipefail
 
 STRIDE=4
 IK_ITERS=40
-LAMBDA_SMOOTH="${LAMBDA_SMOOTH:-10}"     # GlobalOPT Stage-A smoothing weight
+# Unified GlobalOPT config (same for ALL actions): lambda=20 + Stage-B contact
+# QP. On a hold10 solve this pins shovel plants to ~1.5cm slip and is safe on
+# get-ups (<=2.8cm, 0 spikes) — no per-clip tuning.
+LAMBDA_SMOOTH="${LAMBDA_SMOOTH:-20}"     # GlobalOPT Stage-A smoothing weight
+N_OUTER="${N_OUTER:-3}"                  # Stage-B contact-QP outer iterations (0=off)
 RENDER_EXTRA="${RENDER_EXTRA:-}"          # extra render flags, e.g. "--fixed-cam"
 # --- Z-grounding (Stage 4.5) ---
 GROUND_MODE="${GROUND_MODE:-perframe}"    # perframe (plant every frame) | constant (single per-clip shift)
@@ -39,24 +43,27 @@ mkdir -p "$CF" "$GO" "$GR" "$RD"
 echo "Render mesh: $RENDER_MESH -> $RMODEL   |  ground: $GROUND_MODE (smooth=$GROUND_SMOOTH)"
 
 # clip name  ->  canonical *_with_orient.npz input (one per clip; variants deduped)
+# Optional 3rd field: extra contact-first SOLVER flags. 4th: extra GLOBALOPT
+# flags. BOTH EMPTY by design — one retargeter config for all actions; the
+# fields exist for experiments only.
 CLIPS=(
-  "standup_01|standup_01_with_orient.npz"
-  "standup_02|standup_02_canonical_human_fresh_with_orient.npz"
-  "standup_natural_01|standup_natural_01_with_orient.npz"
-  "standup_natural_02|standup_natural_02_with_orient.npz"
-  "standup_side_04|standup_side_04_with_orient.npz"
-  "standup_side_05|standup_side_05_with_orient.npz"
-  "standup_slideHandsBack_03|standup_slideHandsBack_03_with_orient.npz"
-  "shovel_fronthard_02|PrabinRef_Shovel_FrontHard_02_with_orient.npz"
-  "shovel_leftbucket_02|PrabinRef_Shovel_LeftBucket_02_with_orient.npz"
-  "shovel_lefthard_01|PrabinRef_Shovel_LeftHard_01_with_orient.npz"
-  "shovel_rightbucket_01|PrabinRef_Shovel_RightBucket_01_with_orient.npz"
-  "shovel_righthard_01|PrabinRef_Shovel_RightHard_01_with_orient.npz"
+  "standup_01|standup_01_with_orient.npz||"
+  "standup_02|standup_02_canonical_human_fresh_with_orient.npz||"
+  "standup_natural_01|standup_natural_01_with_orient.npz||"
+  "standup_natural_02|standup_natural_02_with_orient.npz||"
+  "standup_side_04|standup_side_04_with_orient.npz||"
+  "standup_side_05|standup_side_05_with_orient.npz||"
+  "standup_slideHandsBack_03|standup_slideHandsBack_03_with_orient.npz||"
+  "shovel_fronthard_02|PrabinRef_Shovel_FrontHard_02_with_orient.npz||"
+  "shovel_leftbucket_02|PrabinRef_Shovel_LeftBucket_02_with_orient.npz||"
+  "shovel_lefthard_01|PrabinRef_Shovel_LeftHard_01_with_orient.npz||"
+  "shovel_rightbucket_01|PrabinRef_Shovel_RightBucket_01_with_orient.npz||"
+  "shovel_righthard_01|PrabinRef_Shovel_RightHard_01_with_orient.npz||"
 )
 
 ok=0; fail=0
 for entry in "${CLIPS[@]}"; do
-  name="${entry%%|*}"; infile="${entry##*|}"
+  IFS='|' read -r name infile solve_extra go_extra <<< "$entry"
   src="$IN/$infile"
   cf="$CF/${name}_contactfirst.npz"
   go="$GO/${name}_global_opt.npz"
@@ -70,17 +77,18 @@ for entry in "${CLIPS[@]}"; do
   if [[ -f "$cf" ]]; then
     echo "  [have] $cf"
   else
-    echo "  [solve] contact-first ..."
+    echo "  [solve] contact-first ${solve_extra:+(extra: $solve_extra) }..."
     python scripts/solve_fbx_canonical_alex_contactfirst.py \
       --canonical "$src" --out "$cf" \
       --stride "$STRIDE" --max-frames 99999 --ik-iters "$IK_ITERS" \
-      --log-every 200 || { echo "  [FAIL] contact-first"; fail=$((fail+1)); continue; }
+      --log-every 200 $solve_extra \
+      || { echo "  [FAIL] contact-first"; fail=$((fail+1)); continue; }
   fi
 
-  # Stage 4 — GlobalOPT Stage-A smoothing
-  echo "  [smooth] GlobalOPT ..."
+  # Stage 4 — GlobalOPT Stage-A smoothing (+ per-clip extras, e.g. Stage B)
+  echo "  [smooth] GlobalOPT ${go_extra:+(extra: $go_extra) }..."
   python scripts/solve_global_trajectory_opt_contactfirst.py \
-    --ik-npz "$cf" --out "$go" --lambda-smooth "$LAMBDA_SMOOTH" \
+    --ik-npz "$cf" --out "$go" --lambda-smooth "$LAMBDA_SMOOTH" --n-outer "$N_OUTER" $go_extra \
     || { echo "  [FAIL] globalopt"; fail=$((fail+1)); continue; }
 
   # Stage 4.5 — Z-grounding (plant lowest contact point on the floor)
