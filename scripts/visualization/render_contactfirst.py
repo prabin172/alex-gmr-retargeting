@@ -117,15 +117,43 @@ def _contact_strip(effector_names, flags, align_errs, W, height=46):
     return np.array(img)
 
 
-def set_camera(model, data, cam, frame_idx, total_frames):
-    pts = np.asarray([data.xpos[b].copy() for b in range(1, model.nbody)])
-    center = pts.mean(axis=0)
-    extent = float(np.max(pts.max(axis=0) - pts.min(axis=0)))
-    progress = frame_idx / max(total_frames - 1, 1)
-    cam.lookat[:] = center
-    cam.distance = max(1.2, extent * (2.4 - 0.5 * progress))
-    cam.azimuth = 135.0 + 25.0 * progress
-    cam.elevation = -20.0
+def set_camera(model, data, cam, frame_idx, total_frames, *,
+               fixed=False, az=135.0, el=-20.0, dist=None, lookat=None):
+    """Position the camera. Default: slow orbit + zoom (progress-based).
+    fixed=True: constant azimuth/elevation/distance AND a constant lookat
+    (`lookat`, the clip-global center) so the WORLD is static and only Alex
+    moves in frame — no orbit, no zoom, no pan."""
+    if fixed:
+        cam.lookat[:] = lookat if lookat is not None else data.xpos[1:model.nbody].mean(axis=0)
+        pts = np.asarray([data.xpos[b].copy() for b in range(1, model.nbody)])
+        extent = float(np.max(pts.max(axis=0) - pts.min(axis=0)))
+        cam.distance = dist if (dist and dist > 0) else max(1.2, extent * 2.2)
+        cam.azimuth = az
+        cam.elevation = el
+    else:
+        pts = np.asarray([data.xpos[b].copy() for b in range(1, model.nbody)])
+        cam.lookat[:] = pts.mean(axis=0)
+        extent = float(np.max(pts.max(axis=0) - pts.min(axis=0)))
+        progress = frame_idx / max(total_frames - 1, 1)
+        cam.distance = max(1.2, extent * (2.4 - 0.5 * progress))
+        cam.azimuth = 135.0 + 25.0 * progress
+        cam.elevation = -20.0
+
+
+def add_ground_plane(scene, z, center_xy, half=2.5, rgba=(0.45, 0.5, 0.55, 0.35)):
+    """Append a semi-transparent ground plane geom to the scene at height z."""
+    if scene.ngeom >= scene.maxgeom:
+        return
+    g = scene.geoms[scene.ngeom]
+    mujoco.mjv_initGeom(
+        g, mujoco.mjtGeom.mjGEOM_PLANE,
+        np.array([half, half, 0.1]),
+        np.array([center_xy[0], center_xy[1], z], dtype=np.float64),
+        np.eye(3).flatten(),
+        np.array(rgba, dtype=np.float32),
+    )
+    g.category = mujoco.mjtCatBit.mjCAT_DECOR
+    scene.ngeom += 1
 
 
 def main():
@@ -138,6 +166,18 @@ def main():
     ap.add_argument("--fps", type=float, default=30.0)
     ap.add_argument("--frame-step", type=int, default=None)
     ap.add_argument("--no-human", action="store_true")
+    ap.add_argument("--fixed-cam", action="store_true",
+                    help="Freeze camera orbit/zoom (constant azimuth/elevation/distance) "
+                         "so contact make/break flicker is easy to see; lookat still recenters.")
+    ap.add_argument("--cam-azimuth", type=float, default=135.0)
+    ap.add_argument("--cam-elevation", type=float, default=-20.0)
+    ap.add_argument("--cam-distance", type=float, default=0.0,
+                    help="Fixed-cam distance (0 = auto from clip extent).")
+    ap.add_argument("--ground", action="store_true",
+                    help="Draw a semi-transparent ground plane below Alex (at the clip's lowest point).")
+    ap.add_argument("--ground-z", type=float, default=None,
+                    help="Pin the ground plane to this world Z instead of the clip's lowest body origin "
+                         "(use 0.0 for z-grounded NPZs).")
     args = ap.parse_args()
 
     z = np.load(args.npz, allow_pickle=True)
@@ -173,8 +213,34 @@ def main():
     total_out = len(frame_ids)
     out_width = args.width * 2 if show_human else args.width
 
+    # Fixed camera / ground: precompute the clip-GLOBAL bounding box (over all
+    # frames) so lookat, distance and ground height stay constant and the world
+    # is static (only Alex moves). Distance from the global extent keeps the
+    # whole trajectory in frame.
+    fixed_dist = args.cam_distance
+    fixed_lookat = None
+    ground_z = None
+    ground_xy = (0.0, 0.0)
+    if args.fixed_cam or args.ground:
+        gmin = np.full(3, np.inf)
+        gmax = np.full(3, -np.inf)
+        for src_i in frame_ids[:: max(1, len(frame_ids) // 40)]:
+            data.qpos[:] = qpos[src_i]
+            mujoco.mj_forward(model, data)
+            pts = np.asarray([data.xpos[b] for b in range(1, model.nbody)])
+            gmin = np.minimum(gmin, pts.min(axis=0))
+            gmax = np.maximum(gmax, pts.max(axis=0))
+        gcenter = (gmin + gmax) / 2.0
+        gextent = float(np.max(gmax - gmin))
+        fixed_lookat = gcenter
+        if fixed_dist <= 0.0:
+            fixed_dist = max(1.7, gextent * 1.7)   # pulled back so the full robot stays in frame
+        ground_z = args.ground_z if args.ground_z is not None else float(gmin[2])
+        ground_xy = (float(gcenter[0]), float(gcenter[1]))
+
     args.out_mp4.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Rendering {total_out} frames -> {args.out_mp4}  ({out_width}x{args.height} @ {args.fps:.0f}fps)")
+    print(f"Rendering {total_out} frames -> {args.out_mp4}  ({out_width}x{args.height} @ {args.fps:.0f}fps)"
+          + (f"  [fixed cam az={args.cam_azimuth} el={args.cam_elevation} d={fixed_dist:.2f}]" if args.fixed_cam else ""))
     if len(eff_names):
         print(f"Contact effectors: {eff_names}")
 
@@ -182,8 +248,12 @@ def main():
         for out_i, src_i in enumerate(frame_ids):
             data.qpos[:] = qpos[src_i]
             mujoco.mj_forward(model, data)
-            set_camera(model, data, cam, out_i, total_out)
+            set_camera(model, data, cam, out_i, total_out,
+                       fixed=args.fixed_cam, az=args.cam_azimuth,
+                       el=args.cam_elevation, dist=fixed_dist, lookat=fixed_lookat)
             renderer.update_scene(data, camera=cam)
+            if args.ground and ground_z is not None:
+                add_ground_plane(renderer.scene, ground_z, ground_xy)
             robot_img = _add_label(renderer.render(), "Alex V2 (contact-first IK)")
 
             if show_human:

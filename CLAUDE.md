@@ -26,6 +26,13 @@ Human MoCap (FBX/MVNX) → canonical skeleton → MuJoCo QP IK → IHMC Alex bip
 `scripts/solve_fbx_canonical_alex_posori_qp_fresh_worlddelta.py`
 Uses rest-pose delta targets + world-delta orientation transfer. This is the canonical solver.
 
+## Contact-first on Alex V2 (active — branch `feature/alex-v2-contact-first-ik`)
+Contact-first IK + trajectory smoothing. Model `assets/alex/alex_floating_base_with_sites_v2.xml` (convex hulls).
+- Solve: `scripts/solve_fbx_canonical_alex_contactfirst.py` (foot-flat + yaw, fist/palm support, make/break blend)
+- Smooth: `scripts/solve_global_trajectory_opt_contactfirst.py` (Stage-A: joints + root; Stage-B contact-pin QP is off by default)
+- Render: `scripts/visualization/render_contactfirst.py` (`--fixed-cam`, `--ground`)
+- Run all clips: `run_globalopt_all.sh`. Details + decisions in `SESSION_HANDOFF.md`.
+
 ## Canonical roles (15 + 4 contact sites)
 `pelvis, torso, head, left_hip, left_knee, left_foot, right_hip, right_knee, right_foot, left_shoulder, left_elbow, left_hand, right_shoulder, right_elbow, right_hand` + `left_palm, right_palm, left_sole, right_sole`
 

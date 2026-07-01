@@ -1,23 +1,42 @@
 #!/usr/bin/env bash
 # run_globalopt_all.sh
 # Full contact-first pipeline for every fbx clip:
-#   Stage 3  contact-first IK  (skipped if the NPZ already exists)
-#   Stage 4  GlobalOPT Stage-A smoothing (spikes->0, collisions down)
-#   Stage 5  render, REAL TIME (fps = source_fps / stride)
+#   Stage 3    contact-first IK  (skipped if the NPZ already exists)
+#   Stage 4    GlobalOPT Stage-A smoothing (spikes->0, collisions down)
+#   Stage 4.5  Z-grounding (plant lowest contact point on the floor z=0)
+#   Stage 5    render, REAL TIME (fps = source_fps / stride)
 #
 # Outputs:
 #   outputs/contactfirst/<clip>_contactfirst.npz
 #   outputs/global_opt_contactfirst/<clip>_global_opt.npz
+#   outputs/grounded_contactfirst/<clip>_grounded.npz
 #   outputs/renders/contactfirst/<clip>_globalopt.mp4
 set -uo pipefail
 
 STRIDE=4
 IK_ITERS=40
+LAMBDA_SMOOTH="${LAMBDA_SMOOTH:-10}"     # GlobalOPT Stage-A smoothing weight
+RENDER_EXTRA="${RENDER_EXTRA:-}"          # extra render flags, e.g. "--fixed-cam"
+# --- Z-grounding (Stage 4.5) ---
+GROUND_MODE="${GROUND_MODE:-perframe}"    # perframe (plant every frame) | constant (single per-clip shift)
+GROUND_SMOOTH="${GROUND_SMOOTH:-5}"       # perframe: tridiagonal smoothing on the shift series
+# --- Render mesh (Stage 5) ---
+# visual    = Alex visual mesh, hands drawn as closed fists (good visualisation)
+# collision = v2 collision convex hulls (what the solver actually uses)
+# <path>    = any explicit model xml
+RENDER_MESH="${RENDER_MESH:-visual}"
+case "$RENDER_MESH" in
+  visual)    RMODEL="assets/alex/alex_visual_mesh_fist_hands.xml" ;;
+  collision) RMODEL="assets/alex/alex_floating_base_with_sites_v2.xml" ;;
+  *)         RMODEL="$RENDER_MESH" ;;
+esac
 IN=outputs/canonical_human/fbx_fresh
 CF=outputs/contactfirst
 GO=outputs/global_opt_contactfirst
-RD=outputs/renders/contactfirst
-mkdir -p "$CF" "$GO" "$RD"
+GR=outputs/grounded_contactfirst
+RD="${RENDER_DIR:-outputs/renders/contactfirst}"
+mkdir -p "$CF" "$GO" "$GR" "$RD"
+echo "Render mesh: $RENDER_MESH -> $RMODEL   |  ground: $GROUND_MODE (smooth=$GROUND_SMOOTH)"
 
 # clip name  ->  canonical *_with_orient.npz input (one per clip; variants deduped)
 CLIPS=(
@@ -41,6 +60,7 @@ for entry in "${CLIPS[@]}"; do
   src="$IN/$infile"
   cf="$CF/${name}_contactfirst.npz"
   go="$GO/${name}_global_opt.npz"
+  gr="$GR/${name}_grounded.npz"
   mp4="$RD/${name}_globalopt.mp4"
   echo "======================================================================"
   echo ">>> $name   ($infile)"
@@ -60,11 +80,17 @@ for entry in "${CLIPS[@]}"; do
   # Stage 4 — GlobalOPT Stage-A smoothing
   echo "  [smooth] GlobalOPT ..."
   python scripts/solve_global_trajectory_opt_contactfirst.py \
-    --ik-npz "$cf" --out "$go" \
+    --ik-npz "$cf" --out "$go" --lambda-smooth "$LAMBDA_SMOOTH" \
     || { echo "  [FAIL] globalopt"; fail=$((fail+1)); continue; }
 
+  # Stage 4.5 — Z-grounding (plant lowest contact point on the floor)
+  echo "  [ground] $GROUND_MODE ..."
+  python scripts/post_process_ground_contactfirst.py \
+    --npz "$go" --out "$gr" --mode "$GROUND_MODE" --smooth-shift "$GROUND_SMOOTH" \
+    || { echo "  [FAIL] ground"; fail=$((fail+1)); continue; }
+
   # Stage 5 — render REAL TIME:  fps = source_fps / stride ; no extra frame skip
-  RT=$(python - "$go" <<'PY'
+  RT=$(python - "$gr" <<'PY'
 import numpy as np, sys
 z=np.load(sys.argv[1],allow_pickle=True)
 fps=float(z["fps"]); sfi=z["source_frame_ids"]
@@ -72,10 +98,11 @@ stride=int(np.round(np.median(np.diff(sfi)))) if len(sfi)>1 else 1
 print(f"{fps/max(stride,1):.4f}")
 PY
 )
-  echo "  [render] real-time fps=$RT"
+  echo "  [render] real-time fps=$RT  (mesh=$RENDER_MESH)"
   MUJOCO_GL=egl python scripts/visualization/render_contactfirst.py \
-    --npz "$go" --out-mp4 "$mp4" \
+    --npz "$gr" --model "$RMODEL" --out-mp4 "$mp4" \
     --width 640 --height 480 --fps "$RT" --frame-step 1 \
+    --ground --ground-z 0 $RENDER_EXTRA \
     || { echo "  [FAIL] render"; fail=$((fail+1)); continue; }
 
   echo "  [OK] $mp4"; ok=$((ok+1))

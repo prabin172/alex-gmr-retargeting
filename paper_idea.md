@@ -14,14 +14,20 @@
 
 ## The Core Insight (one paragraph)
 
-Every published retargeting method — PHC, ProtoMotions, GMR — uses per-frame IK.
-The implicit justification is real-time teleoperation: you only have present and past frames, so
+The widely-used teleoperation-oriented retargeting methods (PHC, ProtoMotions, GMR) use per-frame
+IK. The implicit justification is real-time teleoperation: you only have present and past frames, so
 global optimization over the whole trajectory is impossible. But when building a *training dataset*
 for an imitation learning policy (Mimic, BeyondMimic), the entire motion sequence is available
-upfront. Nobody has exploited this. We propose that the teleoperation constraint is being silently
-imported into an offline context where it does not apply, and that removing this constraint
-enables global trajectory optimization, which produces smoother, more physically coherent reference
-trajectories that train measurably better policies.
+upfront, and the teleoperation constraint no longer applies. Removing it enables global trajectory
+optimization, which produces smoother, more physically coherent reference trajectories.
+
+> **Novelty caveat (added after literature pass, June 2026):** This offline / whole-trajectory
+> framing is NOT new. Several 2024–2026 papers already formulate retargeting as whole-sequence
+> optimization for offline imitation-learning reference generation, and at least one explicitly
+> critiques frame-by-frame retargeting. See the **Related Work & Novelty Risk** section below.
+> The "first to exploit offline context" claim is **not defensible** and has been removed. What
+> remains potentially novel is narrower: a lightweight convex kinematic-only refiner usable as a
+> retargeter-agnostic post-process, and the floor-contact / get-up motion class.
 
 ---
 
@@ -64,8 +70,11 @@ the change. Per-frame IK has no equivalent mechanism.
 ### The key observation that makes this tractable
 
 For teleoperation you cannot do this — future frames are unknown. But for offline dataset
-generation you have the full trajectory. This is a distinction nobody in the retargeting
-literature has made explicit, and it is the core novelty of this paper.
+generation you have the full trajectory. This observation motivates the global formulation, but
+it is **not** by itself novel: the whole-trajectory framing for offline retargeting already exists
+in the literature (SPARK, KDMR, IKMR, STMR — see Related Work). The contribution, if any, must
+come from the *specific* method (a cheap convex kinematic-only refiner usable as a wrapper) and the
+motion class (whole-body floor contact), not from the framing.
 
 ---
 
@@ -162,21 +171,28 @@ shoveling, get-up from prone. This is a real contribution because:
 
 ## Key Claims (what the paper will argue)
 
-1. **The offline/online gap is real and unexploited**: The retargeting community has implicitly
-   assumed real-time constraints even for offline dataset generation. We are the first to address
-   this explicitly.
+> **Removed claims** (preempted by prior work — see Related Work & Novelty Risk):
+> - ~~"We are the first to address the offline/online gap explicitly."~~ IKMR (2025) and the
+>   whole-trajectory retargeting line (SPARK, KDMR, STMR) already do. Not defensible.
+> - ~~"Global optimization is novel for retargeting."~~ Already the premise of SPARK/KDMR/STMR.
 
-2. **Global optimization measurably improves policy outcomes**: Success rates and tracking errors
-   improve when the reference trajectory is globally smooth vs per-frame optimized.
+Surviving claims (each must be backed by an experiment, not framing):
 
-3. **The improvement is largest for dynamic/complex motions**: Exactly the motions where current
-   methods struggle most (get-up, floor contact, topology-change-heavy sequences).
+1. **A cheap convex kinematic-only refiner is enough**: Most of the policy benefit of full
+   kinodynamic trajectory optimization (SPARK, KDMR) can be recovered by a lightweight
+   tridiagonal/SCA smoother that needs no dynamics or torque model and runs in milliseconds per
+   clip. *Only defensible if the head-to-head experiment supports it.*
 
-4. **The method is a general wrapper**: It improves PHC, ProtoMotions, and GMR — it is not a
-   competing retargeter but an orthogonal post-processing stage.
+2. **Retargeter-agnostic post-process**: The Stage 2 refiner improves the output of any per-frame
+   retargeter (PHC, ProtoMotions, GMR) without being a competing retargeter. SPARK is an integrated
+   pipeline; a true drop-in wrapper is a different (engineering) contribution.
 
-5. **The whole-body floor-contact gap**: We demonstrate good retargeting quality on motions that
-   existing methods explicitly exclude, enabled by the collision-constraint machinery in Stage 1.
+3. **The improvement is largest for dynamic/complex motions**: Get-up, floor contact, and
+   topology-change-heavy sequences — where per-frame methods struggle most.
+
+4. **The whole-body floor-contact gap (strongest remaining wedge)**: We demonstrate good retargeting
+   on motions GMR explicitly excludes (crawling, get-up from prone), which the kinodynamic
+   retargeting papers also do not center.
 
 ---
 
@@ -321,7 +337,35 @@ at Humanoids 2026 is the single most important input you need right now.
 
 ---
 
-## Differentiation from GMR (the closest prior work)
+## Related Work & Novelty Risk (literature pass, June 2026)
+
+The closest prior work is **NOT** GMR — it is the recent line of whole-trajectory / kinodynamic
+retargeting papers that already occupy most of this idea's conceptual space. These must be cited as
+named baselines and the framing must be positioned against them, not around them.
+
+| Paper | Venue/ID | What it does | Overlap with our idea |
+|-------|----------|--------------|-----------------------|
+| **SPARK** — Skeleton-Parameter Aligned Retargeting with Kinodynamic Trajectory Optimization | arXiv 2603.11480 (Mar 2026) | Two-stage: IK reference → **whole-trajectory** kinodynamic optimization; self-collision avoidance constraints; acceleration regularization for smoothness; offline reference for RL; G1/H1/T1/PM01/Kuavo | **Highest overlap.** Almost exactly our Stage1+Stage2 architecture, plus dynamics/torques. Pre-dates our deadline. |
+| **KDMR** — Kinodynamic Motion Retargeting via Multi-Contact Whole-Body Trajectory Optimization | arXiv 2603.09956 (Mar 2026) | Retargeting as whole-body trajectory optimization with contact complementarity + GRF; "dynamically viable reference trajectories that accelerate policy convergence" | Preempts Claim "global opt → better policies." Humanoid, offline. |
+| **IKMR** — Implicit Kinodynamic Motion Retargeting | arXiv 2509.15443 (Sep 2025) | Neural whole-**sequence** retargeting, offline pretraining; explicitly states frame-by-frame "lacks scalability"; lower accel/jerk; Unitree G1 | **Kills the "first to make the per-frame-vs-whole-sequence distinction" claim.** |
+| **STMR** — Spatio-Temporal Motion Retargeting | arXiv 2404.11557 (Apr 2024) | Finite-horizon OCP over the **whole trajectory** as IL preprocessing; explicit temporal retargeting | Same "global trajectory opt as IL preprocessing" framing (quadruped). |
+| **STaR** — Spatial-Temporal Aware Motion Retargeting | arXiv 2504.06504 (Apr 2025) | Predicts entire sequence at once; temporal consistency + penetration constraints | Whole-sequence smoothness (character/mesh domain). |
+
+**Implications:**
+- The conceptual "core insight" of the original draft (offline ⇒ global opt, and nobody has done it)
+  is **occupied**. Reposition against SPARK/KDMR/IKMR as baselines.
+- The honest, defensible angles are narrower: (a) a *cheap convex kinematic-only* wrapper vs SPARK's
+  full kinodynamic pipeline — "do you actually need dynamics/torques?"; (b) retargeter-agnostic
+  post-processing; (c) floor-contact / get-up motions.
+- Defending (a) requires comparing against SPARK **on policy outcomes** → needs the policy-training
+  infrastructure (the highest-risk, not-yet-built item). This strengthens the case for **Option C**
+  (2027 venue with real evaluation) over a rushed July 2026 submission.
+- **Action:** Bring this table to the mentor meeting. The novelty conversation, not just the
+  timeline, is the key decision.
+
+---
+
+## Differentiation from GMR (a secondary baseline, not the closest)
 
 | Aspect | GMR | Ours |
 |--------|-----|------|
@@ -330,7 +374,7 @@ at Humanoids 2026 is the single most important input you need right now.
 | Velocity spikes | Still present (Dance 5 failure) | Eliminated by global smoothing |
 | Self-collision in IK | None (post-hoc detection only) | Soft repulsion in QP (w=20) |
 | Floor-contact motions | Explicitly excluded | Primary motion class |
-| Offline/online distinction | Not made | Core contribution |
+| Offline/online distinction | Not made by GMR | Used, but NOT novel (see SPARK/KDMR/IKMR) |
 | Robot | Unitree G1 | IHMC Alex (+ optionally G1) |
 | Source format | BVH + SMPL | FBX + MVNX (broader industrial support) |
 
@@ -367,9 +411,12 @@ at Humanoids 2026 is the single most important input you need right now.
 5. **Co-authorship**: Who from the lab would be appropriate co-authors (mentor, others who
    contribute infrastructure)?
 
-6. **Claim scope**: Is "first to exploit offline context for global trajectory optimization in
-   humanoid retargeting" a claim we can defend? A literature search pass is needed to confirm
-   nobody has done this.
+6. **Claim scope**: ~~Is "first to exploit offline context for global trajectory optimization in
+   humanoid retargeting" a claim we can defend?~~ **ANSWERED (June 2026 lit pass): No.** SPARK,
+   KDMR, IKMR, and STMR already do whole-trajectory offline retargeting. The remaining defensible
+   contributions are narrower (cheap kinematic-only wrapper; floor-contact motions) — discuss with
+   mentor whether they are sufficient for a Humanoids-level paper, or whether to target a 2027 venue
+   with full policy-training evaluation against these baselines.
 
 ---
 
@@ -383,9 +430,11 @@ Key quotes that motivate our work:
 - "we do not include motions with complex interaction with the environment, such as crawling or
   getting up from the floor" — this is our primary motion class, explicitly not addressed by GMR
 
-The GMR paper is the strongest related work and the clearest benchmark. Beating it on their own
-metrics (Table I success rates) while adding the get-up motions they couldn't handle would be a
-clean and defensible contribution.
+GMR is a useful per-frame baseline and metric template, but it is **not** the strongest related
+work for *our* contribution — the whole-trajectory retargeting papers (SPARK, KDMR, IKMR) are
+closer and must be the primary comparison. Beating GMR on its own metrics while adding the get-up
+motions it couldn't handle is still worth showing, but it does not by itself establish novelty over
+the kinodynamic-retargeting line.
 
 ---
 

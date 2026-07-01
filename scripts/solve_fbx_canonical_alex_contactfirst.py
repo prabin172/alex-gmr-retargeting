@@ -235,6 +235,62 @@ def detect_contacts_from_human(positions, role_to_idx, fps, *,
     return contacts, floor_z
 
 
+def debounce_flags(flag, min_run):
+    """Remove ON/OFF runs shorter than min_run (fill gaps, drop specks).
+
+    Kills marginal-threshold flicker without touching genuine long contacts."""
+    if min_run <= 1:
+        return flag.copy()
+    out = flag.copy().astype(bool)
+    n = len(out)
+    # drop short ON specks, then fill short OFF gaps
+    for target in (True, False):
+        i = 0
+        while i < n:
+            j = i
+            while j < n and out[j] == out[i]:
+                j += 1
+            if out[i] == target and (j - i) < min_run and not (i == 0 and j == n):
+                out[i:j] = not target
+            i = j
+    return out
+
+
+def ramp_envelope(flag, ramp, preroll):
+    """Per-frame contact weight in [0,1] from a boolean contact timeline.
+
+    `preroll` extends each contact earlier (anticipation: begin easing the foot/
+    hand toward the support face before touchdown). `ramp` applies a cosine rise
+    into each leading edge and fall out of each trailing edge, so the contact
+    constraints cross-fade in/out instead of snapping at full weight."""
+    n = len(flag)
+    base = flag.copy().astype(bool)
+    if preroll > 0:
+        pr = base.copy()
+        idx = np.where(base)[0]
+        for i in idx:
+            pr[max(0, i - preroll):i] = True
+        base = pr
+    env = base.astype(np.float64)
+    if ramp > 0:
+        def cosramp(k):   # k=1..ramp -> rises toward 1
+            return 0.5 * (1.0 - np.cos(np.pi * k / (ramp + 1)))
+        for i in range(n):
+            if not base[i]:
+                continue
+            if i == 0 or not base[i - 1]:            # leading edge -> ramp preceding frames
+                for k in range(1, ramp + 1):
+                    p = i - k
+                    if p >= 0 and not base[p]:
+                        env[p] = max(env[p], cosramp(ramp - k + 1))
+            if i == n - 1 or not base[i + 1]:        # trailing edge -> ramp following frames
+                for k in range(1, ramp + 1):
+                    p = i + k
+                    if p < n and not base[p]:
+                        env[p] = max(env[p], cosramp(ramp - k + 1))
+    return env
+
+
 def mj_name(model, objtype, idx):
     out = mujoco.mj_id2name(model, objtype, idx)
     return "" if out is None else out
@@ -545,6 +601,8 @@ def solve_frame_position_ik(
     skip_ori_body_ids=None,
     pos_site_constraints=None,
     skip_pos_roles=None,
+    ori_weight_scale=None,
+    pos_weight_scale=None,
     iters=30,
     damping=1e-3,
     step_scale=0.7,
@@ -567,14 +625,18 @@ def solve_frame_position_ik(
         rhs = []
 
         for role, bid in role_to_body_id.items():
-            # Suppressed while the matching hand is in contact: the palm
+            # Suppressed/faded while the matching hand is in contact: the palm
             # position pin places the hand instead of the wrist-body target.
+            # pos_weight_scale cross-fades this over the contact ramp (0..1).
             if skip_pos_roles and role in skip_pos_roles:
+                continue
+            wscale = pos_weight_scale.get(role, 1.0) if pos_weight_scale else 1.0
+            weight = TARGET_WEIGHTS.get(role, 1.0) * wscale
+            if weight <= 0.0:
                 continue
 
             current = data.xpos[bid].copy()
             err = targets[role] - current
-            weight = TARGET_WEIGHTS.get(role, 1.0)
 
             jacp = np.zeros((3, nv), dtype=np.float64)
             jacr = np.zeros((3, nv), dtype=np.float64)
@@ -585,17 +647,19 @@ def solve_frame_position_ik(
 
         if ori_role_to_body_id is not None and ori_targets is not None and ori_scale > 0.0:
             for role, bid in ori_role_to_body_id.items():
-                # Suppressed while this body is in contact: the contact
+                # Suppressed/faded while this body is in contact: the contact
                 # axis-alignment constraint replaces the human orientation.
+                # ori_weight_scale cross-fades this over the contact ramp (0..1).
                 if skip_ori_body_ids is not None and bid in skip_ori_body_ids:
                     continue
+                wscale = ori_weight_scale.get(bid, 1.0) if ori_weight_scale else 1.0
 
                 R_current = body_xmat(data, bid)
                 R_target = ori_targets[role]
                 R_err = R_target @ R_current.T
                 err_rot = rotmat_to_rotvec(R_err)
 
-                weight = ori_scale * ORI_WEIGHTS.get(role, 0.0)
+                weight = ori_scale * ORI_WEIGHTS.get(role, 0.0) * wscale
                 if weight <= 0.0:
                     continue
 
@@ -710,6 +774,21 @@ def main():
     ap.add_argument("--foot-flat-tilt", type=float, default=40.0,
                     help="Max tilt (deg) of the human foot sole-normal from vertical for a foot to count "
                          "as a flat plantar support (default: 40)")
+    ap.add_argument("--foot-yaw-weight", type=float, default=1.5,
+                    help="Weight for the foot heading (yaw) align during contact: drives the foot "
+                         "forward axis to the HUMAN foot heading so the planted foot follows the "
+                         "human's small heading change instead of free-drifting (inner/outer slip). "
+                         "0 disables (default: 1.5)")
+    ap.add_argument("--contact-min-run", type=int, default=3,
+                    help="Debounce: remove contact ON/OFF runs shorter than this many SOLVED "
+                         "frames (kills marginal-threshold flicker). 1 disables (default: 3)")
+    ap.add_argument("--contact-ramp", type=int, default=4,
+                    help="Cross-fade the contact constraints (flat/align, palm-pin, foot-yaw) over "
+                         "this many solved frames at make/break instead of snapping. 0 = binary "
+                         "(default: 4)")
+    ap.add_argument("--contact-preroll", type=int, default=2,
+                    help="Look-ahead: begin easing contact constraints in this many solved frames "
+                         "BEFORE touchdown so the foot/hand is prepared (default: 2)")
     ap.add_argument("--log-every", type=int, default=1,
                     help="Print a per-frame line every N solved frames (1=all). "
                          "Final frame + summary always printed. Use >1 to cut log volume.")
@@ -766,6 +845,17 @@ def main():
     frame_ids = list(range(0, src_positions.shape[0], args.stride))
     if args.max_frames is not None:
         frame_ids = frame_ids[: args.max_frames]
+
+    # Contact conditioning at the SOLVED frame rate: debounce marginal-threshold
+    # flicker, then build a cross-fade envelope (cosine ramp + look-ahead preroll)
+    # so contact constraints ease in/out instead of snapping full-weight at onset
+    # (measured: pose jump is ~2.8x larger at raw contact transitions; feet were
+    # yanked flat from a mean 47deg tilt).
+    fidx = np.asarray(frame_ids)
+    contacts_solved = {eff: debounce_flags(contacts[eff][fidx], args.contact_min_run)
+                       for eff in CONTACT_EFFECTORS}
+    contact_env = {eff: ramp_envelope(contacts_solved[eff], args.contact_ramp, args.contact_preroll)
+                   for eff in CONTACT_EFFECTORS}
 
     first_src_pos = src_positions[frame_ids[0]]
     first_src_ori = orientation_mats[frame_ids[0]]
@@ -898,6 +988,8 @@ def main():
         skip_ori_body_ids = set()
         pos_site_constraints = []
         skip_pos_roles = set()
+        ori_weight_scale = {}
+        pos_weight_scale = {}
         frame_contacts = {}
         palm_targets = {}
         if contact_first:
@@ -905,15 +997,38 @@ def main():
             src_pelvis = src_positions[src_i][role_to_idx["pelvis"]]
             root_delta = root_scale * (src_pelvis - src_pelvis0)
             for eff, cfg in CONTACT_EFFECTORS.items():
-                in_contact = bool(contacts[eff][src_i])
-                frame_contacts[eff] = in_contact
-                if not in_contact:
+                w_env = float(contact_env[eff][ti])   # cross-fade weight in [0,1]
+                # Report as "in contact" once the effector is at least half engaged
+                # (used for diagnostics/renderer); constraints themselves are scaled
+                # continuously by w_env so they ease in/out with no snap.
+                frame_contacts[eff] = w_env >= 0.5
+                if w_env <= 0.0:
                     continue
                 bid = effector_body_id[eff]
                 align_constraints.append(
-                    (bid, cfg["axis_local"], cfg["world_dir"], CONTACT_ALIGN_WEIGHT[eff])
+                    (bid, cfg["axis_local"], cfg["world_dir"], CONTACT_ALIGN_WEIGHT[eff] * w_env)
                 )
-                skip_ori_body_ids.add(ori_role_body_id[cfg["ori_role"]])
+                # Cross-fade the human world-delta orientation out as the contact
+                # constraint fades in (weight *= 1-w_env), so the foot eases from
+                # its human pose onto flat instead of the target snapping off.
+                obid = ori_role_body_id[cfg["ori_role"]]
+                ori_weight_scale[obid] = min(ori_weight_scale.get(obid, 1.0), 1.0 - w_env)
+
+                # Foot heading (yaw) align: flat pins pitch/roll but leaves yaw a
+                # free DOF, so a planted foot free-drifts in-plane (inner/outer
+                # rotation slip). Drive the foot forward axis (+X) to the HUMAN
+                # foot heading (ground-projected), so it follows the human's small
+                # heading change instead of the leg chain spinning it freely.
+                # Hands keep yaw free (fist support face doesn't need it).
+                if "foot" in eff and args.foot_yaw_weight > 0.0:
+                    fwd_tgt = ori_targets[cfg["ori_role"]] @ np.array([1.0, 0.0, 0.0])
+                    fwd_xy = np.array([fwd_tgt[0], fwd_tgt[1], 0.0])
+                    n_xy = np.linalg.norm(fwd_xy)
+                    if n_xy > 0.1:   # skip if the human foot points near-vertical
+                        align_constraints.append(
+                            (bid, np.array([1.0, 0.0, 0.0]), fwd_xy / n_xy,
+                             args.foot_yaw_weight * w_env)
+                        )
 
                 # Hand contact also pins the palm site to the human hand location
                 # (and suppresses the now-redundant wrist-body position target).
@@ -925,9 +1040,12 @@ def main():
                         rel = src_positions[src_i][role_to_idx[mk]] - src_pelvis
                         tgt = palm_rest_pos[eff] + root_delta + palm_pos_scale[eff] * (rel - rel0)
                         pos_site_constraints.append(
-                            (effector_site_id[eff], tgt, CONTACT_POS_WEIGHT)
+                            (effector_site_id[eff], tgt, CONTACT_POS_WEIGHT * w_env)
                         )
-                        skip_pos_roles.add(cpos["skip_pos_role"])
+                        # Cross-fade the wrist-body position target out as the palm
+                        # pin fades in (weight *= 1-w_env).
+                        spr = cpos["skip_pos_role"]
+                        pos_weight_scale[spr] = min(pos_weight_scale.get(spr, 1.0), 1.0 - w_env)
                         palm_targets[eff] = tgt
 
         q = solve_frame_position_ik(
@@ -941,6 +1059,8 @@ def main():
             ori_scale=args.ori_scale,
             align_constraints=align_constraints,
             skip_ori_body_ids=skip_ori_body_ids,
+            ori_weight_scale=ori_weight_scale,
+            pos_weight_scale=pos_weight_scale,
             pos_site_constraints=pos_site_constraints,
             skip_pos_roles=skip_pos_roles,
             iters=args.ik_iters,

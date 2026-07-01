@@ -276,17 +276,46 @@ def _contact_slip_stats(model, data, qpos, tgt, wgt, planted, resolved):
 # Stage A — closed-form smoothing
 # ---------------------------------------------------------------------------
 
-def stage_a(qpos_ik, lambda_track, lambda_smooth, q_lo, q_hi):
-    T = qpos_ik.shape[0]
+def _banded_smoother(T, lambda_track, lambda_smooth):
     dtd_main = np.full(T, 2.0); dtd_main[0] = dtd_main[-1] = 1.0
-    main_diag = lambda_track + lambda_smooth * dtd_main
-    off_diag = -lambda_smooth * np.ones(T - 1)
     ab = np.zeros((3, T))
-    ab[0, 1:] = off_diag; ab[1, :] = main_diag; ab[2, :-1] = off_diag
-    rhs = lambda_track * qpos_ik[:, 7:]
+    ab[1, :] = lambda_track + lambda_smooth * dtd_main
+    ab[0, 1:] = -lambda_smooth
+    ab[2, :-1] = -lambda_smooth
+    return ab
+
+
+def _smooth_channel(sig, ab, lambda_track):
+    return solve_banded((1, 1), ab, lambda_track * sig)
+
+
+def stage_a(qpos_ik, lambda_track, lambda_smooth, q_lo, q_hi,
+            smooth_root=True, root_lambda_smooth=None):
+    """Closed-form per-channel tridiagonal smoothing.
+
+    Actuated joints (qpos[7:]) always smoothed. With smooth_root, the free-base
+    root is ALSO smoothed — position (qpos[0:3]) with the same tridiagonal solver
+    and the quaternion (qpos[3:7]) via hemisphere-aligned component smoothing +
+    renormalise. Without this the root passes through jumpy (per-frame IK root has
+    ~3cm / 10deg per-frame pops that read as the whole body flicking)."""
+    T = qpos_ik.shape[0]
+    ab = _banded_smoother(T, lambda_track, lambda_smooth)
     out = qpos_ik.copy()
     for j in range(N_ACT):
-        out[:, 7 + j] = np.clip(solve_banded((1, 1), ab, rhs[:, j]), q_lo[j], q_hi[j])
+        out[:, 7 + j] = np.clip(_smooth_channel(qpos_ik[:, 7 + j], ab, lambda_track),
+                                q_lo[j], q_hi[j])
+    if smooth_root:
+        rls = lambda_smooth if root_lambda_smooth is None else root_lambda_smooth
+        abr = _banded_smoother(T, lambda_track, rls)
+        for j in range(3):                        # root position
+            out[:, j] = _smooth_channel(qpos_ik[:, j], abr, lambda_track)
+        Q = qpos_ik[:, 3:7].copy()                # root quaternion (wxyz)
+        for t in range(1, T):                     # hemisphere continuity
+            if np.dot(Q[t], Q[t - 1]) < 0:
+                Q[t] = -Q[t]
+        Qs = np.column_stack([_smooth_channel(Q[:, k], abr, lambda_track) for k in range(4)])
+        n = np.linalg.norm(Qs, axis=1, keepdims=True); n[n < 1e-9] = 1.0
+        out[:, 3:7] = Qs / n
     return out
 
 
@@ -508,6 +537,13 @@ def main():
     ap.add_argument("--lambda-track", type=float, default=1.0)
     ap.add_argument("--lambda-smooth", type=float, default=10.0)
     ap.add_argument("--lambda-coll", type=float, default=5.0)
+    ap.add_argument("--no-root-smooth", action="store_true",
+                    help="Do NOT smooth the free-base root (qpos[0:7]). By default the root "
+                         "IS smoothed (pos + quaternion) — its per-frame IK jumps (~3cm/10deg) "
+                         "otherwise read as the whole body flicking.")
+    ap.add_argument("--root-smooth", type=float, default=0.0,
+                    help="Root smoothing weight (0 = use --lambda-smooth). Lower = gentler root "
+                         "smoothing (less risk of feet sliding as the root moves).")
     ap.add_argument("--foot-weight", type=float, default=40.0,
                     help="Soft weight pinning a PLANTED foot to its stationary anchor.")
     ap.add_argument("--hand-weight", type=float, default=8.0,
@@ -588,7 +624,9 @@ def main():
     s_ik = all_stats(qpos_ik)
 
     print("Stage A: closed-form smoothing...")
-    qpos_a = stage_a(qpos_ik, args.lambda_track, args.lambda_smooth, q_lo, q_hi)
+    qpos_a = stage_a(qpos_ik, args.lambda_track, args.lambda_smooth, q_lo, q_hi,
+                     smooth_root=not args.no_root_smooth,
+                     root_lambda_smooth=(args.root_smooth if args.root_smooth > 0 else None))
     s_a = all_stats(qpos_a)
 
     qpos_b = None
