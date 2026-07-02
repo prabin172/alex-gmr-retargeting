@@ -464,11 +464,13 @@ def stage_b(qpos_warm, target_positions, role_names, role_to_body, target_weight
             tgt, wgt, planted, resolved, downweight_roles,
             model, data, q_lo, q_hi,
             lambda_track, lambda_smooth, lambda_coll,
-            foot_flat_w, fist_w, downweight_factor, n_outer, trust):
+            foot_flat_w, fist_w, downweight_factor, n_outer, trust,
+            soft_collision=False, collision_penalty=1000.0):
     T = qpos_warm.shape[0]
     N = T * N_ACT
     q_warm_act = qpos_warm[:, 7:].reshape(-1)
-    print(f"  Stage B: T={T} variables={N} n_outer={n_outer} trust={trust}")
+    print(f"  Stage B: T={T} variables={N} n_outer={n_outer} trust={trust}"
+          + (f" soft_collision=ON penalty={collision_penalty}" if soft_collision else ""))
 
     H_smooth = _build_smoothness_hessian(T, lambda_smooth)
     A_jl = sp.eye(N, format="csc")
@@ -494,26 +496,58 @@ def stage_b(qpos_warm, target_positions, role_names, role_to_body, target_weight
         jl_hi = np.minimum(jl_hi_abs, delta + trust)
 
         A_coll, l_coll, u_coll = _build_collision(qpos_cur, model, data, lambda_coll)
-        if A_coll is not None:
-            A = sp.vstack([A_jl, A_coll], format="csc")
-            l = np.concatenate([jl_lo, l_coll]); u = np.concatenate([jl_hi, u_coll])
+        n_coll_rows = 0 if A_coll is None else A_coll.shape[0]
+
+        slack_info = ""
+        if soft_collision:
+            # Slack-based SOFT collision: augment decision vector with one slack
+            # var per collision row so the QP is always feasible. Genuinely-close
+            # legs relax via slack (penalised) instead of driving OSQP infeasible.
+            m = n_coll_rows
+            if m > 0:
+                # P: block-diag [ 2*(H_task+H_smooth) , 0 ; 0 , 2*rho*I_m ]
+                P_slack = sp.diags(np.full(m, 2.0 * collision_penalty), format="csc")
+                P_aug = sp.block_diag([P, P_slack], format="csc")
+                q_aug = np.concatenate([q_vec, np.zeros(m)])
+                # joint-limit rows: [eye_N, 0_{N x m}]
+                A_jl_aug = sp.hstack([A_jl, sp.csc_matrix((N, m))], format="csc")
+                # collision rows: [sqw*jsep , +I_m] ; sqw*jsep·δq + s_i >= l_i
+                A_coll_aug = sp.hstack([A_coll, sp.eye(m, format="csc")], format="csc")
+                # slack non-negativity: [0_{m x N}, eye_m], 0 <= s <= 1e6
+                A_slack = sp.hstack([sp.csc_matrix((m, N)), sp.eye(m, format="csc")], format="csc")
+                A = sp.vstack([A_jl_aug, A_coll_aug, A_slack], format="csc")
+                l = np.concatenate([jl_lo, l_coll, np.zeros(m)])
+                u = np.concatenate([jl_hi, u_coll, np.full(m, 1e6)])
+                P_use, q_use = P_aug, q_aug
+            else:
+                # no collision rows this iter → plain joint-limit QP (no slack)
+                P_use, q_use = P, q_vec
+                A, l, u = A_jl, jl_lo, jl_hi
         else:
-            A, l, u = A_jl, jl_lo, jl_hi
+            if A_coll is not None:
+                A = sp.vstack([A_jl, A_coll], format="csc")
+                l = np.concatenate([jl_lo, l_coll]); u = np.concatenate([jl_hi, u_coll])
+            else:
+                A, l, u = A_jl, jl_lo, jl_hi
+            P_use, q_use = P, q_vec
 
         prob = osqp.OSQP()
-        prob.setup(P.tocsc(), q_vec, A, l, u, warm_starting=True, verbose=False,
+        prob.setup(P_use.tocsc(), q_use, A, l, u, warm_starting=True, verbose=False,
                    eps_abs=1e-4, eps_rel=1e-4, max_iter=8000, polish=True)
         res = prob.solve()
 
-        n_coll_rows = 0 if A_coll is None else A_coll.shape[0]
         if res.info.status not in ("solved", "solved_inaccurate"):
             print(f"    outer {outer+1}/{n_outer}: OSQP {res.info.status} — keep previous")
         else:
-            delta = res.x
+            delta = res.x[:N]
             q_act = np.clip((q_warm_act + delta).reshape(T, N_ACT), q_lo, q_hi)
             qpos_cur[:, 7:] = q_act
-        print(f"    outer {outer+1}/{n_outer}: coll_rows={n_coll_rows} "
-              f"|dQ|max={np.abs(delta).max():.4f} time={time.time()-t0:.1f}s")
+            if soft_collision and n_coll_rows > 0:
+                s = res.x[N:N + n_coll_rows]
+                slack_info = (f" slack_max={float(np.abs(s).max()):.4f} "
+                              f"slack_active={int((np.abs(s) > 1e-4).sum())}/{n_coll_rows}")
+        print(f"    outer {outer+1}/{n_outer}: coll_rows={n_coll_rows} status={res.info.status} "
+              f"|dQ|max={np.abs(delta).max():.4f} time={time.time()-t0:.1f}s" + slack_info)
     return qpos_cur
 
 
@@ -568,6 +602,14 @@ def main():
                          "contact detection isolates true stationary plants.")
     ap.add_argument("--trust", type=float, default=0.15,
                     help="Stage B trust-region: max change in δq per outer iter (rad).")
+    ap.add_argument("--soft-collision", action="store_true",
+                    help="Stage B: make self-collision constraints SOFT via slack "
+                         "variables (one per collision row). Keeps the QP feasible with "
+                         "the dense fullmesh collision model (hard rows go primal "
+                         "infeasible → Stage B no-ops). Default OFF = existing hard path.")
+    ap.add_argument("--collision-penalty", type=float, default=1000.0,
+                    help="Quadratic penalty weight ρ on the collision slack variables "
+                         "(only used with --soft-collision).")
     args = ap.parse_args()
 
     z = np.load(args.ik_npz, allow_pickle=True)
@@ -637,7 +679,9 @@ def main():
                          model, data, q_lo, q_hi,
                          args.lambda_track, args.lambda_smooth, args.lambda_coll,
                          args.foot_flat_weight, args.fist_weight,
-                         args.contact_downweight, args.n_outer, args.trust)
+                         args.contact_downweight, args.n_outer, args.trust,
+                         soft_collision=args.soft_collision,
+                         collision_penalty=args.collision_penalty)
         s_b = all_stats(qpos_b)
 
     print("\n" + "=" * 120)

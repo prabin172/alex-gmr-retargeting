@@ -11,6 +11,19 @@
 #   outputs/global_opt_contactfirst/<clip>_global_opt.npz
 #   outputs/grounded_contactfirst/<clip>_grounded.npz
 #   outputs/renders/contactfirst/<clip>_globalopt.mp4
+#
+# Env knobs (all optional; defaults reproduce current shipped behavior byte-for-byte):
+#   STAGEB_MODEL   (default empty)  when set, passed as `--model` to the Stage 4
+#                                   solve_global_trajectory_opt_contactfirst.py call.
+#                                   Empty -> no --model (script uses its default primitive model).
+#                                   Set to the fullmesh collision xml to adopt FULLMESH collisions.
+#   STAGEB_EXTRA   (default empty)  extra flags appended to the Stage 4 call,
+#                                   e.g. "--soft-collision --collision-penalty 1000".
+#   GO_DIR         (default outputs/global_opt_contactfirst)  Stage-4 output dir.
+#   GR_DIR         (default outputs/grounded_contactfirst)    Stage-4.5 output dir.
+#                                   Override GO_DIR/GR_DIR to keep primitive-model NPZs intact
+#                                   while writing a separate fullmesh pass.
+#   RENDER_MESH / RENDER_DIR / RENDER_EXTRA  render-stage controls (see below).
 set -uo pipefail
 
 STRIDE=4
@@ -25,20 +38,25 @@ RENDER_EXTRA="${RENDER_EXTRA:-}"          # extra render flags, e.g. "--fixed-ca
 GROUND_MODE="${GROUND_MODE:-perframe}"    # perframe (plant every frame) | constant (single per-clip shift)
 GROUND_SMOOTH="${GROUND_SMOOTH:-5}"       # perframe: tridiagonal smoothing on the shift series
 # --- Render mesh (Stage 5) ---
-# visual    = Alex visual mesh, hands drawn as closed fists (good visualisation)
+# visual    = Alex visual mesh (V1 legs/arms), hands drawn as closed fists
+# visualv2  = full V2 body visual mesh (legs+arms+torso), hands as closed fists
 # collision = v2 collision convex hulls (what the solver actually uses)
 # <path>    = any explicit model xml
 RENDER_MESH="${RENDER_MESH:-visual}"
 case "$RENDER_MESH" in
   visual)    RMODEL="assets/alex/alex_visual_mesh_fist_hands.xml" ;;
+  visualv2)  RMODEL="assets/alex/alex_visual_mesh_fist_hands_v2.xml" ;;
   collision) RMODEL="assets/alex/alex_floating_base_with_sites_v2.xml" ;;
   *)         RMODEL="$RENDER_MESH" ;;
 esac
 IN=outputs/canonical_human/fbx_fresh
 CF=outputs/contactfirst
-GO=outputs/global_opt_contactfirst
-GR=outputs/grounded_contactfirst
+GO="${GO_DIR:-outputs/global_opt_contactfirst}"
+GR="${GR_DIR:-outputs/grounded_contactfirst}"
 RD="${RENDER_DIR:-outputs/renders/contactfirst}"
+# --- Stage 4 (GlobalOPT) model/extra knobs ---
+STAGEB_MODEL="${STAGEB_MODEL:-}"          # when set: --model "$STAGEB_MODEL" for Stage 4
+STAGEB_EXTRA="${STAGEB_EXTRA:-}"          # extra Stage 4 flags, e.g. "--soft-collision --collision-penalty 1000"
 mkdir -p "$CF" "$GO" "$GR" "$RD"
 echo "Render mesh: $RENDER_MESH -> $RMODEL   |  ground: $GROUND_MODE (smooth=$GROUND_SMOOTH)"
 
@@ -59,6 +77,12 @@ CLIPS=(
   "shovel_lefthard_01|PrabinRef_Shovel_LeftHard_01_with_orient.npz||"
   "shovel_rightbucket_01|PrabinRef_Shovel_RightBucket_01_with_orient.npz||"
   "shovel_righthard_01|PrabinRef_Shovel_RightHard_01_with_orient.npz||"
+  "standupFromKneeling_01|PrabinRef_STandupFromKneeling_01_with_orient.npz||"
+  "standupFromKneeling_02|PrabinRef_STandupFromKneeling_02_with_orient.npz||"
+  "standupKnees_02|PrabinRef_StandupKnees_02_with_orient.npz||"
+  "standupSquatCrouch_01|PrabinRef_StandupSquatCrouch_01_with_orient.npz||"
+  "kneelingFall_02|PrabinRef_KneelingFall_02_with_orient.npz||"
+  "kneelingFall_03|PrabinRef_KneelingFall_03_with_orient.npz||"
 )
 
 ok=0; fail=0
@@ -86,9 +110,10 @@ for entry in "${CLIPS[@]}"; do
   fi
 
   # Stage 4 — GlobalOPT Stage-A smoothing (+ per-clip extras, e.g. Stage B)
-  echo "  [smooth] GlobalOPT ${go_extra:+(extra: $go_extra) }..."
+  echo "  [smooth] GlobalOPT ${STAGEB_MODEL:+(model: $STAGEB_MODEL) }${STAGEB_EXTRA:+(extra: $STAGEB_EXTRA) }${go_extra:+(clip-extra: $go_extra) }..."
   python scripts/solve_global_trajectory_opt_contactfirst.py \
-    --ik-npz "$cf" --out "$go" --lambda-smooth "$LAMBDA_SMOOTH" --n-outer "$N_OUTER" $go_extra \
+    --ik-npz "$cf" --out "$go" --lambda-smooth "$LAMBDA_SMOOTH" --n-outer "$N_OUTER" \
+    ${STAGEB_MODEL:+--model "$STAGEB_MODEL"} $STAGEB_EXTRA $go_extra \
     || { echo "  [FAIL] globalopt"; fail=$((fail+1)); continue; }
 
   # Stage 4.5 — Z-grounding (plant lowest contact point on the floor)
