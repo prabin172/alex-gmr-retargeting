@@ -20,7 +20,7 @@ import os
 import numpy as np
 import mujoco
 
-MODEL = "assets/alex/alex_floating_base_with_sites_v2.xml"
+MODEL = "assets/alex/alex_floating_base_with_sites.xml"
 GO_DIR = "outputs/global_opt_contactfirst"
 
 GEOM = {

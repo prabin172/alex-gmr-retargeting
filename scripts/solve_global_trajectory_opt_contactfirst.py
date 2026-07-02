@@ -10,19 +10,23 @@ lets smoothing drift the end-effectors = slip).
   Stage A — closed-form per-joint tridiagonal smoothing (kills velocity spikes).
             Root DOF (qpos[0:7]) untouched. Identical to base GlobalOPT.
 
-  Stage B — sparse global QP (OSQP) over actuated δq of all frames:
-      min 0.5 δQᵀP δQ + qᵀδQ   s.t.  joint limits, self-collision (SCA),
-                                       and CONTACT constraints.
-    Contact constraints, per effector while `contact_flags` is set:
+  Stage B — sparse global QP (OSQP) over actuated δq of all frames.
+    Nothing is a hard equality — every term is a soft weighted cost or a box
+    constraint, so the QP is always feasible (reach-limited pushes yield
+    gracefully instead of going primal-infeasible):
       * Anchor  = median of the per-frame-IK contact-point world positions over
         each contiguous contact interval (robust to jitter, stays near the IK
         pose). One fixed anchor per interval → no slip.
-      * Feet  (hard equality): pin foot-body position to the anchor (3 rows) and
-        keep the foot flat, up-axis→world +Z (3 rows). `--relax-flat` moves the
-        flat term to a soft cost if the equalities over-constrain the leg.
-      * Hands (soft, high weight): pin the palm contact site to the anchor and
-        press the fist down (+X→world −Z, low weight) — reach-limited dynamic
-        pushes must not make the QP infeasible.
+      * Feet (soft pins, weights): pull foot-body position to the anchor and,
+        on planted frames, keep the foot flat (up-axis→world +Z) — both as
+        weighted least-squares costs, not equalities.
+      * Hands (soft pins, weights): pull the palm contact site to the anchor and
+        press the fist down (+X→world −Z, low weight).
+      * Self-collision: always-on SLACK-based soft avoidance. Each active
+        collision row gets a non-negative slack variable penalised by
+        `--collision-penalty` ρ, so genuinely-close links relax via (penalised)
+        slack instead of driving the solve infeasible.
+      * Trust region + joint-limit box constraints bound each outer SCA step.
       * Tracking of a contacting effector's own role is down-weighted while in
         contact (the anchor governs that point) — mirrors the per-frame
         `skip_pos_roles` suppress.
@@ -47,7 +51,7 @@ import scipy.sparse as sp
 from scipy.linalg import solve_banded
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-MODEL_DEFAULT = REPO_ROOT / "assets/alex/alex_floating_base_with_sites_v2.xml"
+MODEL_DEFAULT = REPO_ROOT / "assets/alex/alex_floating_base_with_sites.xml"
 
 COLL_MARGIN  = 0.02   # metres
 COLL_HOPS    = 2
@@ -465,12 +469,12 @@ def stage_b(qpos_warm, target_positions, role_names, role_to_body, target_weight
             model, data, q_lo, q_hi,
             lambda_track, lambda_smooth, lambda_coll,
             foot_flat_w, fist_w, downweight_factor, n_outer, trust,
-            soft_collision=False, collision_penalty=1000.0):
+            collision_penalty=1000.0):
     T = qpos_warm.shape[0]
     N = T * N_ACT
     q_warm_act = qpos_warm[:, 7:].reshape(-1)
-    print(f"  Stage B: T={T} variables={N} n_outer={n_outer} trust={trust}"
-          + (f" soft_collision=ON penalty={collision_penalty}" if soft_collision else ""))
+    print(f"  Stage B: T={T} variables={N} n_outer={n_outer} trust={trust} "
+          f"soft_collision=ON penalty={collision_penalty}")
 
     H_smooth = _build_smoothness_hessian(T, lambda_smooth)
     A_jl = sp.eye(N, format="csc")
@@ -499,37 +503,30 @@ def stage_b(qpos_warm, target_positions, role_names, role_to_body, target_weight
         n_coll_rows = 0 if A_coll is None else A_coll.shape[0]
 
         slack_info = ""
-        if soft_collision:
-            # Slack-based SOFT collision: augment decision vector with one slack
-            # var per collision row so the QP is always feasible. Genuinely-close
-            # legs relax via slack (penalised) instead of driving OSQP infeasible.
-            m = n_coll_rows
-            if m > 0:
-                # P: block-diag [ 2*(H_task+H_smooth) , 0 ; 0 , 2*rho*I_m ]
-                P_slack = sp.diags(np.full(m, 2.0 * collision_penalty), format="csc")
-                P_aug = sp.block_diag([P, P_slack], format="csc")
-                q_aug = np.concatenate([q_vec, np.zeros(m)])
-                # joint-limit rows: [eye_N, 0_{N x m}]
-                A_jl_aug = sp.hstack([A_jl, sp.csc_matrix((N, m))], format="csc")
-                # collision rows: [sqw*jsep , +I_m] ; sqw*jsep·δq + s_i >= l_i
-                A_coll_aug = sp.hstack([A_coll, sp.eye(m, format="csc")], format="csc")
-                # slack non-negativity: [0_{m x N}, eye_m], 0 <= s <= 1e6
-                A_slack = sp.hstack([sp.csc_matrix((m, N)), sp.eye(m, format="csc")], format="csc")
-                A = sp.vstack([A_jl_aug, A_coll_aug, A_slack], format="csc")
-                l = np.concatenate([jl_lo, l_coll, np.zeros(m)])
-                u = np.concatenate([jl_hi, u_coll, np.full(m, 1e6)])
-                P_use, q_use = P_aug, q_aug
-            else:
-                # no collision rows this iter → plain joint-limit QP (no slack)
-                P_use, q_use = P, q_vec
-                A, l, u = A_jl, jl_lo, jl_hi
+        # Slack-based SOFT collision (always on): augment the decision vector with
+        # one slack var per collision row so the QP is always feasible.
+        # Genuinely-close links relax via (penalised) slack instead of driving
+        # OSQP primal-infeasible.
+        m = n_coll_rows
+        if m > 0:
+            # P: block-diag [ 2*(H_task+H_smooth) , 0 ; 0 , 2*rho*I_m ]
+            P_slack = sp.diags(np.full(m, 2.0 * collision_penalty), format="csc")
+            P_aug = sp.block_diag([P, P_slack], format="csc")
+            q_aug = np.concatenate([q_vec, np.zeros(m)])
+            # joint-limit rows: [eye_N, 0_{N x m}]
+            A_jl_aug = sp.hstack([A_jl, sp.csc_matrix((N, m))], format="csc")
+            # collision rows: [sqw*jsep , +I_m] ; sqw*jsep·δq + s_i >= l_i
+            A_coll_aug = sp.hstack([A_coll, sp.eye(m, format="csc")], format="csc")
+            # slack non-negativity: [0_{m x N}, eye_m], 0 <= s <= 1e6
+            A_slack = sp.hstack([sp.csc_matrix((m, N)), sp.eye(m, format="csc")], format="csc")
+            A = sp.vstack([A_jl_aug, A_coll_aug, A_slack], format="csc")
+            l = np.concatenate([jl_lo, l_coll, np.zeros(m)])
+            u = np.concatenate([jl_hi, u_coll, np.full(m, 1e6)])
+            P_use, q_use = P_aug, q_aug
         else:
-            if A_coll is not None:
-                A = sp.vstack([A_jl, A_coll], format="csc")
-                l = np.concatenate([jl_lo, l_coll]); u = np.concatenate([jl_hi, u_coll])
-            else:
-                A, l, u = A_jl, jl_lo, jl_hi
+            # no collision rows this iter → plain joint-limit QP (no slack)
             P_use, q_use = P, q_vec
+            A, l, u = A_jl, jl_lo, jl_hi
 
         prob = osqp.OSQP()
         prob.setup(P_use.tocsc(), q_use, A, l, u, warm_starting=True, verbose=False,
@@ -542,7 +539,7 @@ def stage_b(qpos_warm, target_positions, role_names, role_to_body, target_weight
             delta = res.x[:N]
             q_act = np.clip((q_warm_act + delta).reshape(T, N_ACT), q_lo, q_hi)
             qpos_cur[:, 7:] = q_act
-            if soft_collision and n_coll_rows > 0:
+            if n_coll_rows > 0:
                 s = res.x[N:N + n_coll_rows]
                 slack_info = (f" slack_max={float(np.abs(s).max()):.4f} "
                               f"slack_active={int((np.abs(s) > 1e-4).sum())}/{n_coll_rows}")
@@ -602,14 +599,9 @@ def main():
                          "contact detection isolates true stationary plants.")
     ap.add_argument("--trust", type=float, default=0.15,
                     help="Stage B trust-region: max change in δq per outer iter (rad).")
-    ap.add_argument("--soft-collision", action="store_true",
-                    help="Stage B: make self-collision constraints SOFT via slack "
-                         "variables (one per collision row). Keeps the QP feasible with "
-                         "the dense fullmesh collision model (hard rows go primal "
-                         "infeasible → Stage B no-ops). Default OFF = existing hard path.")
     ap.add_argument("--collision-penalty", type=float, default=1000.0,
-                    help="Quadratic penalty weight ρ on the collision slack variables "
-                         "(only used with --soft-collision).")
+                    help="Quadratic penalty weight ρ on the always-on collision slack "
+                         "variables (Stage B soft self-collision).")
     args = ap.parse_args()
 
     z = np.load(args.ik_npz, allow_pickle=True)
@@ -680,7 +672,6 @@ def main():
                          args.lambda_track, args.lambda_smooth, args.lambda_coll,
                          args.foot_flat_weight, args.fist_weight,
                          args.contact_downweight, args.n_outer, args.trust,
-                         soft_collision=args.soft_collision,
                          collision_penalty=args.collision_penalty)
         s_b = all_stats(qpos_b)
 

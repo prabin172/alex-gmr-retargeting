@@ -31,7 +31,7 @@ import mujoco
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-MODEL_DEFAULT = REPO_ROOT / "assets/alex/alex_floating_base_with_sites_v2.xml"
+MODEL_DEFAULT = REPO_ROOT / "assets/alex/alex_floating_base_with_sites.xml"
 
 
 def _build_mesh_cache(model: mujoco.MjModel):

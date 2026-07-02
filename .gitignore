@@ -1,20 +1,8 @@
-__pycache__/
-*.pyc
-.venv/
-
-data/
-outputs/
-
-*.npz
-*.npy
-*.pkl
-*.mp4
-*.gif
-*.log
 # ==============================
 # Python / environment artifacts
 # ==============================
 __pycache__/
+*.pyc
 *.py[cod]
 *.pyo
 *.egg-info/
@@ -30,24 +18,28 @@ env/
 *.env
 
 # ==============================
-# Temporary local experiment code
+# Temporary local experiment code / scratch
 # ==============================
 temp_codes/
+temp_*
 scripts/temp_*.py
+assets/alex/temp_*
+*.bak_*
+*.bak*
+*.broken_orientation_patch_*
 
 # ==============================
-# Outputs / generated files
+# Outputs / generated data files
 # ==============================
 outputs/
-data/processed/
-data/source_motions/
-data/raw/
-data/*.npz
+data/
 *.npz
+*.npy
 *.pkl
 *.mp4
 *.avi
 *.mov
+*.gif
 *.log
 
 # ==============================
@@ -59,15 +51,12 @@ assets/alex/*
 !assets/alex/README.md
 !assets/alex/.gitkeep
 
-# --- Local retargeting experiments / scratch ---
-outputs/
-data/processed/
-data/raw/
-temp_*
-*.bak_*
-*.bak*
-*.broken_orientation_patch_*
-assets/alex/temp_*
-__pycache__/
-*.pyc
-# --- End local retargeting experiments / scratch ---
+# ==============================
+# Keep-local working docs (tracked history removed; kept on disk)
+# ==============================
+SESSION_HANDOFF.md
+paper_idea.md
+
+# Editor / local scratch
+.obsidian/
+prompt.md

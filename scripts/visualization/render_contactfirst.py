@@ -25,7 +25,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-MODEL_DEFAULT = REPO_ROOT / "assets/alex/alex_floating_base_with_sites_v2.xml"
+MODEL_DEFAULT = REPO_ROOT / "assets/alex/alex_floating_base_with_sites.xml"
 
 SKELETON_EDGES = [
     ("pelvis", "torso", (230, 230, 230)),
