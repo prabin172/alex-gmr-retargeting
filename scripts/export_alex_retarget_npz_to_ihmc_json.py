@@ -197,6 +197,25 @@ def infer_foot_contacts_from_sites(
 
     return contacts
 
+def load_contact_effector_flags(z: np.lib.npyio.NpzFile) -> dict[str, np.ndarray] | None:
+    if "contact_effector_names" not in z or "contact_flags" not in z:
+        return None
+
+    names = np.asarray(z["contact_effector_names"]).reshape(-1).astype(str)
+    flags = np.asarray(z["contact_flags"])
+    if flags.ndim == 1:
+        flags = flags.reshape(-1, 1)
+
+    mapping: dict[str, np.ndarray] = {}
+    for idx, name in enumerate(names):
+        key = name.strip().lower().replace(" ", "_")
+        if key in {"left_foot", "right_foot", "left_hand", "right_hand"}:
+            mapping[key] = flags[:, idx].astype(bool)
+    if not mapping:
+        return None
+    return mapping
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("input_npz", type=Path)
@@ -206,6 +225,8 @@ def main():
     ap.add_argument("--com-offset", type=float, default=0.5)
     ap.add_argument("--left-contact", type=int, default=1)
     ap.add_argument("--right-contact", type=int, default=1)
+    ap.add_argument("--left-hand-contact", type=int, default=0)
+    ap.add_argument("--right-hand-contact", type=int, default=0)
     ap.add_argument(
         "--contact-mode",
         choices=["constant", "infer-sites"],
@@ -214,6 +235,10 @@ def main():
     )
     ap.add_argument("--contact-height-threshold-m", type=float, default=0.04)
     ap.add_argument("--contact-speed-threshold-mps", type=float, default=0.20)
+    ap.add_argument("--solution-quality", type=float, default=0.0,
+                    help="Constant solution_quality to write into each frame.")
+    ap.add_argument("--solution-quality-random", action="store_true",
+                    help="If set, generate a random solution_quality per frame instead of a constant value.")
     args = ap.parse_args()
 
     z = np.load(args.input_npz, allow_pickle=True)
@@ -224,14 +249,15 @@ def main():
     if qpos.ndim != 2 or qpos.shape[1] != 36:
         raise ValueError(f"Expected qpos shape (T, 36), got {qpos.shape}")
 
-    fps = float(args.fps)
-    if args.fps is None:
-        if "output_fps" in z:
-            fps = float(np.asarray(z["output_fps"]).reshape(-1)[0])
-        elif "fps" in z:
-            fps = float(np.asarray(z["fps"]).reshape(-1)[0])
-        else:
-            fps = 30.0
+    fps = None
+    if args.fps is not None:
+        fps = float(args.fps)
+    elif "output_fps" in z:
+        fps = float(np.asarray(z["output_fps"]).reshape(-1)[0])
+    elif "fps" in z:
+        fps = float(np.asarray(z["fps"]).reshape(-1)[0])
+    else:
+        fps = 30.0
 
     mj_names = load_mujoco_joint_order(args.model)
     if len(mj_names) != 29:
@@ -249,6 +275,10 @@ def main():
     root_lin_vel = finite_diff(root_pos, fps)
     root_ang_vel = quat_to_angvel_wxyz(root_quat_wxyz, fps)
 
+    contact_effector_map = load_contact_effector_flags(z)
+    if contact_effector_map is not None:
+        print("Loaded contact effector flags from NPZ:", sorted(contact_effector_map.keys()))
+
     if args.contact_mode == "infer-sites":
         foot_contacts = infer_foot_contacts_from_sites(
             qpos=qpos,
@@ -257,10 +287,27 @@ def main():
             height_threshold_m=args.contact_height_threshold_m,
             speed_threshold_mps=args.contact_speed_threshold_mps,
         )
+        left_foot = foot_contacts[:, 0]
+        right_foot = foot_contacts[:, 1]
     else:
-        foot_contacts = np.zeros((qpos.shape[0], 2), dtype=bool)
-        foot_contacts[:, 0] = bool(args.left_contact)
-        foot_contacts[:, 1] = bool(args.right_contact)
+        left_foot = np.full((qpos.shape[0],), bool(args.left_contact), dtype=bool)
+        right_foot = np.full((qpos.shape[0],), bool(args.right_contact), dtype=bool)
+
+    if contact_effector_map is not None:
+        left_foot = contact_effector_map.get("left_foot", left_foot)
+        right_foot = contact_effector_map.get("right_foot", right_foot)
+
+    left_hand = np.full((qpos.shape[0],), bool(args.left_hand_contact), dtype=bool)
+    right_hand = np.full((qpos.shape[0],), bool(args.right_hand_contact), dtype=bool)
+    if contact_effector_map is not None:
+        left_hand = contact_effector_map.get("left_hand", left_hand)
+        right_hand = contact_effector_map.get("right_hand", right_hand)
+
+    if args.solution_quality_random:
+        rng = np.random.default_rng(0)
+        solution_quality = rng.random(qpos.shape[0]).astype(np.float32)
+    else:
+        solution_quality = np.full((qpos.shape[0],), float(args.solution_quality), dtype=np.float32)
 
     timestamps_ms = np.arange(qpos.shape[0], dtype=np.float64) * (1000.0 / fps)
 
@@ -283,9 +330,11 @@ def main():
             "desired_torso_position": vec3(root_pos[i]),
             "desired_torso_orientation": quat_xyzw_from_wxyz(root_quat_wxyz[i]),
             "com_offset": float(args.com_offset),
-            "left_foot_in_contact": bool(foot_contacts[i, 0]),
-            "right_foot_in_contact": bool(foot_contacts[i, 1]),
-            "solution_quality": 0.0,
+            "left_foot_in_contact": bool(left_foot[i]),
+            "right_foot_in_contact": bool(right_foot[i]),
+            "left_hand_in_contact": bool(left_hand[i]),
+            "right_hand_in_contact": bool(right_hand[i]),
+            "solution_quality": float(solution_quality[i]),
         }
         messages.append(json.dumps({INNER_KEY: status}, separators=(",", ":")))
 
