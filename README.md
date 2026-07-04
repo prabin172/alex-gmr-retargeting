@@ -25,7 +25,7 @@ assets/alex/                  ROBOT MODEL — git-ignored, local only
 data/                         INPUT FBX + canonical NPZs — git-ignored, local only
 outputs/                      ALL generated NPZs, renders, logs — git-ignored, local only
 SESSION_HANDOFF.md            current working state & decisions — git-ignored, kept on disk
-paper_idea.md                 submission draft — git-ignored, kept on disk
+wiki/                         LLM-maintained knowledge base (see wiki/index.md)
 ```
 
 ### Git-ignored layout you must provide locally

@@ -119,6 +119,79 @@ def quat_to_angvel_wxyz(q: np.ndarray, fps: float) -> np.ndarray:
     return w
 
 
+def quat_slerp_wxyz(q0: np.ndarray, q1: np.ndarray, alpha: float) -> np.ndarray:
+    q0 = q0.astype(np.float64)
+    q1 = q1.astype(np.float64)
+    q0 = q0 / np.linalg.norm(q0).clip(min=1e-8)
+    q1 = q1 / np.linalg.norm(q1).clip(min=1e-8)
+    dot = float(np.dot(q0, q1))
+    if dot < 0.0:
+        q1 = -q1
+        dot = -dot
+    dot = np.clip(dot, -1.0, 1.0)
+    if dot > 0.9995:
+        out = q0 + alpha * (q1 - q0)
+        return (out / np.linalg.norm(out)).astype(np.float32)
+
+    theta_0 = np.arccos(dot)
+    sin_theta_0 = np.sin(theta_0)
+    theta = theta_0 * alpha
+    s0 = np.sin(theta_0 - theta) / sin_theta_0
+    s1 = np.sin(theta) / sin_theta_0
+    return (s0 * q0 + s1 * q1).astype(np.float32)
+
+
+def resample_contacts_bool(flags: np.ndarray, src_fps: float, dst_fps: float) -> np.ndarray:
+    if flags.ndim == 1:
+        flags = flags.reshape(-1, 1)
+    src_len = flags.shape[0]
+    if src_len == 0:
+        return flags.copy()
+    src_times = np.arange(src_len, dtype=np.float64) / src_fps
+    dst_len = int(round((src_len - 1) * dst_fps / src_fps)) + 1
+    dst_times = np.arange(dst_len, dtype=np.float64) / dst_fps
+    indices = np.searchsorted(src_times, dst_times, side="right") - 1
+    np.clip(indices, 0, src_len - 1, out=indices)
+    return flags[indices]
+
+
+def resample_qpos(qpos: np.ndarray, src_fps: float, dst_fps: float) -> np.ndarray:
+    if src_fps == dst_fps:
+        return qpos.copy()
+    src_len = qpos.shape[0]
+    if src_len == 0:
+        return qpos.copy()
+    src_times = np.arange(src_len, dtype=np.float64) / src_fps
+    dst_len = int(round((src_len - 1) * dst_fps / src_fps)) + 1
+    dst_times = np.arange(dst_len, dtype=np.float64) / dst_fps
+
+    root_pos = qpos[:, 0:3]
+    root_quat = qpos[:, 3:7]
+    joints = qpos[:, 7:36]
+
+    dst_root_pos = np.empty((dst_len, 3), dtype=np.float32)
+    dst_root_quat = np.empty((dst_len, 4), dtype=np.float32)
+    dst_joints = np.empty((dst_len, 29), dtype=np.float32)
+
+    for d in range(3):
+        dst_root_pos[:, d] = np.interp(dst_times, src_times, root_pos[:, d])
+    for j in range(29):
+        dst_joints[:, j] = np.interp(dst_times, src_times, joints[:, j])
+
+    src_indices = np.searchsorted(src_times, dst_times, side="right")
+    src_indices = np.clip(src_indices, 1, src_len - 1)
+    prev_indices = src_indices - 1
+    alpha = (dst_times - src_times[prev_indices]) / np.maximum(src_times[src_indices] - src_times[prev_indices], 1e-8)
+
+    for i in range(dst_len):
+        dst_root_quat[i] = quat_slerp_wxyz(root_quat[prev_indices[i]], root_quat[src_indices[i]], float(alpha[i]))
+
+    dst_qpos = np.empty((dst_len, 36), dtype=np.float32)
+    dst_qpos[:, 0:3] = dst_root_pos
+    dst_qpos[:, 3:7] = dst_root_quat
+    dst_qpos[:, 7:36] = dst_joints
+    return dst_qpos
+
 
 def infer_foot_contacts_from_sites(
     qpos: np.ndarray,
@@ -249,15 +322,33 @@ def main():
     if qpos.ndim != 2 or qpos.shape[1] != 36:
         raise ValueError(f"Expected qpos shape (T, 36), got {qpos.shape}")
 
-    fps = None
-    if args.fps is not None:
-        fps = float(args.fps)
-    elif "output_fps" in z:
-        fps = float(np.asarray(z["output_fps"]).reshape(-1)[0])
+    # Real-time source fps. The grounded NPZ stores `fps` = the CAPTURE rate
+    # (e.g. 120), but the solved qpos is strided (see source_frame_ids), so the
+    # true real-time rate is capture_fps / stride (e.g. 120/4 = 30 Hz). Using the
+    # raw capture fps mislabels the motion and plays it back stride-times too fast
+    # (and inflates all velocities by the same factor).
+    src_fps = None
+    if "output_fps" in z:
+        src_fps = float(np.asarray(z["output_fps"]).reshape(-1)[0])
     elif "fps" in z:
-        fps = float(np.asarray(z["fps"]).reshape(-1)[0])
+        capture_fps = float(np.asarray(z["fps"]).reshape(-1)[0])
+        stride = 1
+        if "source_frame_ids" in z:
+            sfi = np.asarray(z["source_frame_ids"]).reshape(-1)
+            if sfi.size > 1:
+                stride = max(int(np.round(np.median(np.diff(sfi)))), 1)
+        src_fps = capture_fps / stride
+        if stride != 1:
+            print(f"Real-time src fps = capture {capture_fps:.2f} / stride {stride} = {src_fps:.2f} Hz")
     else:
-        fps = 30.0
+        src_fps = 30.0
+
+    dst_fps = float(args.fps) if args.fps is not None else src_fps
+    resample = abs(dst_fps - src_fps) > 1e-6
+
+    if resample:
+        print(f"Resampling from {src_fps:.2f} Hz to {dst_fps:.2f} Hz")
+        qpos = resample_qpos(qpos, src_fps, dst_fps)
 
     mj_names = load_mujoco_joint_order(args.model)
     if len(mj_names) != 29:
@@ -271,9 +362,9 @@ def main():
     mj_joint_pos = qpos[:, 7:36]
     isaac_joint_pos = mj_joint_pos[:, reorder]
 
-    joint_vel = finite_diff(isaac_joint_pos, fps)
-    root_lin_vel = finite_diff(root_pos, fps)
-    root_ang_vel = quat_to_angvel_wxyz(root_quat_wxyz, fps)
+    joint_vel = finite_diff(isaac_joint_pos, dst_fps)
+    root_lin_vel = finite_diff(root_pos, dst_fps)
+    root_ang_vel = quat_to_angvel_wxyz(root_quat_wxyz, dst_fps)
 
     contact_effector_map = load_contact_effector_flags(z)
     if contact_effector_map is not None:
@@ -283,7 +374,7 @@ def main():
         foot_contacts = infer_foot_contacts_from_sites(
             qpos=qpos,
             model_path=args.model,
-            fps=fps,
+            fps=dst_fps,
             height_threshold_m=args.contact_height_threshold_m,
             speed_threshold_mps=args.contact_speed_threshold_mps,
         )
@@ -296,12 +387,18 @@ def main():
     if contact_effector_map is not None:
         left_foot = contact_effector_map.get("left_foot", left_foot)
         right_foot = contact_effector_map.get("right_foot", right_foot)
+        if resample:
+            left_foot = resample_contacts_bool(left_foot, src_fps, dst_fps).reshape(-1)
+            right_foot = resample_contacts_bool(right_foot, src_fps, dst_fps).reshape(-1)
 
     left_hand = np.full((qpos.shape[0],), bool(args.left_hand_contact), dtype=bool)
     right_hand = np.full((qpos.shape[0],), bool(args.right_hand_contact), dtype=bool)
     if contact_effector_map is not None:
         left_hand = contact_effector_map.get("left_hand", left_hand)
         right_hand = contact_effector_map.get("right_hand", right_hand)
+        if resample:
+            left_hand = resample_contacts_bool(left_hand, src_fps, dst_fps).reshape(-1)
+            right_hand = resample_contacts_bool(right_hand, src_fps, dst_fps).reshape(-1)
 
     if args.solution_quality_random:
         rng = np.random.default_rng(0)
@@ -309,7 +406,7 @@ def main():
     else:
         solution_quality = np.full((qpos.shape[0],), float(args.solution_quality), dtype=np.float32)
 
-    timestamps_ms = np.arange(qpos.shape[0], dtype=np.float64) * (1000.0 / fps)
+    timestamps_ms = np.arange(qpos.shape[0], dtype=np.float64) * (1000.0 / dst_fps)
 
     messages = []
     for i in range(qpos.shape[0]):
@@ -349,7 +446,7 @@ def main():
     args.out.write_text(json.dumps(out))
     print("wrote:", args.out)
     print("frames:", qpos.shape[0])
-    print("fps:", fps)
+    print("fps:", dst_fps)
     print("MuJoCo order:", mj_names)
     print("Isaac order:", ISAAC_JOINT_NAMES_FULLBODY)
     print("reorder:", reorder)
