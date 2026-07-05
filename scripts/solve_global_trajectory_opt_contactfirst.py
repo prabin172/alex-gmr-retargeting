@@ -483,6 +483,31 @@ def stage_b(qpos_warm, target_positions, role_names, role_to_body, target_weight
     jl_lo_abs = np.tile(q_lo, T) - q_warm_act
     jl_hi_abs = np.tile(q_hi, T) - q_warm_act
 
+    # Keep-best-iterate: the SCA outer loop oscillates — an outer that starts
+    # collision-free drops all collision rows and takes an unconstrained
+    # tracking+smoothing step straight back into penetration. Returning the LAST
+    # iterate unconditionally makes the result depend on n_outer parity (odd
+    # happened to land on a resolving step, even on a bad victory-lap step).
+    # Instead track the best iterate and return that — parity-immune, never
+    # worse than the Stage-A warm start (which seeds it).
+    #
+    # Score is slip-AWARE, not penetration-only: stronger contact pins cut plant
+    # slip but hold the effector where it mildly penetrates, so a pure-penetration
+    # argmin would silently trade slip back. Lexicographic:
+    #   1) hard = penetration beyond PEN_TOL cm — a self-collision failure that is
+    #      never traded for slip;
+    #   2) pen + slip — among acceptable-penetration iterates, minimise total drift.
+    PEN_TOL = 1.0  # cm; sub-tol penetration is soft-collision slack noise
+    def _iter_score(q):
+        cs = _collision_stats(model, data, q)
+        ss = _contact_slip_stats(model, data, q, tgt, wgt, planted, resolved)
+        pen = cs["max_pen_cm"]; slip = ss["plant_slip_max_cm"]
+        hard = max(0.0, pen - PEN_TOL)
+        return (hard, pen + slip, cs["pct"], pen, slip)
+    best_qpos = qpos_cur.copy()
+    best_score = _iter_score(best_qpos)
+    print(f"    warm: pen={best_score[3]:.2f}cm slip={best_score[4]:.1f}cm coll={best_score[2]:.1f}%")
+
     for outer in range(n_outer):
         t0 = time.time()
         Ht, gt = _build_tracking(qpos_cur, target_positions, role_names, role_to_body,
@@ -529,11 +554,20 @@ def stage_b(qpos_warm, target_positions, role_names, role_to_body, target_weight
             A, l, u = A_jl, jl_lo, jl_hi
 
         prob = osqp.OSQP()
+        # max_iter scaled up from 8000: at the native 120 Hz solve the QP is ~4x
+        # larger (T up to ~3800) and the x16 smoothness Hessian is stiffer, so
+        # 8000 iters left the harder clips at "solved inaccurate" (step discarded
+        # below -> Stage B no-op). 20000 lets them reach full "solved".
         prob.setup(P_use.tocsc(), q_use, A, l, u, warm_starting=True, verbose=False,
-                   eps_abs=1e-4, eps_rel=1e-4, max_iter=8000, polish=True)
+                   eps_abs=1e-4, eps_rel=1e-4, max_iter=20000, polish=True)
         res = prob.solve()
 
-        if res.info.status not in ("solved", "solved_inaccurate"):
+        # NOTE: OSQP (>=1.x) reports the inaccurate status as "solved inaccurate"
+        # (space), NOT "solved_inaccurate" — accept both. An inaccurate solve is a
+        # within-10x-tolerance improving step (trust-region-bounded); discarding
+        # it silently no-op'd Stage B on the larger 120 Hz problems.
+        pen_info = ""
+        if res.info.status not in ("solved", "solved inaccurate", "solved_inaccurate"):
             print(f"    outer {outer+1}/{n_outer}: OSQP {res.info.status} — keep previous")
         else:
             delta = res.x[:N]
@@ -543,9 +577,17 @@ def stage_b(qpos_warm, target_positions, role_names, role_to_body, target_weight
                 s = res.x[N:N + n_coll_rows]
                 slack_info = (f" slack_max={float(np.abs(s).max()):.4f} "
                               f"slack_active={int((np.abs(s) > 1e-4).sum())}/{n_coll_rows}")
+            score = _iter_score(qpos_cur)
+            keep = score < best_score
+            pen_info = (f" pen={score[3]:.2f}cm slip={score[4]:.1f}cm coll={score[2]:.1f}%"
+                        + (" *best" if keep else ""))
+            if keep:
+                best_score = score
+                best_qpos = qpos_cur.copy()
         print(f"    outer {outer+1}/{n_outer}: coll_rows={n_coll_rows} status={res.info.status} "
-              f"|dQ|max={np.abs(delta).max():.4f} time={time.time()-t0:.1f}s" + slack_info)
-    return qpos_cur
+              f"|dQ|max={np.abs(delta).max():.4f} time={time.time()-t0:.1f}s" + slack_info + pen_info)
+    print(f"    Stage B best: pen={best_score[3]:.2f}cm slip={best_score[4]:.1f}cm coll={best_score[2]:.1f}%")
+    return best_qpos
 
 
 # ---------------------------------------------------------------------------

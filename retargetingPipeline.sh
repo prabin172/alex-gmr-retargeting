@@ -22,17 +22,33 @@
 #   RENDER_MESH / RENDER_DIR / RENDER_EXTRA  render-stage controls (see below).
 set -uo pipefail
 
-STRIDE=4
+STRIDE=1
 IK_ITERS=40
-# Unified GlobalOPT config (same for ALL actions): lambda=20 + Stage-B contact
-# QP. On a hold10 solve this pins shovel plants to ~1.5cm slip and is safe on
-# get-ups (<=2.8cm, 0 spikes) — no per-clip tuning.
-LAMBDA_SMOOTH="${LAMBDA_SMOOTH:-20}"     # GlobalOPT Stage-A smoothing weight
-N_OUTER="${N_OUTER:-3}"                  # Stage-B contact-QP outer iterations (0=off)
+# --- Native 120 Hz solve (2026-07-05) ---
+# Downstream IHMC RL tracker consumes at 50 Hz with ZOH (no interp); solving at
+# 30 Hz (old STRIDE=4) was sub-Nyquist for that gate. STRIDE=1 solves at the
+# native 120 fps capture rate; nothing self-upsamples anymore (export stays
+# native, their json_to_npz --output_fps 50 does the only downsample).
+# Rate-dependent knobs rescaled for dt/4 (see wiki/concepts/pipeline.md):
+#   LAMBDA_SMOOTH / GROUND_SMOOTH first-difference penalties  -> x16 (∝ fps²)
+#   contact min-run / ramp / preroll  (measured in FRAMES)     -> x4
+# All time/physical/dimensionless knobs (speeds, onset-delay-s, contact weights,
+# trust, posture_reg) are rate-invariant and unchanged.
+LAMBDA_SMOOTH="${LAMBDA_SMOOTH:-320}"    # GlobalOPT Stage-A smoothing weight (20 @ 30 Hz × 16)
+N_OUTER="${N_OUTER:-6}"                  # Stage-B contact-QP outer iterations (0=off).
+# Bumped 3->6 for the native 120 Hz solve: the 4x larger QP needs more SCA
+# re-linearisation passes for self-collision to converge (get-up clips regressed
+# to ~33% coll at n=3, back to ~14% ≈ 30 Hz baseline at n=6). See wiki/log.md 2026-07-05.
+# Contact pin weights x4 (defaults 40/8) for the 120 Hz solve: LAMBDA_SMOOTH went
+# x16 but the position-space pins did not, so plants slid. x4 cut standup_side_04
+# plant-slip 10.4->6.3cm for <1cm added collision. plant-speed had no effect (slow
+# steady drift stays sub-threshold); weight is the lever. See wiki/log.md.
+FOOT_WEIGHT="${FOOT_WEIGHT:-160}"        # soft pin on a PLANTED foot (40 default x4)
+HAND_WEIGHT="${HAND_WEIGHT:-32}"         # soft pin on a PLANTED palm  (8 default x4)
 RENDER_EXTRA="${RENDER_EXTRA:-}"          # extra render flags, e.g. "--fixed-cam"
 # --- Z-grounding (Stage 4.5) ---
 GROUND_MODE="${GROUND_MODE:-perframe}"    # perframe (plant every frame) | constant (single per-clip shift)
-GROUND_SMOOTH="${GROUND_SMOOTH:-5}"       # perframe: tridiagonal smoothing on the shift series
+GROUND_SMOOTH="${GROUND_SMOOTH:-80}"      # perframe: tridiagonal smoothing on the shift series (5 @ 30 Hz × 16)
 # --- Render mesh (Stage 5) ---
 # visual    = full-body Alex visual mesh (legs+arms+torso), hands as closed fists
 # collision = fullmesh collision convex hulls (what the solver actually uses)
@@ -48,7 +64,12 @@ CF=outputs/contactfirst
 GO="${GO_DIR:-outputs/global_opt_contactfirst}"
 GR="${GR_DIR:-outputs/grounded_contactfirst}"
 RD="${RENDER_DIR:-outputs/renders/contactfirst}"
-mkdir -p "$CF" "$GO" "$GR" "$RD"
+# Stage 6 — IHMC JSON export. Fresh dir: the old outputs/ihmcJsons{,-120hz} were
+# upsampled-from-30 and are superseded by this native-120 solve. At STRIDE=1 the
+# grounded NPZ is native 120 Hz, so we export with NO --fps (identity); their
+# json_to_npz --output_fps 50 does the only downsample. See wiki/concepts/ihmc-export.md.
+IH="${IHMC_DIR:-outputs/ihmcJsons-native120hz}"
+mkdir -p "$CF" "$GO" "$GR" "$RD" "$IH"
 echo "Render mesh: $RENDER_MESH -> $RMODEL   |  ground: $GROUND_MODE (smooth=$GROUND_SMOOTH)"
 
 # clip name  ->  canonical *_with_orient.npz input (one per clip; variants deduped)
@@ -96,6 +117,7 @@ for entry in "${CLIPS[@]}"; do
     python scripts/solve_fbx_canonical_alex_contactfirst.py \
       --canonical "$src" --out "$cf" \
       --stride "$STRIDE" --max-frames 99999 --ik-iters "$IK_ITERS" \
+      --contact-min-run 12 --contact-ramp 16 --contact-preroll 8 \
       --log-every 200 $solve_extra \
       || { echo "  [FAIL] contact-first"; fail=$((fail+1)); continue; }
   fi
@@ -105,6 +127,7 @@ for entry in "${CLIPS[@]}"; do
   echo "  [smooth] GlobalOPT ${go_extra:+(clip-extra: $go_extra) }..."
   python scripts/solve_global_trajectory_opt_contactfirst.py \
     --ik-npz "$cf" --out "$go" --lambda-smooth "$LAMBDA_SMOOTH" --n-outer "$N_OUTER" \
+    --foot-weight "$FOOT_WEIGHT" --hand-weight "$HAND_WEIGHT" \
     --collision-penalty 1000 $go_extra \
     || { echo "  [FAIL] globalopt"; fail=$((fail+1)); continue; }
 
@@ -130,7 +153,14 @@ PY
     --ground --ground-z 0 $RENDER_EXTRA \
     || { echo "  [FAIL] render"; fail=$((fail+1)); continue; }
 
-  echo "  [OK] $mp4"; ok=$((ok+1))
+  # Stage 6 — IHMC JSON export from the grounded NPZ (native 120 Hz, no --fps)
+  js="$IH/${name}.json"
+  echo "  [export] IHMC json -> $js ..."
+  python scripts/export_alex_retarget_npz_to_ihmc_json.py \
+    "$gr" --out "$js" \
+    || { echo "  [FAIL] ihmc-export"; fail=$((fail+1)); continue; }
+
+  echo "  [OK] $mp4 + $js"; ok=$((ok+1))
 done
 
 echo "======================================================================"
