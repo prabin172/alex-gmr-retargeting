@@ -483,12 +483,11 @@ fighting genuine repositioning.
 > dominant slip is a slow steady drift that stays under any sane speed threshold, so lowering
 > it just reclassifies frames without moving the worst-frame slip; pin *weight* is the lever.
 
-> **Soft-weight correction.** The file docstring says feet are pinned by *hard equality*.
-> This is **stale** — the code path is `add_soft` everywhere (`_build_contact`), so feet
-> are a high-weight soft cost (weight 40), not an equality. The only hard constraints in
-> Stage B are the joint-limit box, the trust region, and the self-collision inequality
-> rows. Residual plant slip (≈1.0–1.5 cm on shovels) is a high-weight equilibrium, not
-> zero by construction. Trust the code.
+> **Contacts are soft, not equalities.** Every contact term is `add_soft` (`_build_contact`),
+> so a planted foot is a high-weight soft cost (weight 160), not an equality. The only hard
+> constraints in Stage B are the joint-limit box, the trust region, and the self-collision
+> inequality rows. Residual plant slip is therefore a high-weight equilibrium, not zero by
+> construction (shovels ≈1.0–1.5 cm; get-ups higher — see §9).
 
 **Constraints.**
 - *Joint-limit box*: `q_lo − q_warm ≤ δQ ≤ q_hi − q_warm` (identity rows).
