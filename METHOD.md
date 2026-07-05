@@ -1,8 +1,15 @@
 # Contact-First Human-to-Humanoid Motion Retargeting — Complete Method
 
 *Single self-contained technical reference for the `alex-gmr-retargeting` pipeline.
-Ground truth is the code on branch `FullURDF`; where an older note or the white
+Ground truth is the code on branch `main`; where an older note or the white
 paper disagreed, this document follows the code and flags the correction.*
+
+*The pipeline solves natively at **120 Hz** (the capture rate) and the active
+collision model is the single canonical fullmesh XML
+`assets/alex/alex_floating_base_with_sites.xml` with **always-on** soft
+self-collision — there is no longer a `_v2` / `_v2_fullmesh` split or a
+`--soft-collision` flag. §6.4 gives the rate-scaling recipe; §6.2 the Stage-B
+QP as it actually runs.*
 
 ---
 
@@ -45,11 +52,12 @@ plant it on the floor.
 | 4 | Global trajectory opt | `q(t)` → smoothed `q(t)` | global temporal regularisation | `solve_global_trajectory_opt_contactfirst.py` |
 | 4.5 | Z-grounding | `q(t)` → grounded `q(t)` | vertical rigid shift to floor | `post_process_ground_contactfirst.py` |
 | 5 | Render | grounded `q(t)` → MP4 + contact strip | visualisation | `visualization/render_contactfirst.py` |
+| 6 | IHMC JSON export | grounded `q(t)` → IHMC replay JSON | format conversion (native 120 Hz, no resample) | `export_alex_retarget_npz_to_ihmc_json.py` |
 
 Intermediate representations are NumPy `.npz` at every stage boundary, so the pipeline
-is inspectable and resumable. The whole per-clip run is driven by `run_globalopt_all.sh`
-with **one identical config for every action** (Prabin's rule: a single retargeter, no
-per-clip tuning).
+is inspectable and resumable. The whole per-clip run (stages 3–6) is driven by
+`retargetingPipeline.sh` with **one identical config for every action** (Prabin's rule: a
+single retargeter, no per-clip tuning). Stages 1–2 run per new FBX by hand in Blender.
 
 ```
 FBX/MVNX ─▶ [1] canonical positions ─▶ [2] semantic orientation frames + facing yaw
@@ -421,8 +429,10 @@ endpoints `λ_track + λ_smooth`, off-diagonals `−λ_smooth`. Solved directly 
 solver `scipy.linalg.solve_banded` in `O(T)` per channel (`_banded_smoother` /
 `_smooth_channel`). All 29 actuated channels are smoothed then clipped to joint limits.
 Stage A cannot change a channel's mean, only redistribute a spike over neighbours.
-Default `λ_smooth = 20`, `λ_track = 1.0` (the unified pipeline; the script default is
-`λ_smooth = 10`).
+`λ_track = 1.0`; `λ_smooth = 320` at the shipped native 120 Hz rate (the script default is
+`λ_smooth = 10`; the pipeline passes `--lambda-smooth 320`). The first-difference penalty
+is a *velocity* term, so it scales with `fps²` — `λ_smooth = 20` at 30 Hz became `320 =
+20·16` at 120 Hz. §6.4 gives the full rate-scaling table and the derivation.
 
 **The floating base is smoothed too** (else the whole body flicks — per-frame IK root has
 ~3 cm / 10° pops): root position `qpos[0:3]` uses the same tridiagonal solve; the root
@@ -458,10 +468,20 @@ $$\min_{\delta Q}\ \tfrac12\,\delta Q^{\!\top}P\,\delta Q+q^{\!\top}\delta Q
 plants (a foot/hand can reposition ~30 cm while staying labelled in-contact). So within
 each contiguous interval we split into **stationary sub-segments** (per-frame IK
 contact-point speed `< plant_speed = 0.05 m/s`) and anchor each sub-segment to its own
-**median** contact-point position (high weight `foot_weight = 40`, `hand_weight = 8`,
+**median** contact-point position (high weight `foot_weight = 160`, `hand_weight = 32`,
 `planted = True`). Non-stationary contact frames follow the per-frame IK point at a low
 weight (`× move_ratio = 0.15`) — just enough to stop smoothing from *adding* drift without
 fighting genuine repositioning.
+
+> **Pin weights ×4 for the 120 Hz solve.** The CLI defaults are `foot_weight = 40`,
+> `hand_weight = 8` (the 30 Hz values); the pipeline passes `--foot-weight 160 --hand-weight
+> 32`. These are *position* terms, so unlike `λ_smooth` they are dt-invariant and did **not**
+> need rescaling for correctness — but because `λ_smooth` went ×16 at 120 Hz while the pins
+> stayed, the pins were left 16× weaker *relative to smoothing*, and plants slid. Restoring
+> ×4 rebalances them: on `standup_side_04` this cut plant slip 10.4 → 6.3 cm for < 1 cm of
+> (shallow, sub-tol) added self-collision. `plant_speed` is **not** a useful lever here — the
+> dominant slip is a slow steady drift that stays under any sane speed threshold, so lowering
+> it just reclassifies frames without moving the worst-frame slip; pin *weight* is the lever.
 
 > **Soft-weight correction.** The file docstring says feet are pinned by *hard equality*.
 > This is **stale** — the code path is `add_soft` everywhere (`_build_contact`), so feet
@@ -480,17 +500,46 @@ fighting genuine repositioning.
 
 **Sequential Convex Approximation (SCA).** Collision (and contact/tracking) rows are only
 linear at the current point, so an outer loop re-linearises → assembles → solves with
-OSQP (`eps_abs = eps_rel = 1e-4`, `max_iter = 8000`, `polish=True`, warm-started across
-iters) → applies `δQ` with joint clamps → repeats `n_outer` times (unified default 3;
-the *script* default is `--n-outer 0` = Stage A only).
+OSQP (`eps_abs = eps_rel = 1e-4`, `max_iter = 20000`, `polish=True`, warm-started across
+iters) → applies `δQ` with joint clamps → repeats `n_outer` times (`--n-outer 6` at 120 Hz;
+the *script* default is `--n-outer 0` = Stage A only). The OSQP accept-check treats both
+`"solved"` and `"solved inaccurate"` (note the **space** — OSQP ≥1.x; a stale check for the
+underscored `"solved_inaccurate"` silently discarded every inaccurate step, no-op'ing Stage B
+on the larger 120 Hz QP). `max_iter` was raised 8000 → 20000 so the 4×-larger 120 Hz problems
+reach full `"solved"`.
 
-**Soft-slack self-collision (the key robustness fix on fullmesh).** The dense convex-hull
-legs of the real V2 body make the **hard** collision inequalities primal-infeasible (row
-count explodes, e.g. 424 vs ~80–194, with genuinely-close legs in get-ups/kneels), so the
-hard QP silently no-ops (`|δQ|max = 0`). `--soft-collision` reformulates each collision
-row with a non-negative slack `s ≥ 0` and a quadratic penalty, so the QP is **always
-feasible** and degrades gracefully. Augment the decision vector with one slack per
-collision row:
+**Keep-best-iterate with a slip-aware score (the SCA convergence fix).** The SCA loop does
+**not** monotonically decrease penetration. Collision rows are linearised only at the *start*
+of each outer, so an outer that happens to begin collision-free carries **zero** collision
+rows and takes an unconstrained tracking+smoothing step that walks straight back into
+penetration. On the get-up clips the per-outer penetration therefore *oscillates*
+(clean → ~6 cm → clean → …). Returning the **last** iterate unconditionally — as the original
+loop did — makes the shipped result depend on `n_outer` **parity**: an odd count happened to
+stop on a collision-resolving step, an even count on a bad victory-lap step. (The apparent
+"30 Hz was fine, 120 Hz regressed" was this: 30 Hz used `n_outer = 3` (odd, lucky), 120 Hz used
+`n_outer = 6` (even, unlucky) — not a rate effect at all.)
+
+The fix: **keep the best iterate across outers and return it**, seeded with the Stage-A warm
+start so Stage B is never worse than its own input. "Best" is a slip-aware lexicographic score
+computed on the full trajectory after each accepted outer:
+
+$$\text{score}(q)=\Big(\underbrace{\max(0,\ \text{pen}_{\max}-\tau)}_{\text{hard: real penetration}},\ \ \underbrace{\text{pen}_{\max}+\text{slip}_{\max}}_{\text{tie-break: total drift}},\ \ \text{coll\%}\Big),\qquad \tau=1\ \text{cm},$$
+
+compared lexicographically (smaller wins). The first term makes any penetration beyond
+`τ = 1 cm` a *hard* failure that is never traded away for slip; among iterates that are all
+under `τ`, the second term picks the one with the least combined penetration + plant slip.
+Without the slip term a pure-penetration argmin would silently ship a collision-clean iterate
+that had pushed a foot off its plant (the pins-×4 change makes that trade real). This makes
+Stage B parity-immune and monotone-non-worsening in the score, and the two changes compose:
+`stage_b` returns `best_qpos`, not the last `qpos_cur`.
+
+**Soft-slack self-collision (always on).** The dense convex-hull legs of the fullmesh body
+make **hard** collision inequalities primal-infeasible (row count explodes, e.g. 424 vs
+~80–194, with genuinely-close legs in get-ups/kneels), so a hard QP silently no-ops
+(`|δQ|max = 0`). Stage B therefore reformulates each collision row with a non-negative slack
+`s ≥ 0` and a quadratic penalty, so the QP is **always feasible** and degrades gracefully —
+this is the only code path now (the old hard variant and its `--soft-collision` toggle are
+gone). Augment the decision vector with one slack per collision row:
 
 $$P=\begin{bmatrix}2(H_{\text{task}}+H_{\text{smooth}}) & 0\\[2pt] 0 & 2\rho I_m\end{bmatrix},\quad
 \text{collision rows: } \sqrt{\lambda_{\text{coll}}}\,j_{\text{sep}}\!\cdot\delta q + s_i \ \ge\ \sqrt{\lambda_{\text{coll}}}\,\min(\text{pen},0.05),\quad
@@ -498,9 +547,8 @@ $$P=\begin{bmatrix}2(H_{\text{task}}+H_{\text{smooth}}) & 0\\[2pt] 0 & 2\rho I_m
 
 with penalty `ρ = collision_penalty = 1000`. Genuinely-close legs relax through the
 (penalised) slack instead of driving OSQP infeasible. With no collision rows in an
-iteration it falls back to the plain joint-limit QP. On FullURDF this is **always on**
-(`--soft-collision --collision-penalty 1000`); the default hard path is byte-identical to
-the earlier shipped primitive result.
+iteration it falls back to the plain joint-limit QP. The pipeline runs this unconditionally
+(`--collision-penalty 1000`).
 
 ### 6.3 Why Stage B is worth it now (history)
 
@@ -510,10 +558,42 @@ pulling back toward collision-heavy per-frame targets regressed collisions. The 
 hysteresis + foot-hold(×10) of Stage 3 now yield near-stationary plants (0.1–0.3 cm/plant),
 so with the median/stationary-sub-segment anchoring + all-soft weights + trust region,
 Stage B is well-posed and **enabled everywhere** in the unified pipeline. Stage A alone
-re-adds ≈8 cm plant drift.
+re-adds ≈8 cm plant drift. The last robustness gap — the SCA loop shipping a
+parity-dependent, sometimes-colliding last iterate — was closed by the keep-best-iterate
+selection above (§6.2).
 
-Output saves `qpos` (best = Stage B if run, else Stage A), plus `qpos_per_frame`,
-`qpos_stage_a`, `qpos_stage_b`, and carries the contact arrays through for the renderer.
+Output saves `qpos` (= the Stage-B best iterate if run, else Stage A), plus
+`qpos_per_frame`, `qpos_stage_a`, `qpos_stage_b` (`qpos_stage_b` is the *returned* best
+iterate, not the last outer), and carries the contact arrays through for the renderer.
+
+### 6.4 Native 120 Hz solve and rate scaling
+
+The pipeline solves at the **native 120 Hz capture rate** (`STRIDE = 1`). The motivation is
+downstream: the IHMC RL tracker consumes reference motion at **50 Hz with zero-order hold
+(no interpolation)**, so the earlier 30 Hz solve was sub-Nyquist for that gate and
+self-upsampling 30 → 120 at export never restored the aliased content. Solving at 120 Hz and
+letting the consumer's `json_to_npz --output_fps 50` do the *only* downsample removes the
+aliasing. Export (§ stage 6) is run with **no `--fps`** so it stays native 120 Hz.
+
+Only the **first-difference (velocity) penalties scale with rate**, as `fps²`. Everything
+else in the objective is a position or per-frame term and is **dt-invariant**. Concretely,
+going 30 → 120 Hz (dt/4):
+
+| knob | 30 Hz | 120 Hz | scaling rule |
+|------|-------|--------|--------------|
+| `λ_smooth` (Stage A + Stage-B `H_smooth`) | 20 | **320** | velocity penalty ∝ `fps²` → ×16 |
+| `GROUND_SMOOTH` (Stage 4.5 shift smoother) | 5 | **80** | same first-diff smoother → ×16 |
+| `contact_min_run / ramp / preroll` | 3 / 4 / 2 | **12 / 16 / 8** | measured in *frames* → ×4 |
+| `n_outer` (Stage-B SCA passes) | 3 | **6** | 4× larger QP needs more re-linearisation passes |
+| `foot_weight / hand_weight` (plant pins) | 40 / 8 | **160 / 32** | dt-invariant, but ×4 to rebalance vs the ×16 smoothing (§6.2) |
+
+Derivation: dividing the continuous objective by `dt`, position terms (track `w=1`, contact
+pins, collision `ρ`, trust, posture_reg) carry no `dt`, while the squared first difference
+carries `1/dt²`. So `λ_smooth` and `GROUND_SMOOTH` take the ×16; frame-count debounce knobs
+take ×4 (they count frames); speeds (m/s) and onset delays (s) already auto-scale through
+`×fps` in code and need no change. The pin ×4 is a *relative* rebalance, not a correctness
+requirement (§6.2). This was validated empirically: Stage A reproduces the 30 Hz smoothing,
+and standup slip / collision are insensitive to `λ` and `ρ` sweeps at fixed rate.
 
 ---
 
@@ -553,20 +633,32 @@ Only floor/worldbody geoms (`bodyid = 0`) and non-colliding geoms are excluded. 
 grippers — using the same exact per-shape `z_min` within a 2 cm threshold. That is the
 BeyondMimic export format.)*
 
+### 7.1 Stage 6 — IHMC JSON export
+
+`export_alex_retarget_npz_to_ihmc_json.py` converts a grounded NPZ into the IHMC
+`KinematicsToolboxOutputStatus` replay JSON (root pose + 29 joints per frame, MuJoCo joint
+order remapped to the Isaac full-body order). The one subtlety is the **real-time frame
+rate**: the NPZ stores `fps` = the capture rate (120), but the solved qpos is strided, so the
+true rate is `capture_fps / stride`, derived from the median stride of `source_frame_ids`. At
+the shipped `STRIDE = 1` that is `120 / 1 = 120` Hz, so with **no `--fps`** the export writes
+native 120 Hz with no resample (`--fps X` would resample to `X`). The downstream
+`json_to_npz --output_fps 50` performs the only downsample (§6.4). The pipeline writes
+`outputs/ihmcJsons-native120hz/<clip>.json`.
+
 ---
 
 ## 8. Model note: single mesh-collision body and the shank clamp
 
-The active solver/GlobalOPT/grounding model is
-`assets/alex/alex_floating_base_with_sites_v2.xml`: arms/head/fist already use convex-hull
-mesh collision, plus named palm/sole sites for end-effector targeting. On branch
-`FullURDF` the real V2 URDF arrived with **leg collision as convex-hull STL meshes** too
-(`alex_floating_base_with_sites_v2_fullmesh.xml`, the 8 leg primitives swapped to
-`type="mesh"`, zero offset). Kinematics are **unchanged** (joints, axes, limits, link
-frames identical; only a fixed ZED camera mount removed and torso collision origin nudged
-−0.018 z), so Stage 3 IK output is identical and is **not re-solved** — only Stage 4
-onward run on the fullmesh model, with `--soft-collision` (§6.2). The decision: fullmesh
-is the real body; the primitives were a stopgap.
+The active solver / GlobalOPT / grounding / export model is the single canonical, hand-
+maintained XML **`assets/alex/alex_floating_base_with_sites.xml`**: full convex-hull STL
+mesh collision on legs *and* arms/head/fist, plus named palm/sole sites for end-effector
+targeting. (Historically there were a primitive `_v2` model and a separate `_v2_fullmesh`
+variant on the `FullURDF` branch; those were consolidated into this one fullmesh model, and
+soft-slack self-collision (§6.2) was made unconditional. The model-prep scripts
+`create_alex_mujoco_sites_model.py` / `build_alex_v2_collision_model.py` / `prepare_*` are
+historical and would **overwrite** the hand-maintained XML — never run them blindly.)
+Kinematics match the real V2 URDF exactly (joints, axes, limits, link frames), so Stage 3
+IK is model-independent to within collision geometry.
 
 The **shank clamp exists because Alex's ankle range is much tighter and asymmetric versus
 a human's** (dorsiflexion 60° vs ~20°, plantarflexion 30° vs ~50°, roll ±25°, no ankle
@@ -583,21 +675,28 @@ impossible for Alex to reproduce flat-footed; §5.5 makes the knee target feasib
   expected to absorb the dynamics gap. The pipeline's job is to hand RL a trajectory with
   *no kinematic impossibilities* (no self-penetration, no over-limit joints, exact
   contacts), which RL cannot fix on its own.
-- **Fullmesh + soft-collision buys zero self-penetration at ~1 cm more slip.** Measured:
-  self-penetration on a hard get-up went 32.6% → 0% of frames (peak 5.2 → 0 cm), at the
-  cost of get-up/kneel plant slip rising 2.8–3.4 cm → 4.2 cm. Chosen deliberately —
-  penetration is physically impossible and poisons physics-RL; a centimetre of slip is
-  learnable.
+- **Keep-best-iterate caps penetration; pins ×4 trade shallow grazing for less slip.**
+  With the slip-aware keep-best (§6.2, `τ = 1 cm`), the shipped Stage-B **peak penetration
+  is ≤ 0.88 cm on all 18 clips** — no real self-penetration anywhere. The pins-×4 rebalance
+  reduces plant slip on get-ups (e.g. `standup_side_04` 10.4 → 6.3 cm) at the cost of some
+  *shallow, sub-1 cm* grazing frames (`coll%` rises to 4–38% on get-up clips, but every one
+  of those contacts is < 1 cm deep). This is the deliberate trade: a sub-centimetre graze is
+  within the robot's collision margin and learnable; deep penetration is physically
+  impossible and poisons physics-RL, so the `τ` gate never trades it away.
 - **Residual get-up "flat-snap".** On some get-ups the foot still snaps toward flat near
   touchdown; this is partly faithful (the human foot does flatten) and partly the hard
   boundary of the flatness gate. Crouch-phase foot-flat angles of ~9–13° are genuine
   human tilt, not error.
 - **Contacts are high-weight soft, not exact.** Plant slip is ≈1.0–1.5 cm on shovels,
   higher on dynamic get-ups; the median-anchor Stage B reduces but does not zero it.
-- **Measured (representative, unified batch).** Shovels: plant slip 1.0–1.5 cm, foot-flat
-  0.1–0.2°, collisions 0, velocity spikes 0. Standups: plant slip 2.7–3.7 cm, spikes 0.
-  Contact foot-flat error 12.7° → 7.7° mean after the pipeline; straight-knee lock
-  26.5% → 0%.
+- **Measured (native-120 finalized 18-clip batch, Stage B).** Velocity spikes 0 and peak
+  self-penetration ≤ 0.88 cm on **every** clip. Shovels: plant slip 2.0–3.3 cm, foot-flat
+  ~0.1°, 0% collision. Squat / kneeling-fall: 0% collision, slip 4.0 / 7.1 / 10.7 cm.
+  Standups & get-ups: slip 3.0–9.8 cm with shallow (< 1 cm) grazing 4–28%. Two known
+  outliers: **`standup_side_05`** (14.7 cm slip, 38% shallow grazing) and
+  **`kneelingFall_03`** (10.7 cm slip, 0% collision) — both the structural floor of the
+  single-median plant anchor on a genuinely-repositioning contact, not a solver regression;
+  the fix is finer contact labelling (split-anchor / generalized contacts), not a knob.
 
 ---
 
