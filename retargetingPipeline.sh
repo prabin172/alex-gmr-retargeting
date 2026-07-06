@@ -45,6 +45,11 @@ N_OUTER="${N_OUTER:-6}"                  # Stage-B contact-QP outer iterations (
 # steady drift stays sub-threshold); weight is the lever. See wiki/log.md.
 FOOT_WEIGHT="${FOOT_WEIGHT:-160}"        # soft pin on a PLANTED foot (40 default x4)
 HAND_WEIGHT="${HAND_WEIGHT:-32}"         # soft pin on a PLANTED palm  (8 default x4)
+# Min length (frames) of a stillness sub-segment before it counts as a plant;
+# shorter speed dips are reclassified moving. Debounces phantom 1-frame plants on
+# lifting-off hands (standup_side_05 right_hand 14.7->6.8cm). Frame-count knob -> x4
+# for 120 Hz (2 @ 30 Hz).
+PLANT_MIN_RUN="${PLANT_MIN_RUN:-8}"
 RENDER_EXTRA="${RENDER_EXTRA:-}"          # extra render flags, e.g. "--fixed-cam"
 # --- Z-grounding (Stage 4.5) ---
 GROUND_MODE="${GROUND_MODE:-perframe}"    # perframe (plant every frame) | constant (single per-clip shift)
@@ -67,9 +72,14 @@ RD="${RENDER_DIR:-outputs/renders/contactfirst}"
 # Stage 6 — IHMC JSON export. Fresh dir: the old outputs/ihmcJsons{,-120hz} were
 # upsampled-from-30 and are superseded by this native-120 solve. At STRIDE=1 the
 # grounded NPZ is native 120 Hz, so we export with NO --fps (identity); their
-# json_to_npz --output_fps 50 does the only downsample. See wiki/concepts/ihmc-export.md.
+# json_to_npz --output_fps 50 does the only downsample. We ALSO emit a 50 Hz set
+# (--fps 50) matching the IHMC reference 1.json rate; set EXPORT_50HZ=0 to skip it.
+# See wiki/concepts/ihmc-export.md.
 IH="${IHMC_DIR:-outputs/ihmcJsons-native120hz}"
+EXPORT_50HZ="${EXPORT_50HZ:-1}"           # also emit a 50 Hz set (IHMC 1.json rate)
+IH50="${IHMC_DIR_50:-outputs/ihmcJsons50hz}"
 mkdir -p "$CF" "$GO" "$GR" "$RD" "$IH"
+[ "$EXPORT_50HZ" = "1" ] && mkdir -p "$IH50"
 echo "Render mesh: $RENDER_MESH -> $RMODEL   |  ground: $GROUND_MODE (smooth=$GROUND_SMOOTH)"
 
 # clip name  ->  canonical *_with_orient.npz input (one per clip; variants deduped)
@@ -128,6 +138,7 @@ for entry in "${CLIPS[@]}"; do
   python scripts/solve_global_trajectory_opt_contactfirst.py \
     --ik-npz "$cf" --out "$go" --lambda-smooth "$LAMBDA_SMOOTH" --n-outer "$N_OUTER" \
     --foot-weight "$FOOT_WEIGHT" --hand-weight "$HAND_WEIGHT" \
+    --plant-min-run "$PLANT_MIN_RUN" \
     --collision-penalty 1000 $go_extra \
     || { echo "  [FAIL] globalopt"; fail=$((fail+1)); continue; }
 
@@ -160,7 +171,18 @@ PY
     "$gr" --out "$js" \
     || { echo "  [FAIL] ihmc-export"; fail=$((fail+1)); continue; }
 
-  echo "  [OK] $mp4 + $js"; ok=$((ok+1))
+  # Stage 6b — 50 Hz set (--fps 50), matching the IHMC reference 1.json rate
+  js50_note=""
+  if [ "$EXPORT_50HZ" = "1" ]; then
+    js50="$IH50/${name}.json"
+    echo "  [export] IHMC json 50Hz -> $js50 ..."
+    python scripts/export_alex_retarget_npz_to_ihmc_json.py \
+      "$gr" --out "$js50" --fps 50 \
+      || { echo "  [FAIL] ihmc-export-50hz"; fail=$((fail+1)); continue; }
+    js50_note=" + $js50"
+  fi
+
+  echo "  [OK] $mp4 + $js$js50_note"; ok=$((ok+1))
 done
 
 echo "======================================================================"

@@ -203,7 +203,7 @@ def _contact_point(data, info):
 
 
 def _compute_anchors(model, data, qpos_ik, eff_names, flags, resolved, fps,
-                     plant_speed, foot_w, hand_w, move_ratio):
+                     plant_speed, foot_w, hand_w, move_ratio, plant_min_run=8):
     """Per effector, per frame: contact target (T,3), weight (T,), planted flag (T,).
 
     Contact intervals are NOT stationary plants (a foot/hand can reposition ~30 cm
@@ -211,7 +211,15 @@ def _compute_anchors(model, data, qpos_ik, eff_names, flags, resolved, fps,
     *stationary sub-segments* (IK contact-point speed < plant_speed) and anchor
     each to its own median (high weight, planted=True). Non-stationary contact
     frames follow the per-frame IK contact point at a low weight (just enough to
-    stop smoothing from adding drift). NaN target / 0 weight = not in contact."""
+    stop smoothing from adding drift). NaN target / 0 weight = not in contact.
+
+    A stillness sub-segment shorter than `plant_min_run` frames is NOT treated as a
+    plant — it is reclassified as moving (low weight, follows IK). This debounces
+    momentary speed dips (e.g. a velocity zero-crossing while a hand swings/lifts
+    off during a get-up): a 1-frame 'plant' anchored to that instant otherwise sits
+    metres of smoothed motion away, inflating the plant-slip metric with a phantom
+    (standup_side_05 right_hand: 14.7 cm from 25 single-frame blips → 2.2 cm real).
+    Mirrors the Stage-3 contact_min_run debounce, but for the stillness split."""
     T = qpos_ik.shape[0]
     pts = {eff: np.full((T, 3), np.nan) for eff in resolved}
     for t in range(T):
@@ -236,14 +244,18 @@ def _compute_anchors(model, data, qpos_ik, eff_names, flags, resolved, fps,
             still = speed[s:e + 1] < plant_speed          # (L,) within interval
             k = s
             while k <= e:
-                if still[k - s]:                          # start of a planted run
+                if still[k - s]:                          # start of a stillness run
                     j = k
                     while j <= e and still[j - s]:
                         j += 1
-                    med = np.median(p[k:j], axis=0)
-                    tgt[eff][k:j] = med
-                    wgt[eff][k:j] = w_plant
-                    planted[eff][k:j] = True
+                    if j - k >= plant_min_run:            # long enough → real plant
+                        med = np.median(p[k:j], axis=0)
+                        tgt[eff][k:j] = med
+                        wgt[eff][k:j] = w_plant
+                        planted[eff][k:j] = True
+                    else:                                 # too short → treat as moving
+                        tgt[eff][k:j] = p[k:j]
+                        wgt[eff][k:j] = w_move
                     k = j
                 else:                                     # repositioning frame
                     tgt[eff][k] = p[k]
@@ -626,6 +638,11 @@ def main():
     ap.add_argument("--plant-speed", type=float, default=0.05,
                     help="IK contact-point speed (m/s) below which a contact frame is "
                          "treated as a stationary plant.")
+    ap.add_argument("--plant-min-run", type=int, default=8,
+                    help="Minimum length (frames) of a stillness sub-segment before it "
+                         "counts as a plant; shorter dips are reclassified as moving. "
+                         "Debounces momentary speed zero-crossings that otherwise create "
+                         "phantom 1-frame plants (frame-count knob → scale with fps).")
     ap.add_argument("--foot-flat-weight", type=float, default=3.0,
                     help="Soft weight for foot-flat (up-axis→+Z) on planted foot frames.")
     ap.add_argument("--fist-weight", type=float, default=0.8,
@@ -677,7 +694,8 @@ def main():
     resolved = _resolve_contact_geom(model, eff_names, contact_sites)
     tgt, wgt, planted = _compute_anchors(
         model, data, qpos_ik, eff_names, flags, resolved, fps,
-        args.plant_speed, args.foot_weight, args.hand_weight, args.move_ratio)
+        args.plant_speed, args.foot_weight, args.hand_weight, args.move_ratio,
+        args.plant_min_run)
     for eff in resolved:
         n = int((~np.isnan(tgt[eff][:, 0])).sum())
         npl = int(planted[eff].sum())

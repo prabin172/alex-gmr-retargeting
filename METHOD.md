@@ -473,6 +473,15 @@ contact-point speed `< plant_speed = 0.05 m/s`) and anchor each sub-segment to i
 weight (`× move_ratio = 0.15`) — just enough to stop smoothing from *adding* drift without
 fighting genuine repositioning.
 
+A stillness sub-segment must run **at least `plant_min_run = 8` frames** (a frame-count knob,
+≈2 at 30 Hz) to count as a plant; shorter dips are demoted to the low-weight moving path. This
+debounces momentary velocity **zero-crossings** — e.g. a hand reversing as it lifts off during a
+get-up dips below `plant_speed` for a single frame, which would otherwise become a 1-frame plant
+anchored to that instant while the smoothed trajectory carries the hand away, inflating the
+plant-slip metric with a phantom (measured on `standup_side_05`: the right hand's 14.7 cm "slip"
+was 25 single-frame plants; with the debounce the real-plant slip is 6.8 cm). It mirrors the
+Stage-3 `contact_min_run` contact debounce, applied to the stillness split.
+
 > **Pin weights ×4 for the 120 Hz solve.** The CLI defaults are `foot_weight = 40`,
 > `hand_weight = 8` (the 30 Hz values); the pipeline passes `--foot-weight 160 --hand-weight
 > 32`. These are *position* terms, so unlike `λ_smooth` they are dt-invariant and did **not**
@@ -583,6 +592,7 @@ going 30 → 120 Hz (dt/4):
 | `λ_smooth` (Stage A + Stage-B `H_smooth`) | 20 | **320** | velocity penalty ∝ `fps²` → ×16 |
 | `GROUND_SMOOTH` (Stage 4.5 shift smoother) | 5 | **80** | same first-diff smoother → ×16 |
 | `contact_min_run / ramp / preroll` | 3 / 4 / 2 | **12 / 16 / 8** | measured in *frames* → ×4 |
+| `plant_min_run` (stillness debounce, §6.2) | 2 | **8** | measured in *frames* → ×4 |
 | `n_outer` (Stage-B SCA passes) | 3 | **6** | 4× larger QP needs more re-linearisation passes |
 | `foot_weight / hand_weight` (plant pins) | 40 / 8 | **160 / 32** | dt-invariant, but ×4 to rebalance vs the ×16 smoothing (§6.2) |
 
@@ -688,14 +698,18 @@ impossible for Alex to reproduce flat-footed; §5.5 makes the knee target feasib
   human tilt, not error.
 - **Contacts are high-weight soft, not exact.** Plant slip is ≈1.0–1.5 cm on shovels,
   higher on dynamic get-ups; the median-anchor Stage B reduces but does not zero it.
-- **Measured (native-120 finalized 18-clip batch, Stage B).** Velocity spikes 0 and peak
-  self-penetration ≤ 0.88 cm on **every** clip. Shovels: plant slip 2.0–3.3 cm, foot-flat
-  ~0.1°, 0% collision. Squat / kneeling-fall: 0% collision, slip 4.0 / 7.1 / 10.7 cm.
-  Standups & get-ups: slip 3.0–9.8 cm with shallow (< 1 cm) grazing 4–28%. Two known
-  outliers: **`standup_side_05`** (14.7 cm slip, 38% shallow grazing) and
-  **`kneelingFall_03`** (10.7 cm slip, 0% collision) — both the structural floor of the
-  single-median plant anchor on a genuinely-repositioning contact, not a solver regression;
-  the fix is finer contact labelling (split-anchor / generalized contacts), not a knob.
+- **Measured (native-120 batch, Stage B).** Velocity spikes 0 and peak self-penetration
+  ≤ 0.88 cm on **every** clip. Shovels: plant slip 2.0–3.3 cm, foot-flat ~0.1°, 0% collision.
+  Squat / kneeling-fall: 0% collision, slip 4.0 / 7.1 / (kneelingFall_03) cm. Standups &
+  get-ups: slip 3.0–9.8 cm with shallow (< 1 cm, within-margin) grazing 4–28% on the harder
+  get-ups (standupKnees_02, standupFromKneeling_02).
+- **Plant-slip outliers are usually a metric phantom, not real slip.** `standup_side_05`
+  reported 14.7 cm; a per-effector dig showed it was **entirely** the right hand and
+  **entirely** 25 single-frame "plants" (velocity zero-crossings while the hand lifts off) —
+  the IK contact point never left its anchor (IK-vs-median ≤ 0.4 cm), but Stage A smoothed the
+  hand along its real moving path away from the 1-frame anchor. The `plant_min_run = 8` stillness
+  debounce (§6.2) removes these; standup_side_05 drops to 6.8 cm (real-plant slip). Lesson: audit
+  a slip outlier per-effector before attributing it to the solver.
 
 ---
 
