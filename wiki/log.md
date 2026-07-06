@@ -1,0 +1,51 @@
+# Wiki Log
+
+Append-only. Format: `## [YYYY-MM-DD] <op> | <what>` — parseable via `grep "^## \[" log.md | tail -5`.
+
+## [2026-07-03] init | Wiki created
+Seeded from METHOD.md, SESSION_HANDOFF.md, README.md, paper_idea.md, paperIdea2.md, repo scan.
+18 pages: concepts (9), data (2), experiments (3), results (2), questions (2). CLAUDE.md slimmed to
+session protocol + critical conventions; details moved here.
+
+## [2026-07-03] ingest | Undermind lit report → paperIdea3.md (Humanoids 2027)
+Read the 38-page Undermind deep-research report (170 refs): niche confirmed unoccupied, 4 concrete
+gaps (floor-stance templates, contact sequencing, knee/pelvis target editing, kinematic hardware
+playback). Consolidated paper_idea.md + paperIdea2.md into paperIdea3.md — "Any-Contact Retargeting"
+full paper for Humanoids 2027 (C1 generalized contacts, C2 template library, C3 quasi-static CoM,
+C4 hardware playback; 12-month plan, BeyondMimic gate Oct 2026). New wiki page concepts/related-work;
+questions/publication rewritten as two tracks.
+
+## [2026-07-03] lint | Old idea docs deleted by Prabin
+`LLM Wiki.md`, `paper_idea.md` (untracked, gone), `paperIdea2.md` (tracked — recover via
+`git show HEAD:paperIdea2.md`). Content absorbed into paperIdea3.md + wiki. Dead refs fixed in
+CLAUDE.md, README.md, questions/publication.md.
+
+## [2026-07-03] write | paper_intro.md drafted + SESSION_HANDOFF rewritten lean
+Introduction v0.1 for the 2027 Any-Contact paper (intro→background→lit→gap→contributions, [TBD-*]
+placeholders, revision notes). Handoff slimmed to session-delta + uncommitted state + NEXT; wiki is
+now the technical record. Next session: fullURDF render inspection, C1 (generalized contacts),
+mentor items.
+
+## [2026-07-03] fix | IHMC export fps bug: src_fps now real-time (fps/stride=30), not capture 120. Regenerated all 18 outputs/ihmcJsons-120hz/ at correct 4x duration.
+
+## [2026-07-05] analyze | rsl_rl consumer traced: IHMC RL tracker consumes at 50 Hz (json_to_npz --output_fps 50, ZOH no-interp; replay dt=0.02; all ref motions fps=50). 30 Hz solve is sub-Nyquist → self-upsample 30→120 launders lost content. Plan: solve at ≥50 Hz (STRIDE=1→120 or 2→60), downsample only at render/consumer. Watch LAMBDA_SMOOTH dt-retune. Wiki ihmc-export + pipeline updated.
+
+## [2026-07-05] change | Native 120 Hz solve: STRIDE 4→1, LAMBDA_SMOOTH 20→320 (×16 ∝fps²), GROUND_SMOOTH 5→80, N_OUTER 3→6, contact min-run/ramp/preroll ×4. Fixed OSQP status bug ("solved inaccurate" space vs underscore) + max_iter 8000→20000. Validated on 3 clips vs archived 30 Hz baseline (scaling correct; standup ~9cm slip pre-existing; get-up coll needs n_outer=6). Full 18-clip batch run; 30 Hz baseline archived outputs/*_30hz/. Review next session.
+
+## [2026-07-05] diagnose+fix | SCA parity bug → keep-best-iterate (slip-aware). Reviewing the 120 Hz batch found the get-up self-collision "regression" was NOT frame rate and NOT OSQP: the SCA loop re-linearizes collision only at each outer's start, so a collision-free outer drops all collision rows and takes an unconstrained step back into ~6 cm penetration → per-outer penetration OSCILLATES, and returning the last iterate makes the result depend on n_outer PARITY (30 Hz n=3 odd=lucky, 120 Hz n=6 even=bad). Verbose re-solve of standup_side_04 proved it (outers 3&5 hit 0.00 cm, discarded; outer 6 shipped 6.59 cm). Fix: stage_b returns the best iterate across outers, scored lexicographically (pen-beyond-1cm, then pen+slip, then coll%), seeded with the Stage-A warm start.
+
+## [2026-07-05] tune | Plant-slip reduction. plant-speed sweep (0.05/0.04/0.03) = DEAD lever (slip 10.4→10.9 cm, slow steady drift stays sub-threshold). Pin-weight sweep IS the lever: foot/hand ×4 (40/8→160/32) cut standup_side_04 slip 10.4→6.3 cm for <1 cm shallow collision; ×16 barely beats ×4 (diminishing). Finalized #3 = pins ×4 + slip-aware keep-best. Pipeline: added FOOT_WEIGHT/HAND_WEIGHT knobs + Stage 6 IHMC export (outputs/ihmcJsons-native120hz, native 120 no --fps).
+
+## [2026-07-05] batch | Finalized 18-clip run, ok=18 fail=0 (clip 11 shovel_rightbucket_01 no longer crashes). Peak self-penetration ≤0.88 cm + spikes 0 on ALL 18. Slip outliers: standup_side_05 14.7 cm/38% grazing, kneelingFall_03 10.7 cm — contact-labeling floor, not regression. 18 IHMC JSONs regenerated native 120. Log outputs/logs/pipeline_native120_20260705_141837.log.
+
+## [2026-07-05] doc | METHOD.md updated to shipped reality: header (branch main, single fullmesh model, no _v2/_v2_fullmesh/--soft-collision), Stage-6 export subsection §7.1, §6.2 keep-best+slip-aware selection + pins ×4, new §6.4 native-120 rate-scaling table+derivation, §8 model consolidation, §9 refreshed metrics. Wiki globalopt/pipeline/metrics synced.
+
+## [2026-07-05] diagnose+fix | standup_side_05 slip 14.7cm = PHANTOM. Per-effector dig: entirely right_hand, entirely 25 single-frame "plants" (velocity zero-crossings while the hand lifts off in late standup); IK-vs-median ≤0.4cm (plant IS locally stationary), Stage A smooths hand off the 1-frame anchor. NOT the "structural repositioning floor" I claimed earlier — that take was wrong. Fix: plant_min_run=8 stillness debounce in _compute_anchors (still run <8 fr → moving, not plant) + --plant-min-run CLI + PLANT_MIN_RUN=8 pipeline knob (×4 frame-count, 2@30Hz). Standalone standup_side_05 14.7→6.8cm, coll/spikes/track unchanged. Full 18-clip batch re-running with fix → review next session (watch kneelingFall_03 10.7cm). solver+pipeline uncommitted.
+
+## [2026-07-06] export+pipeline | Added 50 Hz IHMC JSON set. `1.json` (IHMC ref) confirmed ~50 Hz, `1.npz` fps=50 (json→npz keeps rate, NOT 100). Regenerated 18 clips from the native-120 grounded NPZs via exporter `--fps 50` (genuine 120→50 downsample, not upsampled-from-30) → `outputs/ihmcJsons50hz/` (all exactly 50.0 Hz). Wired Stage 6b into retargetingPipeline.sh (EXPORT_50HZ=1 default, IHMC_DIR_50 knob). Old `outputs/ihmcJsons/` (30 Hz-origin) left in place but superseded. Wiki ihmc-export.md updated.
+
+## [2026-07-06] diagnose+fix | RDX playback: foot-off-ground + bobbing. Root cause of the floating foot = Stage-3 TARGETS put the two ankles 5.78 cm apart in Z while both feet contact-labelled (inconsistent input a 1-DOF grounding shift can't reconcile), NOT a solver bug. Bobbing = perframe grounding shift wanders 7–9 cm as the lowest contact migrates hands→knees→feet. Fixes (3 stages): (3) `--coplanar-feet-mode mean` snaps both ankle-height targets to a common Z on both-feet-contact frames (achieved ankle gap 4.66→0.95 cm); (4) sole-corner on-floor rows drive each planted foot's 4 corners to a shared floor_z = on-floor+flat+coplanar in one row type (final sole gap →0.54 cm), pin split to X,Y on planted frames, keep-best score gains foot_floor_err + pen gate→2 cm, plant-slip made horizontal-only for feet; (4.5) new grounding mode `constant-contact` (now default) = single shift keyed to planted-foot soles (median) → 0 bobbing AND feet stay down (plain `constant` floats them +9.8 cm grounding on early hands/knees). Result standup_02: worst foot 4.7→0.6 cm off floor, wander 9→0 cm, peak self-pen 0.5→1.4 cm. Only standup_02 regenerated + re-exported; 18-clip re-run pending. Wiki globalopt/contact-first-ik/grounding updated. L/R-mirror-vs-RDX convention unconfirmed.
+
+## [2026-07-06] batch | Full 18-clip coplanar re-run (COPLANAR_FEET_MODE=mean, FLOOR_WEIGHT=200, GROUND_MODE=constant-contact, RENDER=0). ok=18 fail=0, spikes 0. Peak self-pen ≤1.86cm (kneelingFall_02; up from pre-coplanar ≤0.88 — coplanar/floor rows extend get-up legs ~1cm more grazing); shovels+squat 0.00. Feet planted: 7 standup/get-up clips finish both feet within ≈0.6cm of floor, coplanar pair split ≤0.6cm (standup_02 L0.60/R0.06) — RDX floating-foot gone. Caveat: the 13–16cm Stage-B floor_err on natural/side/slideHandsBack is a max-over-planted-frames artefact from early high-plant frames, NOT final stance. Two FALL clips penetrate the floor plane at the end (kneelingFall_02 Lfoot −11cm, kneelingFall_03 Rfoot −15.8cm): late free foot below the single constant-contact shift — separate regime, wants per-frame/hybrid grounding. 18 native-120 + 18 50Hz JSONs regenerated. METHOD.md §9 measured stats updated. Log outputs/logs/pipeline_coplanar.log.
+
+## [2026-07-06] doc | METHOD.md §6: added in-detail the Stage3→Stage4 data hand-off (qpos_ik = smoothing target + contact-anchor source + Stage-B linearisation origin; target_positions/contact_flags reused; achieved-ori/align-errors/self-coll-counts carried but unused), the mesh→QP-row hand-off ("mesh never enters the QP as geometry" — mj_forward reduces mesh to contact points = dist/normal/pos; one row per contact, j_sep coeffs + pen RHS; QP size scales with #contacts not vertices), and the OSQP assembly mapping (Jacobians→P/q/A, pen→l, slack→P penalty+A identity). Wiki globalopt.md gets a summary block pointing to METHOD. Answering a "which QP / why didn't the huge mesh choke it" question. No code change.

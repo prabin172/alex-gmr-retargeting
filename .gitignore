@@ -56,9 +56,13 @@ assets/alex/*
 # ==============================
 SESSION_HANDOFF.md
 paper_idea.md
+# Paper / presentation drafts — local only, not for the shared repo
+paperIdea3.md
+paper_intro.md
+PRESENTATION.md
+PRESENTATION_SLIDES.md
 
 # Editor / local scratch
 .obsidian/
 prompt.md
 Undermind - Hardware-ready kinematic contact-first humanoid motion retargeting methods for whole-body floor-contact sequences.pdf
-wiki/
