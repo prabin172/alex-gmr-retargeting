@@ -50,9 +50,24 @@ HAND_WEIGHT="${HAND_WEIGHT:-32}"         # soft pin on a PLANTED palm  (8 defaul
 # lifting-off hands (standup_side_05 right_hand 14.7->6.8cm). Frame-count knob -> x4
 # for 120 Hz (2 @ 30 Hz).
 PLANT_MIN_RUN="${PLANT_MIN_RUN:-8}"
+# Stage-3 coplanar-feet targets: when both feet are contact-labelled, snap their
+# ankle-height targets to a common Z so the IK produces coplanar feet. Fixes the
+# root cause of the "one foot floats in RDX" bug — the retargeted foot-height
+# targets can sit several cm apart (source ankles / per-leg scale differ) while
+# both are labelled planted, which a rigid grounding shift can't reconcile.
+# mean = distribute (lowest self-collision) | min = snap to lower foot | off = legacy.
+COPLANAR_FEET_MODE="${COPLANAR_FEET_MODE:-mean}"
+# On-floor + coplanar rows: drive each PLANTED foot's 4 sole-corner Zs to a shared
+# floor height (the lower foot's warm-start ground). Co-plants both feet in the
+# SOLVE, which a rigid 1-DOF grounding shift cannot. 0 = off. Pairs with
+# GROUND_MODE=constant (constant does the absolute z=0 registration; the feet are
+# already coplanar so one shift plants both).
+FLOOR_WEIGHT="${FLOOR_WEIGHT:-200}"
+FLOOR_MODE="${FLOOR_MODE:-estimate}"      # estimate (lower foot's ground) | zero (soles->z=0)
 RENDER_EXTRA="${RENDER_EXTRA:-}"          # extra render flags, e.g. "--fixed-cam"
+RENDER="${RENDER:-1}"                      # 1 = render Stage 5 mp4 | 0 = skip (faster; JSON export still runs)
 # --- Z-grounding (Stage 4.5) ---
-GROUND_MODE="${GROUND_MODE:-perframe}"    # perframe (plant every frame) | constant (single per-clip shift)
+GROUND_MODE="${GROUND_MODE:-constant-contact}"   # constant-contact (single shift keyed to planted feet — no bobbing, feet stay down) | perframe (plant every frame, wanders) | constant (single shift, global lowest)
 GROUND_SMOOTH="${GROUND_SMOOTH:-80}"      # perframe: tridiagonal smoothing on the shift series (5 @ 30 Hz × 16)
 # --- Render mesh (Stage 5) ---
 # visual    = full-body Alex visual mesh (legs+arms+torso), hands as closed fists
@@ -128,6 +143,7 @@ for entry in "${CLIPS[@]}"; do
       --canonical "$src" --out "$cf" \
       --stride "$STRIDE" --max-frames 99999 --ik-iters "$IK_ITERS" \
       --contact-min-run 12 --contact-ramp 16 --contact-preroll 8 \
+      --coplanar-feet-mode "$COPLANAR_FEET_MODE" \
       --log-every 200 $solve_extra \
       || { echo "  [FAIL] contact-first"; fail=$((fail+1)); continue; }
   fi
@@ -139,6 +155,7 @@ for entry in "${CLIPS[@]}"; do
     --ik-npz "$cf" --out "$go" --lambda-smooth "$LAMBDA_SMOOTH" --n-outer "$N_OUTER" \
     --foot-weight "$FOOT_WEIGHT" --hand-weight "$HAND_WEIGHT" \
     --plant-min-run "$PLANT_MIN_RUN" \
+    --floor-weight "$FLOOR_WEIGHT" --floor-mode "$FLOOR_MODE" \
     --collision-penalty 1000 $go_extra \
     || { echo "  [FAIL] globalopt"; fail=$((fail+1)); continue; }
 
@@ -157,12 +174,16 @@ stride=int(np.round(np.median(np.diff(sfi)))) if len(sfi)>1 else 1
 print(f"{fps/max(stride,1):.4f}")
 PY
 )
-  echo "  [render] real-time fps=$RT  (mesh=$RENDER_MESH)"
-  MUJOCO_GL=egl python scripts/visualization/render_contactfirst.py \
-    --npz "$gr" --model "$RMODEL" --out-mp4 "$mp4" \
-    --width 640 --height 480 --fps "$RT" --frame-step 1 \
-    --ground --ground-z 0 $RENDER_EXTRA \
-    || { echo "  [FAIL] render"; fail=$((fail+1)); continue; }
+  if [ "$RENDER" = "1" ]; then
+    echo "  [render] real-time fps=$RT  (mesh=$RENDER_MESH)"
+    MUJOCO_GL=egl python scripts/visualization/render_contactfirst.py \
+      --npz "$gr" --model "$RMODEL" --out-mp4 "$mp4" \
+      --width 640 --height 480 --fps "$RT" --frame-step 1 \
+      --ground --ground-z 0 $RENDER_EXTRA \
+      || { echo "  [FAIL] render"; fail=$((fail+1)); continue; }
+  else
+    echo "  [render] skipped (RENDER=0)"
+  fi
 
   # Stage 6 — IHMC JSON export from the grounded NPZ (native 120 Hz, no --fps)
   js="$IH/${name}.json"

@@ -7,12 +7,22 @@ the v2 model uses convex-hull meshes on the fists/limbs), and shifts the free
 root Z so the clip rests on the ground plane z=0.
 
 Modes:
-  constant  (default) — ONE shift for the whole clip: floor = a low percentile
-            of per-frame lowest-Z; shift all frames by -floor. Preserves every
-            bit of vertical motion (crouch/stand), never adds jitter. The clip's
-            lowest moments touch the floor; other frames float slightly above.
+  constant-contact (recommended) — ONE shift for the whole clip, but the floor is
+            registered to the PLANTED FEET (sole-corner sites on frames where a
+            foot is contact-labelled), not the global lowest geom. Fixes the two
+            failure modes of the other modes at once: a single shift adds ZERO
+            vertical wander (no bobbing), and keying off the feet keeps them on the
+            floor even when hands/knees are the global-lowest point earlier in a
+            get-up (plain `constant` grounds on those and floats the feet metres
+            up). Falls back to `constant` if no foot-contact frames / sole sites.
+  constant  — ONE shift for the whole clip: floor = a low percentile of per-frame
+            lowest-Z (ANY geom); shift all frames by -floor. Preserves every bit of
+            vertical motion, never adds jitter, but grounds on whatever is lowest —
+            wrong reference during get-ups (see above).
   perframe  — shift each frame so its lowest point sits exactly at 0 (full
-            plant, both up and down). Optional --smooth-shift to de-jitter.
+            plant, both up and down). Optional --smooth-shift to de-jitter. Plants
+            the feet but the per-frame shift wanders (~7-9 cm on get-ups) = bobbing
+            in a fixed world frame.
 
 Only qpos[:,2] (root Z) is modified. All other keys are copied through; the
 original ungrounded qpos is kept as `qpos_ungrounded`.
@@ -32,6 +42,41 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MODEL_DEFAULT = REPO_ROOT / "assets/alex/alex_floating_base_with_sites.xml"
+
+# Sole corner sites per foot effector — the contact reference for constant-contact
+# grounding (mirrors the Stage-4 on-floor rows).
+SOLE_CORNER_SITES = {
+    "left_foot": [f"alex_left_sole_corner_{a}_body_{b}_site"
+                  for a in ("toe", "heel") for b in ("left", "right")],
+    "right_foot": [f"alex_right_sole_corner_{a}_body_{b}_site"
+                   for a in ("toe", "heel") for b in ("left", "right")],
+}
+
+
+def _planted_foot_sole_samples(model, data, qpos, contact_flags, eff_names):
+    """Per-frame min sole-corner Z of each foot on frames where that foot is
+    contact-labelled → the set of heights the planted feet actually rest at.
+    Returns a flat array (empty if no foot contacts / sole sites resolve)."""
+    foot_sites = {}
+    for eff, names in SOLE_CORNER_SITES.items():
+        if eff not in eff_names:
+            continue
+        ids = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, n) for n in names]
+        ids = [i for i in ids if i >= 0]
+        if ids:
+            foot_sites[eff_names.index(eff)] = ids
+    if not foot_sites or contact_flags is None:
+        return np.array([])
+    samples = []
+    for t in range(qpos.shape[0]):
+        cols = [c for c, ids in foot_sites.items() if contact_flags[t, c]]
+        if not cols:
+            continue
+        data.qpos[:] = qpos[t]
+        mujoco.mj_forward(model, data)
+        for c in cols:
+            samples.append(min(float(data.site_xpos[s][2]) for s in foot_sites[c]))
+    return np.asarray(samples)
 
 
 def _build_mesh_cache(model: mujoco.MjModel):
@@ -122,9 +167,16 @@ def main():
     ap.add_argument("--npz", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--model", type=Path, default=MODEL_DEFAULT)
-    ap.add_argument("--mode", choices=["constant", "perframe"], default="constant")
+    ap.add_argument("--mode", choices=["constant-contact", "constant", "perframe"],
+                    default="constant-contact")
     ap.add_argument("--percentile", type=float, default=1.0,
-                    help="constant mode: floor = this percentile of per-frame lowest-Z (robust to outliers).")
+                    help="constant mode: floor = this percentile of per-frame lowest-Z. Low (1) so "
+                         "the clip's lowest moment touches the floor.")
+    ap.add_argument("--contact-percentile", type=float, default=50.0,
+                    help="constant-contact mode: floor = this percentile of the PLANTED-FOOT sole "
+                         "heights. Default 50 (median) keys on the stable stance, not the brief "
+                         "touchdown transient (a heel-strike corner dips several cm — a low "
+                         "percentile there would leave the whole standing phase floating).")
     ap.add_argument("--smooth-shift", type=float, default=0.0,
                     help="perframe mode: tridiagonal smoothing weight on the shift series (0 = off).")
     args = ap.parse_args()
@@ -147,7 +199,22 @@ def main():
         mujoco.mj_forward(model, data)
         lowest[t] = _robot_lowest_z(model, data, mesh_cache, geom_ids)
 
-    if args.mode == "constant":
+    floor_src = "lowest-geom"
+    if args.mode == "constant-contact":
+        eff_names = [str(x) for x in data_dict["contact_effector_names"]] \
+            if "contact_effector_names" in data_dict else []
+        cflags = np.asarray(data_dict["contact_flags"], dtype=bool) \
+            if "contact_flags" in data_dict else None
+        samples = _planted_foot_sole_samples(model, data, qpos, cflags, eff_names)
+        if samples.size:
+            floor = float(np.percentile(samples, args.contact_percentile))
+            floor_src = f"planted-foot-sole p{args.contact_percentile:g} (n={samples.size})"
+        else:
+            print("  [warn] constant-contact: no planted-foot samples — "
+                  "falling back to global-lowest constant")
+            floor = float(np.percentile(lowest, args.percentile))
+        shift = np.full(N, -floor)
+    elif args.mode == "constant":
         floor = float(np.percentile(lowest, args.percentile))
         shift = np.full(N, -floor)
     else:
@@ -171,8 +238,8 @@ def main():
 
     print(f"[ground] {args.npz.name}  N={N}  mode={args.mode}")
     print(f"  lowest-Z before: min={lowest.min():+.4f} med={np.median(lowest):+.4f} max={lowest.max():+.4f}")
-    if args.mode == "constant":
-        print(f"  floor(p{args.percentile})={floor:+.4f}  constant shift={shift[0]:+.4f} m")
+    if args.mode in ("constant", "constant-contact"):
+        print(f"  floor({floor_src})={floor:+.4f}  constant shift={shift[0]:+.4f} m")
     else:
         print(f"  perframe shift: min={shift.min():+.4f} max={shift.max():+.4f} smooth={args.smooth_shift}")
     print(f"  lowest-Z after : min={grounded_lowest.min():+.4f} med={np.median(grounded_lowest):+.4f}")

@@ -80,6 +80,25 @@ CONTACT_TRACK_ROLE = {
     "left_hand": "left_hand", "right_hand": "right_hand",
 }
 
+# Sole corner sites (toe/heel × body-left/right) per foot. Driving all four
+# corner Zs to a SHARED floor height in Stage B enforces on-floor + flat +
+# inter-foot coplanarity from one row type — a rigid grounding shift (1 DOF)
+# can't co-plant two feet that the solve left non-coplanar; this can.
+SOLE_CORNER_SITES = {
+    "left_foot": [
+        "alex_left_sole_corner_toe_body_left_site",
+        "alex_left_sole_corner_toe_body_right_site",
+        "alex_left_sole_corner_heel_body_left_site",
+        "alex_left_sole_corner_heel_body_right_site",
+    ],
+    "right_foot": [
+        "alex_right_sole_corner_toe_body_left_site",
+        "alex_right_sole_corner_toe_body_right_site",
+        "alex_right_sole_corner_heel_body_left_site",
+        "alex_right_sole_corner_heel_body_right_site",
+    ],
+}
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers (from base GlobalOPT)
@@ -190,9 +209,20 @@ def _resolve_contact_geom(model, eff_names, contact_sites):
             if sid < 0:
                 print(f"  [warn] site {sname} not found — skipping {eff}")
                 continue
+        sole_sites = []
+        if g["kind"] == "foot":
+            for sname in SOLE_CORNER_SITES.get(eff, []):
+                ss = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, sname)
+                if ss >= 0:
+                    sole_sites.append(ss)
+            if len(sole_sites) != 4:
+                print(f"  [warn] {eff}: {len(sole_sites)}/4 sole corner sites found "
+                      f"— on-floor rows disabled for it")
+                sole_sites = []
         resolved[eff] = dict(
             body_id=bid, site_id=sid, kind=g["kind"],
             axis_local=np.asarray(g["axis_local"]), world_dir=np.asarray(g["world_dir"]),
+            sole_sites=sole_sites,
         )
     return resolved
 
@@ -264,6 +294,54 @@ def _compute_anchors(model, data, qpos_ik, eff_names, flags, resolved, fps,
     return tgt, wgt, planted
 
 
+def _estimate_floor_z(model, data, qpos_warm, planted, resolved):
+    """Shared floor height (world Z) that planted feet should rest on.
+
+    Per foot: median over its planted frames of the min sole-corner Z (its typical
+    ground contact in the warm start). Floor = MEDIAN across feet (= midpoint for
+    two feet) so BOTH feet share the coplanarity correction — Stage B holds the
+    root fixed and leg articulation alone can't pull the higher foot the full gap
+    down to the lower foot's ground (reach-limited, saturates ~3 cm). Splitting it
+    (each foot ~half the gap) stays within reach; a final constant grounding shift
+    then plants the now-coplanar pair. Returns None if no foot has sole sites +
+    plants. Single-stance (one planted foot) → that foot's own ground (no lift)."""
+    per_foot = []
+    for eff, info in resolved.items():
+        if info["kind"] != "foot" or not info["sole_sites"]:
+            continue
+        pf = np.where(planted[eff])[0]
+        if pf.size == 0:
+            continue
+        mins = []
+        for t in pf:
+            data.qpos[:] = qpos_warm[t]
+            mujoco.mj_forward(model, data)
+            mins.append(min(float(data.site_xpos[s][2]) for s in info["sole_sites"]))
+        per_foot.append(float(np.median(mins)))
+    return float(np.median(per_foot)) if per_foot else None
+
+
+def _foot_floor_err_cm(model, data, qpos, planted, resolved, floor_z):
+    """Max |sole-corner Z − floor_z| over planted foot frames (cm). Combined
+    on-floor + coplanar residual — the quantity the floor rows drive to zero, and
+    the term keep-best must credit or it discards every floor-improving iterate."""
+    if floor_z is None:
+        return 0.0
+    errs = []
+    for t in range(qpos.shape[0]):
+        touched = False
+        for eff, info in resolved.items():
+            if info["kind"] != "foot" or not info["sole_sites"] or not planted[eff][t]:
+                continue
+            if not touched:
+                data.qpos[:] = qpos[t]
+                mujoco.mj_forward(model, data)
+                touched = True
+            for sid in info["sole_sites"]:
+                errs.append(abs(float(data.site_xpos[sid][2]) - floor_z))
+    return float(np.max(errs)) * 100 if errs else 0.0
+
+
 def _contact_slip_stats(model, data, qpos, tgt, wgt, planted, resolved):
     """Drift of the contact point off its target, split planted vs moving, plus
     mean foot-flat angle over planted foot frames."""
@@ -275,7 +353,11 @@ def _contact_slip_stats(model, data, qpos, tgt, wgt, planted, resolved):
             a = tgt[eff][t]
             if np.isnan(a[0]):
                 continue
-            disp = float(np.linalg.norm(_contact_point(data, info) - a))
+            d = _contact_point(data, info) - a
+            # Feet: plant-slip is HORIZONTAL sliding only — vertical foot motion is
+            # the deliberate on-floor/coplanar correction (floor rows), not slip, and
+            # scoring it as slip would make keep-best reject the correction. Hands: 3D.
+            disp = float(np.linalg.norm(d[:2] if info["kind"] == "foot" else d))
             (slip_p if planted[eff][t] else slip_m).append(disp)
             if info["kind"] == "foot" and planted[eff][t]:
                 R = data.xmat[info["body_id"]].reshape(3, 3)
@@ -395,11 +477,15 @@ def _build_tracking(qpos_warm, target_positions, role_names, role_to_body,
 
 
 def _build_contact(qpos_warm, tgt, wgt, planted, resolved, model, data,
-                   foot_flat_w, fist_w):
+                   foot_flat_w, fist_w, floor_z=None, floor_w=0.0):
     """All-soft contact terms into H_blocks/g:
         * position: w_t ||J_pt δq - (target - p)||²   (per-frame weight from wgt)
         * foot-flat: foot up-axis → world +Z, weight foot_flat_w on planted frames
         * fist-down: gripper +X → world −Z, weight fist_w while a hand is in contact
+        * on-floor (planted feet, floor_w>0): each sole-corner Z → shared floor_z,
+          weight floor_w. Enforces on-floor + flat + inter-foot coplanar at once.
+          On those frames the position pin drops to X,Y only so it does not fight
+          the floor rows over height.
     Soft everywhere → the QP is always feasible (reach-limited pushes yield
     gracefully instead of going infeasible)."""
     T = qpos_warm.shape[0]
@@ -431,10 +517,23 @@ def _build_contact(qpos_warm, tgt, wgt, planted, resolved, model, data,
             R = data.xmat[bid].reshape(3, 3)
             err_rot = np.cross(R @ info["axis_local"], info["world_dir"])
 
-            add_soft(Jp, a - p, wgt[eff][t], t)              # position pin
+            do_floor = (info["kind"] == "foot" and planted[eff][t]
+                        and floor_w > 0.0 and floor_z is not None and info["sole_sites"])
+            if do_floor:
+                add_soft(Jp[:2], (a - p)[:2], wgt[eff][t], t)  # pin X,Y only (Z→floor)
+            else:
+                add_soft(Jp, a - p, wgt[eff][t], t)            # full 3D position pin
+
             if info["kind"] == "foot":
                 if planted[eff][t]:
                     add_soft(Jr, err_rot, foot_flat_w, t)     # foot-flat (planted)
+                    if do_floor:
+                        for sid in info["sole_sites"]:
+                            js = np.zeros((3, nv))
+                            mujoco.mj_jacSite(model, data, js, None, sid)
+                            Jz = js[2:3, DV_ACT_SLICE]        # ∂(corner_z)/∂δq_act
+                            e = np.array([floor_z - data.site_xpos[sid][2]])
+                            add_soft(Jz, e, floor_w, t)       # sole corner Z → floor
             else:
                 add_soft(Jr, err_rot, fist_w, t)              # fist-down
     return H_blocks, g
@@ -481,12 +580,14 @@ def stage_b(qpos_warm, target_positions, role_names, role_to_body, target_weight
             model, data, q_lo, q_hi,
             lambda_track, lambda_smooth, lambda_coll,
             foot_flat_w, fist_w, downweight_factor, n_outer, trust,
-            collision_penalty=1000.0):
+            collision_penalty=1000.0, floor_z=None, floor_w=0.0):
     T = qpos_warm.shape[0]
     N = T * N_ACT
     q_warm_act = qpos_warm[:, 7:].reshape(-1)
+    floor_info = (f" floor_w={floor_w} floor_z={floor_z:.4f}"
+                  if floor_w > 0.0 and floor_z is not None else " floor=OFF")
     print(f"  Stage B: T={T} variables={N} n_outer={n_outer} trust={trust} "
-          f"soft_collision=ON penalty={collision_penalty}")
+          f"soft_collision=ON penalty={collision_penalty}{floor_info}")
 
     H_smooth = _build_smoothness_hessian(T, lambda_smooth)
     A_jl = sp.eye(N, format="csc")
@@ -509,16 +610,25 @@ def stage_b(qpos_warm, target_positions, role_names, role_to_body, target_weight
     #   1) hard = penetration beyond PEN_TOL cm — a self-collision failure that is
     #      never traded for slip;
     #   2) pen + slip — among acceptable-penetration iterates, minimise total drift.
-    PEN_TOL = 1.0  # cm; sub-tol penetration is soft-collision slack noise
+    # Penetration gate: sub-tol self-penetration is soft-collision slack noise and
+    # never traded for contact quality. Pressing floating feet onto the floor costs
+    # ~1–1.5 cm of extra self-penetration (legs extend), so with floor rows ON the
+    # gate widens to 2 cm — else keep-best keeps the (feet-4.7cm-apart) warm start.
+    PEN_TOL = 2.0 if floor_w > 0.0 and floor_z is not None else 1.0
     def _iter_score(q):
         cs = _collision_stats(model, data, q)
         ss = _contact_slip_stats(model, data, q, tgt, wgt, planted, resolved)
         pen = cs["max_pen_cm"]; slip = ss["plant_slip_max_cm"]
+        ferr = _foot_floor_err_cm(model, data, q, planted, resolved,
+                                  floor_z if floor_w > 0.0 else None)
         hard = max(0.0, pen - PEN_TOL)
-        return (hard, pen + slip, cs["pct"], pen, slip)
+        # Primary (below the hard gate): total contact error = horizontal plant slip
+        # + vertical foot-off-floor. Both are "how badly the planted contacts miss".
+        return (hard, slip + ferr, pen + slip, cs["pct"], pen, slip, ferr)
     best_qpos = qpos_cur.copy()
     best_score = _iter_score(best_qpos)
-    print(f"    warm: pen={best_score[3]:.2f}cm slip={best_score[4]:.1f}cm coll={best_score[2]:.1f}%")
+    print(f"    warm: pen={best_score[4]:.2f}cm slip={best_score[5]:.1f}cm "
+          f"floor_err={best_score[6]:.2f}cm coll={best_score[3]:.1f}%")
 
     for outer in range(n_outer):
         t0 = time.time()
@@ -526,7 +636,7 @@ def stage_b(qpos_warm, target_positions, role_names, role_to_body, target_weight
                                  target_weights, model, data, lambda_track,
                                  downweight_roles, downweight_factor)
         Hc, gc = _build_contact(qpos_cur, tgt, wgt, planted, resolved,
-                                model, data, foot_flat_w, fist_w)
+                                model, data, foot_flat_w, fist_w, floor_z, floor_w)
         H_task = _blocks_to_sparse([Ht[t] + Hc[t] for t in range(T)], N)
         P = 2.0 * (H_task + H_smooth)
         q_vec = gt + gc
@@ -591,14 +701,16 @@ def stage_b(qpos_warm, target_positions, role_names, role_to_body, target_weight
                               f"slack_active={int((np.abs(s) > 1e-4).sum())}/{n_coll_rows}")
             score = _iter_score(qpos_cur)
             keep = score < best_score
-            pen_info = (f" pen={score[3]:.2f}cm slip={score[4]:.1f}cm coll={score[2]:.1f}%"
+            pen_info = (f" pen={score[4]:.2f}cm slip={score[5]:.1f}cm "
+                        f"floor_err={score[6]:.2f}cm coll={score[3]:.1f}%"
                         + (" *best" if keep else ""))
             if keep:
                 best_score = score
                 best_qpos = qpos_cur.copy()
         print(f"    outer {outer+1}/{n_outer}: coll_rows={n_coll_rows} status={res.info.status} "
               f"|dQ|max={np.abs(delta).max():.4f} time={time.time()-t0:.1f}s" + slack_info + pen_info)
-    print(f"    Stage B best: pen={best_score[3]:.2f}cm slip={best_score[4]:.1f}cm coll={best_score[2]:.1f}%")
+    print(f"    Stage B best: pen={best_score[4]:.2f}cm slip={best_score[5]:.1f}cm "
+          f"floor_err={best_score[6]:.2f}cm coll={best_score[3]:.1f}%")
     return best_qpos
 
 
@@ -661,6 +773,18 @@ def main():
     ap.add_argument("--collision-penalty", type=float, default=1000.0,
                     help="Quadratic penalty weight ρ on the always-on collision slack "
                          "variables (Stage B soft self-collision).")
+    ap.add_argument("--floor-weight", type=float, default=0.0,
+                    help="Soft weight driving each planted foot's 4 sole-corner Zs to a "
+                         "SHARED floor height (on-floor + flat + inter-foot coplanar). "
+                         "0 = off (legacy). On planted frames the position pin drops to "
+                         "X,Y only so it doesn't fight the floor rows. Fixes the "
+                         "non-coplanar-feet gap a rigid grounding shift can't.")
+    ap.add_argument("--floor-mode", choices=["estimate", "zero"], default="estimate",
+                    help="Floor height for the on-floor rows. estimate = lower planted "
+                         "foot's warm-start ground height (still needs a final constant "
+                         "grounding shift for absolute z=0); zero = drive soles to world "
+                         "z=0 directly (grounding becomes a near no-op, but legs must "
+                         "reach 0 from Stage-A root height).")
     args = ap.parse_args()
 
     z = np.load(args.ik_npz, allow_pickle=True)
@@ -725,6 +849,12 @@ def main():
 
     qpos_b = None
     if args.n_outer > 0:
+        floor_z = None
+        if args.floor_weight > 0.0:
+            floor_z = 0.0 if args.floor_mode == "zero" else \
+                _estimate_floor_z(model, data, qpos_a, planted, resolved)
+            print(f"  floor rows: weight={args.floor_weight} mode={args.floor_mode} "
+                  f"floor_z={floor_z}")
         print("Stage B: contact-aware QP + SCA...")
         qpos_b = stage_b(qpos_a, target_positions, role_names, role_to_body, target_weights,
                          tgt, wgt, planted, resolved, downweight_roles,
@@ -732,7 +862,8 @@ def main():
                          args.lambda_track, args.lambda_smooth, args.lambda_coll,
                          args.foot_flat_weight, args.fist_weight,
                          args.contact_downweight, args.n_outer, args.trust,
-                         collision_penalty=args.collision_penalty)
+                         collision_penalty=args.collision_penalty,
+                         floor_z=floor_z, floor_w=args.floor_weight)
         s_b = all_stats(qpos_b)
 
     print("\n" + "=" * 120)

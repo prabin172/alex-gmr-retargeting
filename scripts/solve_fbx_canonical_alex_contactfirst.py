@@ -982,6 +982,15 @@ def main():
     ap.add_argument("--shank-margin-deg", type=float, default=5.0,
                     help="Keep the clamped shank tilt this many degrees INSIDE the ankle joint range "
                          "(default: 5)")
+    ap.add_argument("--coplanar-feet-mode", choices=["min", "mean", "off"], default="mean",
+                    help="When BOTH feet are contact-engaged, snap their ankle-height targets to a "
+                         "common Z (foot-flat makes equal ankle Z ⇒ equal sole Z, so the feet come out "
+                         "coplanar). Fixes inconsistent 'both planted but several-cm-apart' targets that "
+                         "a rigid grounding shift can't reconcile (one foot floats in playback). "
+                         "mean = meet in the middle (default — distributes the correction, lowest "
+                         "self-collision cost); min = snap the higher foot DOWN to the lower/grounded "
+                         "one (more source-faithful but a more extended pose → more self-collision); "
+                         "off = legacy (no enforcement).")
     ap.add_argument("--knee-bias-weight", type=float, default=0.5,
                     help="Weight of the one-sided knee-flexion bias: weakly push a knee straighter than "
                          "--knee-min-flex-deg back toward it (straight knee = joint lower limit + leg "
@@ -1330,6 +1339,30 @@ def main():
                         spr = cpos["skip_pos_role"]
                         pos_weight_scale[spr] = min(pos_weight_scale.get(spr, 1.0), 1.0 - w_env)
                         palm_targets[eff] = tgt
+
+            # Coplanar planted feet. The retargeted foot-height targets can sit
+            # several cm apart in Z while BOTH feet are contact-labelled (the source
+            # ankles differ in height relative to the pelvis, or the per-leg
+            # morphology scale differs). That is an inconsistent input — "both
+            # planted" yet not coplanar — which the downstream rigid grounding shift
+            # cannot reconcile: it plants only the lower foot and the higher one
+            # floats (standup_02: ankle targets 5.78 cm apart → a foot off the ground
+            # in RDX). Fix it at the target: when both feet are engaged, snap the
+            # higher ankle target DOWN to the lower (grounded) one, cross-faded by
+            # the weaker engagement so it eases in with contact. Foot-flat makes
+            # equal ankle Z ⇒ equal sole Z, so the IK then produces coplanar feet
+            # directly — no post-hoc, reach-limited patch needed.
+            if args.coplanar_feet_mode != "off" \
+                    and "left_foot" in contact_env and "right_foot" in contact_env:
+                lpr = FOOT_POS_ROLE["left_foot"]; rpr = FOOT_POS_ROLE["right_foot"]
+                wcp = min(float(contact_env["left_foot"][ti]),
+                          float(contact_env["right_foot"][ti]))
+                if wcp > 0.0:
+                    zl = targets[lpr][2]; zr = targets[rpr][2]
+                    z_common = min(zl, zr) if args.coplanar_feet_mode == "min" \
+                        else 0.5 * (zl + zr)
+                    targets[lpr][2] = (1.0 - wcp) * zl + wcp * z_common
+                    targets[rpr][2] = (1.0 - wcp) * zr + wcp * z_common
 
         q = solve_frame_position_ik(
             model,

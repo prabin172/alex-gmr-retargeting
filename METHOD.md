@@ -1,6 +1,6 @@
-# Contact-First Human-to-Humanoid Motion Retargeting — Complete Method
+# Contact-First Human-to-Humanoid Motion Retargeting
 
-*Single self-contained technical reference for the `alex-gmr-retargeting` pipeline.
+Technical reference for the `alex-gmr-retargeting` pipeline.
 Ground truth is the code on branch `main`; where an older note or the white
 paper disagreed, this document follows the code and flags the correction.*
 
@@ -17,7 +17,7 @@ QP as it actually runs.*
 
 We retarget human motion capture (FBX / MVNX) onto the IHMC **Alex V2** humanoid — a
 36-DOF floating-base biped — producing physically coherent joint trajectories usable
-as reference motions for downstream imitation / physics-RL (e.g. BeyondMimic).
+as reference motions for downstream imitation / physics-RL.
 
 The core problem is **morphology mismatch**: a human and Alex have different limb
 proportions, different DOFs, different joint ranges, and different coordinate
@@ -44,19 +44,19 @@ plant it on the floor.
 
 ### Pipeline stages
 
-| # | Stage | Input → Output | Nature | Script |
-|---|-------|----------------|--------|--------|
-| 1 | Canonical human | FBX/MVNX → landmark positions `(T,N,3)` | geometric re-expression | `build_fbx_canonical_human.py` (Blender) |
-| 2 | Orientation frames | positions → per-part `SO(3)` frames + facing yaw | geometric construction | `build_canonical_orientation_frames_fresh.py` |
-| 3 | Contact-first IK | canonical human → robot poses `q(t)` `(T,36)` | per-frame damped Gauss–Newton | `solve_fbx_canonical_alex_contactfirst.py` |
-| 4 | Global trajectory opt | `q(t)` → smoothed `q(t)` | global temporal regularisation | `solve_global_trajectory_opt_contactfirst.py` |
-| 4.5 | Z-grounding | `q(t)` → grounded `q(t)` | vertical rigid shift to floor | `post_process_ground_contactfirst.py` |
-| 5 | Render | grounded `q(t)` → MP4 + contact strip | visualisation | `visualization/render_contactfirst.py` |
-| 6 | IHMC JSON export | grounded `q(t)` → IHMC replay JSON | format conversion (native 120 Hz, no resample) | `export_alex_retarget_npz_to_ihmc_json.py` |
+| #   | Stage                 | Input → Output                                   | Nature                                         | Script                                        |
+| --- | --------------------- | ------------------------------------------------ | ---------------------------------------------- | --------------------------------------------- |
+| 1   | Canonical human       | FBX/MVNX → landmark positions `(T,N,3)`          | geometric re-expression                        | `build_fbx_canonical_human.py` (Blender)      |
+| 2   | Orientation frames    | positions → per-part `SO(3)` frames + facing yaw | geometric construction                         | `build_canonical_orientation_frames_fresh.py` |
+| 3   | Contact-first IK      | canonical human → robot poses `q(t)` `(T,36)`    | per-frame damped Gauss–Newton                  | `solve_fbx_canonical_alex_contactfirst.py`    |
+| 4   | Global trajectory opt | `q(t)` → smoothed `q(t)`                         | global temporal regularisation                 | `solve_global_trajectory_opt_contactfirst.py` |
+| 4.5 | Z-grounding           | `q(t)` → grounded `q(t)`                         | vertical rigid shift to floor                  | `post_process_ground_contactfirst.py`         |
+| 5   | Render                | grounded `q(t)` → MP4 + contact strip            | visualisation                                  | `visualization/render_contactfirst.py`        |
+| 6   | IHMC JSON export      | grounded `q(t)` → IHMC replay JSON               | format conversion (native 120 Hz, no resample) | `export_alex_retarget_npz_to_ihmc_json.py`    |
 
 Intermediate representations are NumPy `.npz` at every stage boundary, so the pipeline
 is inspectable and resumable. The whole per-clip run (stages 3–6) is driven by
-`retargetingPipeline.sh` with **one identical config for every action** (Prabin's rule: a
+`retargetingPipeline.sh` with **one identical config for every action** (Attempted rule: a
 single retargeter, no per-clip tuning). Stages 1–2 run per new FBX by hand in Blender.
 
 ```
@@ -378,6 +378,23 @@ kneeling clips.
   in `[0.4, 2.5]`), weight `3.0·α`. The now-redundant wrist-body position target is
   cross-faded out (`pos_weight_scale = 1 − α`). This is the substantive "fist support"
   term; the fist-down align (§5.4) only orients it.
+- **Coplanar-feet targets.** The morphology-scaled ankle-height targets (§4) can place
+  the two ankles several cm apart in Z while **both** feet are contact-labelled — the
+  source ankles differ in height relative to the pelvis, or the per-leg scale differs. That
+  is an inconsistent input: "both planted" yet not coplanar, which the downstream 1-DOF
+  grounding shift (§7) cannot reconcile (it plants only the lower foot; the higher floats,
+  e.g. standup_02 was 5.78 cm apart → one foot off the ground in playback). On frames where
+  both feet are engaged we snap their **ankle-target Z** to a common value, cross-faded by
+  the weaker engagement `α_{cp} = \min(α_L, α_R)`:
+
+  $$z^{L}\!,\,z^{R}\ \leftarrow\ (1-α_{cp})\,z^{\{L,R\}} + α_{cp}\,z^{\star},\qquad
+    z^{\star}=\tfrac12(z^{L}+z^{R})\ \text{(mean, default)}\ \text{or}\ \min(z^{L},z^{R})\ \text{(min)}.$$
+
+  Foot-flat (§5.4) makes equal ankle Z ⇒ equal sole Z, so the IK yields **coplanar feet
+  directly**, at full leg freedom (unlike the root-fixed Stage-B patch, §6.2). `mean` meets
+  in the middle (distributes the correction → least self-collision); `min` snaps the higher
+  foot down to the lower/grounded one (more source-faithful, more extended pose). standup_02
+  achieved ankle gap 4.66 → 0.95 cm; `off` = legacy. `--coplanar-feet-mode {mean,min,off}`.
 
 ### 5.7 Self-collision repulsion (in-solver, soft)
 
@@ -412,6 +429,34 @@ root pops. These cannot be fixed within a per-frame framework — the frame at `
 have to "know" a topology change is coming at `t`. Because we build datasets **offline**,
 the whole trajectory is available, so we optimise over all `T` frames jointly. This
 offline/online distinction is the methodological lever.
+
+**What Stage 4 consumes from Stage 3.** Stage 4 re-uses the Stage-3 output NPZ (§5.8); it does
+**not** re-run IK. The load is in `main()`. The single most important input is the per-frame
+damped-least-squares pose trajectory `qpos_ik = z["qpos"] ∈ ℝ^{T×36}`, which drives Stage 4 in
+three distinct roles:
+
+1. **The trajectory to smooth.** Stage A's Tikhonov cost `min_y λ_track‖y−x‖² + λ_smooth‖Dy‖²`
+   takes `x = qpos_ik` as its tracking target (§6.1). Because Stage A cannot change a channel's
+   mean, the Stage-A output is the DLS trajectory with its spikes redistributed — not a new pose.
+2. **The source of the contact-pin anchors.** The Stage-B contact anchors are the **per-interval
+   median of the DLS-solved effector positions** during each stationary plant (`_compute_anchors`
+   runs FK on `qpos_ik`, §6.2). Stage B does not invent contact locations — it holds each effector
+   at the median of wherever the DLS solve placed it while planted.
+3. **The linearisation point / increment origin for Stage B.** Stage B optimises actuated
+   increments `δQ` *from* the warm pose (`q_warm_act = qpos_warm[:,7:]`) and re-linearises every
+   tracking/contact/collision Jacobian at the current trajectory each SCA outer. Stage B's direct
+   warm start is `qpos_a` (the smoothed DLS output), so the DLS solve is the origin of everything
+   Stage 4 does.
+
+The other consumed fields — all also carried from Stage 3, none re-derived — are: `target_positions`
+`∈ ℝ^{T×R×3}` (the morphology-scaled human targets, §4), re-used as the **shared** tracking
+objective by both Stage B and the metrics (so the QP tracks the *same* targets the DLS did, with a
+contacting effector's own role down-weighted ×0.1); `contact_flags ∈ {0,1}^{T×n_eff}` (the Stage-3
+contact detection, §5.2), which drives both the anchor split and the per-frame down-weight set;
+`role_names` / `alex_body_names` (role→body map); and `metadata_json` (contact-site names,
+`target_weights`) and `fps`. Fields carried through to Stage 4's output but **not** used in the
+solve — achieved orientations, `contact_align_errors_deg`, `self_collision_counts`,
+`human_target_positions` — are copied straight to the renderer via `save = {k: z[k] for k in z.files}`.
 
 ### 6.1 Stage A — closed-form tridiagonal smoothing
 
@@ -463,6 +508,22 @@ $$\min_{\delta Q}\ \tfrac12\,\delta Q^{\!\top}P\,\delta Q+q^{\!\top}\delta Q
     effector to its anchor at per-frame weight; foot-flat (`Jr · err_rot`, weight
     `foot_flat_w = 3.0`) on planted foot frames; fist-down (weight `fist_w = 0.8`) while a
     hand is in contact.
+  - *On-floor / coplanar* (`--floor-weight`, pipeline `FLOOR_WEIGHT = 200`): on planted foot
+    frames, one scalar row per **sole corner** site (4 per foot) drives that corner's world Z
+    to a shared floor height `z_f`,
+
+    $$w_f\,\big\|\,J^{z}_{c}\,\delta q_t - (z_f - z_c)\,\big\|^2,\qquad
+      J^{z}_{c}= \text{row 2 of } \texttt{mj\_jacSite}(c)\big|_{\text{act}},$$
+
+    where `z_c` is the corner's current world Z. Driving all four corners of both feet to the
+    *same* `z_f` gives **on-floor + flat + inter-foot coplanarity** from one row type. `z_f`
+    (`--floor-mode estimate`) is the **median of the two feet's** warm-start ground heights
+    (median over each foot's planted frames of its min-corner Z) — both feet share the
+    correction, because Stage B holds the **root fixed** and leg-only articulation saturates at
+    ~3 cm if one foot must travel the whole gap. On these frames the position pin drops to its
+    **X,Y** rows only (Eq. above owns Z, so the two do not fight). This is a *cleanup* of the
+    residual left by the Stage-3 coplanar targets (§5.6); together they take standup_02's final
+    sole gap 4.68 → 0.54 cm, at a cost of peak self-penetration 0.5 → ~1.4 cm.
 
 **Contact anchor = per-interval median.** Labelled contact intervals are *not* stationary
 plants (a foot/hand can reposition ~30 cm while staying labelled in-contact). So within
@@ -506,6 +567,47 @@ Stage-3 `contact_min_run` contact debounce, applied to the stillness split.
   `√λ_coll · j_sep · δq_t ≥ √λ_coll · min(pen, 0.05)` (`λ_coll = 5`), the actuated slice of
   the same separation Jacobian as Stage 3, re-linearised each outer iter.
 
+**How MuJoCo mesh geometry becomes a QP row (the mesh never enters the QP as geometry).** The
+fullmesh legs are dense convex-hull STL meshes, but the QP never sees a vertex or triangle. The
+mesh is consumed **outside** the solver, in one place: `_build_collision` sets `data.qpos = q_cur`
+and calls `mujoco.mj_forward`, which runs MuJoCo's full mesh-vs-mesh narrow-phase and collapses
+every colliding geom pair down to a short list of **contact points**. After that call the mesh has
+done its job and is never referenced again. Each contact `ct` is already reduced to three small
+quantities — a scalar signed distance `ct.dist`, a unit contact normal `ct.frame[:3]`, and a
+contact point `ct.pos` — regardless of how many triangles produced it. From these we build exactly
+one QP row:
+
+$$\text{pen}=\text{margin}-\texttt{ct.dist},\qquad
+j_{\text{sep}}=\hat n^{\!\top}\big(J_1^{p}-J_2^{p}\big)\big|_{\text{act}},\qquad
+J_{1,2}^{p}=\texttt{mj\_jac}(\texttt{ct.pos},\,b_{1,2}),$$
+
+with `n̂` signed to push `b1` off `b2`. The row `√λ_coll · j_sep · δq_t ≥ √λ_coll · min(pen, 0.05)`
+then carries **`j_sep` as the coefficients** (how each joint moves the gap along the normal) and
+**`pen` as the right-hand-side bound** (how much separation is owed) — pure numbers. Consequently
+the QP's collision block is `(number of active contact points) × (T·29)`, and mesh resolution
+affects **only** the cost of `mj_forward`, not the QP's size or conditioning: a 100k-triangle mesh
+and a coarse box that resolve to the same contact points produce byte-identical rows. Because the
+row is a first-order model valid only near `q_cur`, the SCA loop below re-queries the mesh
+(re-runs `mj_forward` + `_build_collision`) at each outer.
+
+**How the QP consumes those values (assembly into OSQP).** OSQP solves
+`min ½ δQ̃ᵀP δQ̃ + qᵀδQ̃  s.t.  l ≤ A δQ̃ ≤ u` over the augmented vector `δQ̃ = [δQ; s]` (§6.2
+soft-slack block). The MuJoCo-derived quantities map into the four matrices as follows, so the
+solver never needs geometry, only linear algebra:
+- **Tracking / contact / collision Jacobians (from `mj_jac`) → `P`, `q`, and `A`.** The tracking
+  and contact-pin Jacobians form the Gauss–Newton blocks `H_task` (into `P`) and the linear term
+  `q = g_track + g_contact` (the current FK errors). The separation Jacobians `j_sep` form the
+  collision rows of `A`.
+- **`pen` → the constraint bound `l`.** Each collision row's lower bound is `√λ_coll·min(pen,0.05)`;
+  its upper bound is `+∞` (one-sided — push apart, never pull together).
+- **Slack column → `P` penalty + `A` identity.** One slack `s_i` per collision row enters `A` as
+  `[√λ_coll·j_sep | +Iₘ]` (so `√λ_coll·j_sep·δq_t + s_i ≥ …`) and is penalised `ρ·s_iᵀs_i` in the
+  bottom-right `2ρIₘ` block of `P` (§6.2 soft-slack). OSQP drives `s_i→0` when the joints *can*
+  separate the bodies and pays the quadratic penalty when they cannot — which is what keeps the
+  problem feasible on the dense fullmesh legs.
+After the solve, `δQ = res.x[:N]` updates the pose (clamped to limits) and `s = res.x[N:]` is read
+back only as a diagnostic (how much penetration had to be relaxed).
+
 **Sequential Convex Approximation (SCA).** Collision (and contact/tracking) rows are only
 linear at the current point, so an outer loop re-linearises → assembles → solves with
 OSQP (`eps_abs = eps_rel = 1e-4`, `max_iter = 20000`, `polish=True`, warm-started across
@@ -531,15 +633,22 @@ The fix: **keep the best iterate across outers and return it**, seeded with the 
 start so Stage B is never worse than its own input. "Best" is a slip-aware lexicographic score
 computed on the full trajectory after each accepted outer:
 
-$$\text{score}(q)=\Big(\underbrace{\max(0,\ \text{pen}_{\max}-\tau)}_{\text{hard: real penetration}},\ \ \underbrace{\text{pen}_{\max}+\text{slip}_{\max}}_{\text{tie-break: total drift}},\ \ \text{coll\%}\Big),\qquad \tau=1\ \text{cm},$$
+$$\text{score}(q)=\Big(\underbrace{\max(0,\ \text{pen}_{\max}-\tau)}_{\text{hard: real penetration}},\ \ \underbrace{\text{slip}_{\max}+\text{floorErr}_{\max}}_{\text{contact quality}},\ \ \text{pen}_{\max}+\text{slip}_{\max},\ \ \text{coll\%}\Big),$$
 
-compared lexicographically (smaller wins). The first term makes any penetration beyond
-`τ = 1 cm` a *hard* failure that is never traded away for slip; among iterates that are all
-under `τ`, the second term picks the one with the least combined penetration + plant slip.
-Without the slip term a pure-penetration argmin would silently ship a collision-clean iterate
-that had pushed a foot off its plant (the pins-×4 change makes that trade real). This makes
-Stage B parity-immune and monotone-non-worsening in the score, and the two changes compose:
-`stage_b` returns `best_qpos`, not the last `qpos_cur`.
+with `τ = 1 cm`, **or `τ = 2 cm` when the on-floor rows are active** (pressing a floating foot
+onto the floor costs ~1.5 cm of extra self-penetration as the leg extends, so a 1 cm gate would
+reject every floor-improving iterate). Compared lexicographically (smaller wins). The first term
+makes penetration beyond `τ` a *hard* failure never traded for contact quality. Below the gate the
+second term minimises total contact error = horizontal plant slip + vertical foot-off-floor
+(`floorErr` = max `|z_c − z_f|` over planted sole corners). `floorErr` is **essential once the
+on-floor rows exist**: without it every floor-improving iterate scores *worse* (it nudges `pen` up
+and earns no credit for the foot reaching the floor), so keep-best would ship the feet-apart warm
+start. Two coupled details: **plant slip is measured horizontally for feet** (`d[:2]`) — the
+deliberate vertical foot motion toward `z_f` is the correction, not slip, and scoring it as slip
+would again reject the fix; and without the slip term a pure-penetration argmin would silently ship
+a collision-clean iterate that had pushed a foot off its plant (the pins-×4 change makes that trade
+real). This makes Stage B parity-immune and monotone-non-worsening in the score; `stage_b` returns
+`best_qpos`, not the last `qpos_cur`.
 
 **Soft-slack self-collision (always on).** The dense convex-hull legs of the fullmesh body
 make **hard** collision inequalities primal-infeasible (row count explodes, e.g. 424 vs
@@ -624,15 +733,25 @@ needed). Primitives use closed-form lowest-extent formulas rather than bounding 
 - Box: `center_z − |R_{20}|h_x − |R_{21}|h_y − |R_{22}|h_z` (support function).
 - Cylinder: `min(center_z ± axis_z·half_len) − r·√(1 − axis_z²)`.
 
-Only floor/worldbody geoms (`bodyid = 0`) and non-colliding geoms are excluded. Two modes:
+Only floor/worldbody geoms (`bodyid = 0`) and non-colliding geoms are excluded. Three modes:
 
-- **`perframe`** (shipped default in `run_globalopt_all.sh`): `Δ(t) = −z_min(t)`, planting
-  every frame; the shift series is lightly de-jittered by an implicit tridiagonal smoother
-  `(I + wL)y = x` (`--smooth-shift 5`). Correctly handles sit-to-stand — the seat is
-  planted while sitting, the feet once standing, since `z_min` tracks whichever is lowest.
-- **`constant`** (script default): a single `Δ = −percentile_p(z_min(t))` for the whole
-  clip, preserving all vertical motion but leaving the body above the floor except at its
-  lowest moments.
+- **`constant-contact`** (shipped default): a **single** `Δ` for the whole clip, registered to
+  the **planted feet** rather than the global-lowest geom. Sample each foot's min sole-corner Z
+  on every frame where that foot is `contact_flags`-labelled, and set `Δ = −\text{median}` of
+  those samples (`--contact-percentile 50`). A single `Δ` adds **zero** vertical wander (no
+  bobbing); keying it to the feet keeps them on the floor. The **median** (not a low percentile)
+  targets the stable *stance* — a low percentile would latch onto the brief touchdown transient
+  (a heel-strike corner dips several cm) and float the whole standing phase. Falls back to
+  `constant` if there are no foot-contact frames / sole sites. This is the mode that resolves the
+  RDX bobbing: perframe's per-frame `Δ(t)` wanders 7–9 cm on a get-up (the lowest point migrates
+  hands→knees→feet), and it can only work *because* the feet were made coplanar upstream (§5.6,
+  §6.2) — a 1-DOF shift cannot co-plant two non-coplanar feet.
+- **`perframe`**: `Δ(t) = −z_min(t)`, planting whatever is lowest every frame; the shift series
+  is de-jittered by an implicit tridiagonal smoother `(I + wL)y = x` (`--smooth-shift`). Plants
+  the feet but the per-frame shift wanders on get-ups (= bobbing in a fixed world frame).
+- **`constant`**: a single `Δ = −percentile_p(z_min(t))` over **any** geom — zero wander, but
+  grounds on whatever is globally lowest (early hands/knees on a get-up → the final feet float,
+  +9.8 cm on standup_02). Superseded by `constant-contact`.
 
 `qpos[:,2] ← qpos[:,2] + Δ`. The pre-grounding trajectory is kept as `qpos_ungrounded`;
 `ground_shift`, `ground_lowest_before/after` are saved.
@@ -684,13 +803,17 @@ impossible for Alex to reproduce flat-footed; §5.5 makes the knee target feasib
   expected to absorb the dynamics gap. The pipeline's job is to hand RL a trajectory with
   *no kinematic impossibilities* (no self-penetration, no over-limit joints, exact
   contacts), which RL cannot fix on its own.
-- **Keep-best-iterate caps penetration; pins ×4 trade shallow grazing for less slip.**
-  With the slip-aware keep-best (§6.2, `τ = 1 cm`), the shipped Stage-B **peak penetration
-  is ≤ 0.88 cm on all 18 clips** — no real self-penetration anywhere. The pins-×4 rebalance
-  reduces plant slip on get-ups (e.g. `standup_side_04` 10.4 → 6.3 cm) at the cost of some
-  *shallow, sub-1 cm* grazing frames (`coll%` rises to 4–38% on get-up clips, but every one
-  of those contacts is < 1 cm deep). This is the deliberate trade: a sub-centimetre graze is
-  within the robot's collision margin and learnable; deep penetration is physically
+- **Keep-best-iterate caps penetration; pins ×4 trade shallow grazing for less slip;
+  coplanar + on-floor rows add ~1 cm of self-penetration on get-ups.** With the slip-aware
+  keep-best (§6.2, `τ = 2 cm` when floor rows active), the shipped Stage-B **peak penetration
+  is ≤ 1.86 cm on all 18 clips** (`kneelingFall_02` 1.86, `standup_side_04` 1.61,
+  `standupFromKneeling_02` 1.46, `standup_02` 1.43; the shovels stay 0.00). This is up from the
+  pre-coplanar ≤ 0.88 cm: pulling the two feet coplanar (§5.6) and driving the soles onto a
+  shared floor plane (§6.2) extends the get-up legs, so the shipped iterate carries ~1 cm more
+  grazing in exchange for planted, coplanar feet. The pins-×4 rebalance reduces plant slip on
+  get-ups (e.g. `standup_side_04` 10.4 → 6.3 cm) at the cost of *shallow, ≈1–2 cm* grazing
+  frames (`coll%` rises to 4–38% on get-up clips). This is the deliberate trade: a low-cm graze
+  is within the robot's collision margin and learnable; deep penetration is physically
   impossible and poisons physics-RL, so the `τ` gate never trades it away.
 - **Residual get-up "flat-snap".** On some get-ups the foot still snaps toward flat near
   touchdown; this is partly faithful (the human foot does flatten) and partly the hard
@@ -698,11 +821,22 @@ impossible for Alex to reproduce flat-footed; §5.5 makes the knee target feasib
   human tilt, not error.
 - **Contacts are high-weight soft, not exact.** Plant slip is ≈1.0–1.5 cm on shovels,
   higher on dynamic get-ups; the median-anchor Stage B reduces but does not zero it.
-- **Measured (native-120 batch, Stage B).** Velocity spikes 0 and peak self-penetration
-  ≤ 0.88 cm on **every** clip. Shovels: plant slip 2.0–3.3 cm, foot-flat ~0.1°, 0% collision.
-  Squat / kneeling-fall: 0% collision, slip 4.0 / 7.1 / (kneelingFall_03) cm. Standups &
-  get-ups: slip 3.0–9.8 cm with shallow (< 1 cm, within-margin) grazing 4–28% on the harder
-  get-ups (standupKnees_02, standupFromKneeling_02).
+- **Measured (native-120 coplanar batch, 2026-07-06, Stage B + grounding).** ok=18 fail=0,
+  velocity spikes 0. Peak self-penetration ≤ 1.86 cm (kneelingFall_02); shovels + squat 0.00 cm.
+  **Feet planted:** on the seven standup / get-up clips both feet finish within **≈0.6 cm** of
+  the floor with the coplanar pair split ≤ 0.6 cm (e.g. standup_02 L 0.60 / R 0.06 cm,
+  standup_side_05 0.66 / −0.05 cm) — the RDX floating-foot symptom is gone. Shovels finish
+  −0.1 to −1.6 cm (slightly sunk, within margin). Note the large Stage-B `floor_err` printed on
+  the natural / side / slideHandsBack get-ups (13–16 cm) is a **max-over-all-planted-frames**
+  artefact from early high-plant frames (foot contact-labelled while still up in a seated / side
+  start), **not** the final stance — the measured final gaps above are the honest number.
+- **Fall clips penetrate the floor plane at the end (constant-contact limit).** `kneelingFall_02`
+  ends with the left foot **−11 cm** and `kneelingFall_03` the right foot **−15.8 cm** below the
+  grounded floor. These clips finish in a collapsed / non-standing pose where a late foot is a
+  free (non-contact) limb, and the single `constant-contact` shift is keyed to the planted-foot
+  median, so it cannot hold a late swinging foot above the plane. Old per-frame grounding avoided
+  this (but bobbed on standups — the trade §7 accepts). Fall clips are a separate regime; if their
+  floor-through matters, they want per-frame or a hybrid grounding, not the standup default.
 - **Plant-slip outliers are usually a metric phantom, not real slip.** `standup_side_05`
   reported 14.7 cm; a per-effector dig showed it was **entirely** the right hand and
   **entirely** 25 single-frame "plants" (velocity zero-crossings while the hand lifts off) —
@@ -726,8 +860,9 @@ impossible for Alex to reproduce flat-footed; §5.5 makes the knee target feasib
 4. **Whole-body (including floating-base) global smoothing** — closed-form tridiagonal
    Stage A plus a **contact-aware sparse QP Stage B** with median-anchored plants and
    **soft-slack self-collision** that stays feasible on the dense fullmesh body.
-5. **Mesh-exact vertical grounding** that plants whichever geom is lowest (seat, knee,
-   or foot) each frame.
+5. **Mesh-exact vertical grounding** — a single contact-aware shift registered to the
+   planted feet (`constant-contact`), enabled by the coplanar-feet targets + on-floor rows
+   upstream; no per-frame wander, feet stay on the floor.
 
 Together these produce contact-faithful, temporally smooth, floor-planted, self-collision-
 free motion on Alex V2, suitable as reference motion for imitation / physics-RL.
