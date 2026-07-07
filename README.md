@@ -5,7 +5,8 @@ A human clip is converted to a canonical skeleton, solved onto Alex with per-fra
 feet/hands planted on their real contacts, then globally smoothed and grounded into a physics-RL-ready
 `qpos` trajectory. Kinematic retargeting only — no dynamics; downstream RL supplies torques.
 
-For the full method and all the mathematics, see **[METHOD.md](METHOD.md)**.
+For the full method and all the mathematics, see **[METHOD.md](METHOD.md)**. For every pipeline knob —
+default, what it trades off, when to touch it — see **[PARAMETERS.md](PARAMETERS.md)**.
 
 ## What you get after cloning
 
@@ -69,8 +70,9 @@ python scripts/build_canonical_orientation_frames_fresh.py \
 ```
 The Stage-4 solver defaults to the single canonical model with always-on soft self-collision — no
 model/flag knobs needed. Useful env overrides (all optional):
-`LAMBDA_SMOOTH=20`, `N_OUTER=3`, `GROUND_MODE=perframe`, `RENDER_MESH=visual|collision|<path>`,
-`RENDER_DIR=...`, `GO_DIR=...`, `GR_DIR=...`, `RENDER_EXTRA="--fixed-cam --no-human"`.
+`LAMBDA_SMOOTH=320`, `N_OUTER=6`, `GROUND_MODE=constant-contact`, `RENDER_MESH=visual|collision|<path>`,
+`RENDER_DIR=...`, `GO_DIR=...`, `GR_DIR=...`, `RENDER_EXTRA="--fixed-cam --no-human"`. Full list with
+defaults and trade-offs: **[PARAMETERS.md](PARAMETERS.md)**.
 
 Outputs per clip: `outputs/contactfirst/<clip>_contactfirst.npz`,
 `outputs/global_opt_contactfirst/<clip>_global_opt.npz`,

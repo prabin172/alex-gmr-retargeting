@@ -120,11 +120,18 @@ CLIPS=(
   "standupSquatCrouch_01|PrabinRef_StandupSquatCrouch_01_with_orient.npz||"
   "kneelingFall_02|PrabinRef_KneelingFall_02_with_orient.npz||"
   "kneelingFall_03|PrabinRef_KneelingFall_03_with_orient.npz||"
+  "luigi_standProne_03|luigi_standProne_03_with_orient.npz||"
+  "luigi_standSupine_08|luigi_standSupine_08_with_orient.npz||"
 )
+
+# Optional substring filter on the clip NAME: run only clips whose name contains
+# CLIPS_MATCH (empty = all). E.g. CLIPS_MATCH=luigi bash retargetingPipeline.sh.
+CLIPS_MATCH="${CLIPS_MATCH:-}"
 
 ok=0; fail=0
 for entry in "${CLIPS[@]}"; do
   IFS='|' read -r name infile solve_extra go_extra <<< "$entry"
+  if [[ -n "$CLIPS_MATCH" && "$name" != *"$CLIPS_MATCH"* ]]; then continue; fi
   src="$IN/$infile"
   cf="$CF/${name}_contactfirst.npz"
   go="$GO/${name}_global_opt.npz"
