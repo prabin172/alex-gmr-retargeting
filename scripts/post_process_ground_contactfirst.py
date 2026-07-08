@@ -53,9 +53,23 @@ SOLE_CORNER_SITES = {
 }
 
 
-def _planted_foot_sole_samples(model, data, qpos, contact_flags, eff_names):
-    """Per-frame min sole-corner Z of each foot on frames where that foot is
-    contact-labelled → the set of heights the planted feet actually rest at.
+def _planted_foot_sole_samples(model, data, qpos, contact_flags, eff_names,
+                               fps=120.0, still_speed=0.05):
+    """Per-frame min sole-corner Z of each foot on frames where that foot is a
+    STILL plant → the set of heights the planted feet actually rest at.
+
+    A foot is a still plant when it is contact-labelled AND its body is moving
+    slower than `still_speed` (m/s). This MUST match the Stage-4 solve's plant
+    definition (`_compute_anchors` splits contact intervals into stationary
+    sub-segments at the same speed and only *those* get the on-floor rows). The
+    grounding previously keyed on raw `contact_flags`, which also include the
+    MOVING approach/transition frames (e.g. a foot descending through a get-up, or
+    a supine-phase touch during standSupine): those sit several cm off the true
+    stance ground, so registering on them drags the shift and floats the actual
+    stance. Filtering to still frames registers on the same ground the solve
+    planted. Per foot: falls back to all contact-labelled frames if it has no
+    still frames (never drop a foot's samples entirely).
+
     Returns a flat array (empty if no foot contacts / sole sites resolve)."""
     foot_sites = {}
     for eff, names in SOLE_CORNER_SITES.items():
@@ -67,15 +81,30 @@ def _planted_foot_sole_samples(model, data, qpos, contact_flags, eff_names):
             foot_sites[eff_names.index(eff)] = ids
     if not foot_sites or contact_flags is None:
         return np.array([])
-    samples = []
-    for t in range(qpos.shape[0]):
-        cols = [c for c, ids in foot_sites.items() if contact_flags[t, c]]
-        if not cols:
-            continue
+
+    # Per-foot body speed (m/s) from the sole sites' shared body position.
+    T = qpos.shape[0]
+    body_pos = {c: np.zeros((T, 3)) for c in foot_sites}
+    min_z = {c: np.zeros(T) for c in foot_sites}
+    for t in range(T):
         data.qpos[:] = qpos[t]
         mujoco.mj_forward(model, data)
-        for c in cols:
-            samples.append(min(float(data.site_xpos[s][2]) for s in foot_sites[c]))
+        for c, ids in foot_sites.items():
+            body_pos[c][t] = data.xpos[int(model.site_bodyid[ids[0]])]
+            min_z[c][t] = min(float(data.site_xpos[s][2]) for s in ids)
+    speed = {}
+    for c, p in body_pos.items():
+        v = np.zeros(T)
+        v[1:] = np.linalg.norm(np.diff(p, axis=0), axis=1) * fps
+        v[0] = v[1] if T > 1 else 0.0
+        speed[c] = v
+
+    samples = []
+    for c in foot_sites:
+        labelled = contact_flags[:, c]
+        still = labelled & (speed[c] < still_speed)
+        use = still if still.any() else labelled     # per-foot fallback: keep some samples
+        samples.extend(min_z[c][use].tolist())
     return np.asarray(samples)
 
 
@@ -179,6 +208,12 @@ def main():
                          "percentile there would leave the whole standing phase floating).")
     ap.add_argument("--smooth-shift", type=float, default=0.0,
                     help="perframe mode: tridiagonal smoothing weight on the shift series (0 = off).")
+    ap.add_argument("--still-speed", type=float, default=0.05,
+                    help="constant-contact: a contact-labelled foot only anchors the floor registration "
+                         "on frames where its body moves slower than this (m/s) — the STILL-plant "
+                         "definition, matching the Stage-4 solve. Excludes moving approach/transition "
+                         "contacts (get-up descents, supine touches) that otherwise drag the shift and "
+                         "float the true stance. (default: 0.05, = the solver's plant-speed)")
     args = ap.parse_args()
 
     model = mujoco.MjModel.from_xml_path(str(args.model))
@@ -205,7 +240,9 @@ def main():
             if "contact_effector_names" in data_dict else []
         cflags = np.asarray(data_dict["contact_flags"], dtype=bool) \
             if "contact_flags" in data_dict else None
-        samples = _planted_foot_sole_samples(model, data, qpos, cflags, eff_names)
+        gfps = float(data_dict["fps"]) if "fps" in data_dict else 120.0
+        samples = _planted_foot_sole_samples(model, data, qpos, cflags, eff_names,
+                                             fps=gfps, still_speed=args.still_speed)
         if samples.size:
             floor = float(np.percentile(samples, args.contact_percentile))
             floor_src = f"planted-foot-sole p{args.contact_percentile:g} (n={samples.size})"
