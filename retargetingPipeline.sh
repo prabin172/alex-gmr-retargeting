@@ -81,6 +81,7 @@ case "$RENDER_MESH" in
 esac
 IN=outputs/canonical_human/fbx_fresh
 CF=outputs/contactfirst
+mkdir -p "$IN"
 GO="${GO_DIR:-outputs/global_opt_contactfirst}"
 GR="${GR_DIR:-outputs/grounded_contactfirst}"
 RD="${RENDER_DIR:-outputs/renders/contactfirst}"
@@ -97,31 +98,30 @@ mkdir -p "$CF" "$GO" "$GR" "$RD" "$IH"
 [ "$EXPORT_50HZ" = "1" ] && mkdir -p "$IH50"
 echo "Render mesh: $RENDER_MESH -> $RMODEL   |  ground: $GROUND_MODE (smooth=$GROUND_SMOOTH)"
 
-# clip name  ->  canonical *_with_orient.npz input (one per clip; variants deduped)
-# Optional 3rd field: extra contact-first SOLVER flags. 4th: extra GLOBALOPT
-# flags. BOTH EMPTY by design — one retargeter config for all actions; the
-# fields exist for experiments only.
+# clip name  ->  source FBX path (stages 1-2 produce the canonical NPZ + with_orient NPZ).
+# Optional 3rd field: extra contact-first SOLVER flags. 4th: extra GLOBALOPT flags.
+# BOTH EMPTY by design — one retargeter config for all actions; the fields exist for experiments only.
 CLIPS=(
-  "standup_01|standup_01_with_orient.npz||"
-  "standup_02|standup_02_canonical_human_fresh_with_orient.npz||"
-  "standup_natural_01|standup_natural_01_with_orient.npz||"
-  "standup_natural_02|standup_natural_02_with_orient.npz||"
-  "standup_side_04|standup_side_04_with_orient.npz||"
-  "standup_side_05|standup_side_05_with_orient.npz||"
-  "standup_slideHandsBack_03|standup_slideHandsBack_03_with_orient.npz||"
-  "shovel_fronthard_02|PrabinRef_Shovel_FrontHard_02_with_orient.npz||"
-  "shovel_leftbucket_02|PrabinRef_Shovel_LeftBucket_02_with_orient.npz||"
-  "shovel_lefthard_01|PrabinRef_Shovel_LeftHard_01_with_orient.npz||"
-  "shovel_rightbucket_01|PrabinRef_Shovel_RightBucket_01_with_orient.npz||"
-  "shovel_righthard_01|PrabinRef_Shovel_RightHard_01_with_orient.npz||"
-  "standupFromKneeling_01|PrabinRef_STandupFromKneeling_01_with_orient.npz||"
-  "standupFromKneeling_02|PrabinRef_STandupFromKneeling_02_with_orient.npz||"
-  "standupKnees_02|PrabinRef_StandupKnees_02_with_orient.npz||"
-  "standupSquatCrouch_01|PrabinRef_StandupSquatCrouch_01_with_orient.npz||"
-  "kneelingFall_02|PrabinRef_KneelingFall_02_with_orient.npz||"
-  "kneelingFall_03|PrabinRef_KneelingFall_03_with_orient.npz||"
-  "luigi_standProne_03|luigi_standProne_03_with_orient.npz|--contact-preroll 0 --contact-on-speed-frac 0.25 --contact-onset-max-delay 0.35|"
-  "luigi_standSupine_08|luigi_standSupine_08_with_orient.npz||"
+  "standup_01|data/raw/inhouse/get_up_from_ground/fbx/standup_01.fbx||"
+  "standup_02|data/raw/inhouse/get_up_from_ground/fbx/standup_02.fbx||"
+  "standup_natural_01|data/raw/inhouse/get_up_from_ground/fbx/standup_natural_01.fbx||"
+  "standup_natural_02|data/raw/inhouse/get_up_from_ground/fbx/standup_natural_02.fbx||"
+  "standup_side_04|data/raw/inhouse/get_up_from_ground/fbx/standup_side_04.fbx||"
+  "standup_side_05|data/raw/inhouse/get_up_from_ground/fbx/standup_side_05.fbx||"
+  "standup_slideHandsBack_03|data/raw/inhouse/get_up_from_ground/fbx/standup_slideHandsBack_03.fbx||"
+  "shovel_fronthard_02|data/raw/inhouse/shoveling/PrabinRef_Shovel_FrontHard_02.fbx||"
+  "shovel_leftbucket_02|data/raw/inhouse/shoveling/PrabinRef_Shovel_LeftBucket_02.fbx||"
+  "shovel_lefthard_01|data/raw/inhouse/shoveling/PrabinRef_Shovel_LeftHard_01.fbx||"
+  "shovel_rightbucket_01|data/raw/inhouse/shoveling/PrabinRef_Shovel_RightBucket_01.fbx||"
+  "shovel_righthard_01|data/raw/inhouse/shoveling/PrabinRef_Shovel_RightHard_01.fbx||"
+  "standupFromKneeling_01|data/raw/inhouse/standFromKnees/PrabinRef_STandupFromKneeling_01.fbx||"
+  "standupFromKneeling_02|data/raw/inhouse/standFromKnees/PrabinRef_STandupFromKneeling_02.fbx||"
+  "standupKnees_02|data/raw/inhouse/standFromKnees/PrabinRef_StandupKnees_02.fbx||"
+  "standupSquatCrouch_01|data/raw/inhouse/crouchStand/PrabinRef_StandupSquatCrouch_01.fbx||"
+  "kneelingFall_02|data/raw/inhouse/KneelingFall/PrabinRef_KneelingFall_02.fbx||"
+  "kneelingFall_03|data/raw/inhouse/KneelingFall/PrabinRef_KneelingFall_03.fbx||"
+  "luigi_standProne_03|data/raw/inhouse/LuigiStand/LuigiRef_StandProne_03.fbx|--contact-preroll 0 --contact-on-speed-frac 0.25 --contact-onset-max-delay 0.35|"
+  "luigi_standSupine_08|data/raw/inhouse/LuigiStand/LuigiRef_StandSupine_08.fbx||"
 )
 
 # Optional substring filter on the clip NAME: run only clips whose name contains
@@ -130,16 +130,33 @@ CLIPS_MATCH="${CLIPS_MATCH:-}"
 
 ok=0; fail=0
 for entry in "${CLIPS[@]}"; do
-  IFS='|' read -r name infile solve_extra go_extra <<< "$entry"
+  IFS='|' read -r name fbx solve_extra go_extra <<< "$entry"
   if [[ -n "$CLIPS_MATCH" && "$name" != *"$CLIPS_MATCH"* ]]; then continue; fi
-  src="$IN/$infile"
+  can="$IN/${name}_canonical_human.npz"
+  src="$IN/${name}_with_orient.npz"
   cf="$CF/${name}_contactfirst.npz"
   go="$GO/${name}_global_opt.npz"
   gr="$GR/${name}_grounded.npz"
   mp4="$RD/${name}_globalopt.mp4"
   echo "======================================================================"
-  echo ">>> $name   ($infile)"
-  if [[ ! -f "$src" ]]; then echo "  [SKIP] missing input $src"; fail=$((fail+1)); continue; fi
+  echo ">>> $name   ($fbx)"
+
+  # Stage 1 — FBX → canonical human NPZ (Blender Python)
+  # Stage 2 — canonical NPZ → with_orient NPZ (pure Python)
+  # Both skipped if the with_orient output already exists.
+  if [[ -f "$src" ]]; then
+    echo "  [have] $src (stages 1-2 skipped)"
+  else
+    if [[ ! -f "$fbx" ]]; then echo "  [SKIP] missing FBX $fbx"; fail=$((fail+1)); continue; fi
+    echo "  [stage1] FBX -> canonical NPZ (Blender) ..."
+    blender --background --python scripts/build_fbx_canonical_human.py -- \
+      --fbx "$fbx" --out "$can" \
+      || { echo "  [FAIL] stage1 fbx->canonical"; fail=$((fail+1)); continue; }
+    echo "  [stage2] canonical NPZ -> with_orient ..."
+    python scripts/build_canonical_orientation_frames_fresh.py \
+      --in-npz "$can" --out-npz "$src" \
+      || { echo "  [FAIL] stage2 canonical->with_orient"; fail=$((fail+1)); continue; }
+  fi
 
   # Stage 3 — contact-first IK (only if missing)
   if [[ -f "$cf" ]]; then

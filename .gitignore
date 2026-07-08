@@ -52,6 +52,20 @@ assets/alex/*
 !assets/alex/.gitkeep
 
 # ==============================
+# Files removed from cleanedCopy branch — historical/legacy, not needed for pipeline
+# ==============================
+general_motion_retargeting/
+scripts/legacy/
+scripts/analyze_contact_flicker.py
+scripts/analyze_contact_slip_jumps.py
+scripts/analyze_foot_slip.py
+scripts/build_alex_v2_collision_model.py
+scripts/create_alex_mujoco_sites_model.py
+scripts/prepare_alex_floating_base_model.py
+scripts/prepare_alex_mujoco_assets.py
+scripts/visualization/render_fbx_kinematic_v2_alex_visual_mesh_gif.py
+
+# ==============================
 # Keep-local working docs (tracked history removed; kept on disk)
 # ==============================
 SESSION_HANDOFF.md
