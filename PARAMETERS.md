@@ -18,6 +18,25 @@ down, not a knob to set. See `wiki/concepts/design-philosophy.md` (settled — d
 
 ---
 
+## Stage 1 — FBX extraction (`build_fbx_canonical_human.py`, Blender)
+
+Reads the FBX armature and extracts world-space bone-head positions for the 21 canonical roles at every
+frame. Runs headless via `blender --background --python`. The pipeline passes `--fbx` and `--out`;
+the optional args below are for one-off manual runs.
+
+| Arg | Default | What it does |
+|---|---|---|
+| `--start-frame` / `--end-frame` | auto-detected from the action | Override the frame range. Auto-detection reads the FBX action range, which is more reliable than the Blender scene range (often stuck at 250). |
+| `--stride` | `1` | Extract every Nth frame. Leave at 1 — the contact-first solver expects native capture rate. |
+
+## Stage 2 — Orientation frames (`build_canonical_orientation_frames_fresh.py`, Python)
+
+Reads the canonical positions from stage 1, auto-corrects the actor's facing direction to `+X` (snapped
+to the nearest 90°), and computes per-part `SO(3)` semantic frames (pelvis, torso, head, feet, hands)
+from landmark geometry. No tunable knobs — the frame construction is deterministic.
+
+---
+
 ## Global / rate
 
 | Knob | Default | What it does | When to touch |
