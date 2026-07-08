@@ -15,18 +15,17 @@ are large and/or internal (see `.gitignore`). A fresh clone has the pipeline but
 so it will not run until you populate the local-only directories below.
 
 ```
-general_motion_retargeting/   library: morphology scaling, canonical source adapter, robot configs (in git)
-scripts/                      pipeline stages 1–5 (in git)
-scripts/legacy/               retired code — old worlddelta solver family, MVNX path, old renders (in git, not run)
+scripts/                      pipeline stages 1–6 (in git)
 scripts/visualization/        renderers (in git)
 METHOD.md                     full method + math (in git)
+PARAMETERS.md                 per-knob cheat-sheet (in git)
 CLAUDE.md                     repo conventions / agent instructions (in git)
+wiki/                         LLM-maintained knowledge base (see wiki/index.md)
 
 assets/alex/                  ROBOT MODEL — git-ignored, local only
-data/                         INPUT FBX + canonical NPZs — git-ignored, local only
+data/raw/                     INPUT FBX — git-ignored, local only
 outputs/                      ALL generated NPZs, renders, logs — git-ignored, local only
 SESSION_HANDOFF.md            current working state & decisions — git-ignored, kept on disk
-wiki/                         LLM-maintained knowledge base (see wiki/index.md)
 ```
 
 ### Git-ignored layout you must provide locally
@@ -52,32 +51,34 @@ Core deps: `mujoco`, `numpy`, `scipy`, `osqp`, `imageio` (+ ffmpeg). MuJoCo rend
 
 ## Running the pipeline
 
-Stages 1–2 are per-FBX (Blender + orientation frames); stages 3–5 are the batch.
+The full pipeline — FBX → canonical human → orientation frames → contact-first IK → GlobalOPT →
+grounding → render → IHMC JSON (stages 1–6) — is driven by a single script:
 
-**Stages 1–2** — FBX → canonical positions → semantic orientation frames (once per new clip):
-```bash
-blender --background --python scripts/build_fbx_canonical_human.py -- \
-  --fbx data/raw/inhouse/<action>/<clip>.fbx \
-  --out outputs/canonical_human/fbx_fresh/<clip>.npz
-python scripts/build_canonical_orientation_frames_fresh.py \
-  --in-npz  outputs/canonical_human/fbx_fresh/<clip>.npz \
-  --out-npz outputs/canonical_human/fbx_fresh/<clip>_with_orient.npz
-```
-
-**Stages 3–5** — contact-first IK → GlobalOPT → grounding → render, for every clip in the CLIPS list:
 ```bash
 ./retargetingPipeline.sh
 ```
-The Stage-4 solver defaults to the single canonical model with always-on soft self-collision — no
-model/flag knobs needed. Useful env overrides (all optional):
-`LAMBDA_SMOOTH=320`, `N_OUTER=6`, `GROUND_MODE=constant-contact`, `RENDER_MESH=visual|collision|<path>`,
-`RENDER_DIR=...`, `GO_DIR=...`, `GR_DIR=...`, `RENDER_EXTRA="--fixed-cam --no-human"`. Full list with
-defaults and trade-offs: **[PARAMETERS.md](PARAMETERS.md)**.
 
-Outputs per clip: `outputs/contactfirst/<clip>_contactfirst.npz`,
-`outputs/global_opt_contactfirst/<clip>_global_opt.npz`,
-`outputs/grounded_contactfirst/<clip>_grounded.npz`,
-`outputs/renders/contactfirst/<clip>_globalopt.mp4`.
+Add clips to the `CLIPS` array in the script (clip name + FBX path + optional per-clip solver flags).
+Stage 1 requires **Blender** (`blender` on PATH, 4.x); it runs headless (`--background`). Stages 2–6
+are plain Python.
+
+Outputs per clip:
+```
+outputs/canonical_human/fbx_fresh/<clip>_with_orient.npz   Stage 2 output / Stage 3 input
+outputs/contactfirst/<clip>_contactfirst.npz                Stage 3 output
+outputs/global_opt_contactfirst/<clip>_global_opt.npz       Stage 4 output
+outputs/grounded_contactfirst/<clip>_grounded.npz           Stage 4.5 output
+outputs/renders/contactfirst/<clip>_globalopt.mp4           Stage 5 output
+outputs/ihmcJsons-native120hz/<clip>.json                   Stage 6 output (native 120 Hz)
+outputs/ihmcJsons50hz/<clip>.json                           Stage 6b output (50 Hz, IHMC rate)
+```
+
+Stages 1–2 are skipped automatically if the `*_with_orient.npz` already exists (safe to re-run).
+Stage 3 is skipped if `*_contactfirst.npz` already exists. Stages 4–6 always re-run.
+
+Useful env overrides (all optional): `LAMBDA_SMOOTH=320`, `N_OUTER=6`, `GROUND_MODE=constant-contact`,
+`RENDER_MESH=visual|collision|<path>`, `RENDER=0` (skip render), `CLIPS_MATCH=<substring>` (run subset).
+Full list with defaults and trade-offs: **[PARAMETERS.md](PARAMETERS.md)**.
 
 ## Conventions
 

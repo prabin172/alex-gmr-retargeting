@@ -55,9 +55,10 @@ plant it on the floor.
 | 6   | IHMC JSON export      | grounded `q(t)` → IHMC replay JSON               | format conversion (native 120 Hz, no resample) | `export_alex_retarget_npz_to_ihmc_json.py`    |
 
 Intermediate representations are NumPy `.npz` at every stage boundary, so the pipeline
-is inspectable and resumable. The whole per-clip run (stages 3–6) is driven by
+is inspectable and resumable. The entire pipeline (stages 1–6) is driven by
 `retargetingPipeline.sh` with **one identical config for every action** (Attempted rule: a
-single retargeter, no per-clip tuning). Stages 1–2 run per new FBX by hand in Blender.
+single retargeter, no per-clip tuning). Stage 1 requires Blender on PATH and runs headless
+(`blender --background --python`); stages 2–6 are plain Python.
 
 ```
 FBX/MVNX ─▶ [1] canonical positions ─▶ [2] semantic orientation frames + facing yaw
