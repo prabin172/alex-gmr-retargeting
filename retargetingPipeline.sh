@@ -120,7 +120,7 @@ CLIPS=(
   "standupSquatCrouch_01|PrabinRef_StandupSquatCrouch_01_with_orient.npz||"
   "kneelingFall_02|PrabinRef_KneelingFall_02_with_orient.npz||"
   "kneelingFall_03|PrabinRef_KneelingFall_03_with_orient.npz||"
-  "luigi_standProne_03|luigi_standProne_03_with_orient.npz||"
+  "luigi_standProne_03|luigi_standProne_03_with_orient.npz|--contact-preroll 0 --contact-on-speed-frac 0.25 --contact-onset-max-delay 0.35|"
   "luigi_standSupine_08|luigi_standSupine_08_with_orient.npz||"
 )
 
