@@ -185,6 +185,7 @@ def detect_contacts_from_human(positions, role_to_idx, fps, *,
                                orientation_mats=None, ori_to_idx=None,
                                foot_height=0.07, hand_height=0.08,
                                speed_thresh=0.4, foot_flat_tilt=40.0, floor_pct=1.0,
+                               foot_flat_margin=6.0, foot_flat_min_base_frames=20,
                                on_height_frac=1.0, on_speed_frac=1.0,
                                onset_max_delay=0.15):
     """Per-frame ground-contact flags for each effector, from human mocap.
@@ -203,11 +204,21 @@ def detect_contacts_from_human(positions, role_to_idx, fps, *,
     genuine plant intervals on get-up clips). Release unchanged. 1.0/1.0 = off.
 
     For effectors with a `flat_ori_role`, contact additionally requires the
-    *human* segment to be near-flat: its canonical frame local-Z (sole normal)
-    within `foot_flat_tilt` degrees of world +Z. This distinguishes a flat
-    plantar support from a foot that is merely near the floor while folded
-    (toes/side down during a get-up), where forcing the robot foot flat would
-    just fight position tracking.
+    *human* segment to be near-flat. This distinguishes a flat plantar support
+    from a foot that is merely near the floor while folded (toes/side down during
+    a get-up), where forcing the robot foot flat would just fight tracking.
+
+    IMPORTANT — the flatness gate is RELATIVE to a per-foot self-calibrated
+    baseline, not absolute. The canonical foot frame's local-Z is NOT the true
+    sole normal: `x = toe−ankle` is the foot's bone axis, declined ~18° below
+    horizontal (ankle sits above the grounded toe), so a perfectly FLAT foot reads
+    ~18° tilt (+ a ~4° L/R skew) — pure frame geometry, not motion (see
+    wiki/concepts/orientation-frames.md FOOTGUN). Gating raw `tilt < 40°` is
+    therefore nearly inert. Instead we estimate each foot's own flat baseline as
+    the p15 of its tilt over height+speed candidate-contact frames (robust to the
+    tilted phantoms in the tail), and require `tilt − baseline < foot_flat_margin`.
+    Falls back to the absolute `tilt < foot_flat_tilt` cap if a foot has fewer
+    than `foot_flat_min_base_frames` candidate frames (baseline unreliable).
 
     Returns: (dict effector -> bool array (N,), floor_z).
     """
@@ -244,9 +255,17 @@ def detect_contacts_from_human(positions, role_to_idx, fps, *,
         flat_role = cfg.get("flat_ori_role")
         if flat_role is not None and orientation_mats is not None and ori_to_idx is not None \
                 and flat_role in ori_to_idx:
-            up = orientation_mats[:, ori_to_idx[flat_role], :, 2]  # local-Z (sole normal)
+            up = orientation_mats[:, ori_to_idx[flat_role], :, 2]  # frame local-Z (NOT true sole normal)
             tilt = np.degrees(np.arccos(np.clip(np.abs(up @ np.array([0.0, 0.0, 1.0])), -1, 1)))
-            flag = flag & (tilt < foot_flat_tilt)
+            # Per-foot self-calibrated flat baseline from height+speed candidate frames
+            # (p15 = the foot's flattest ≈ its anatomical ~18° declination; robust to
+            # tilted phantoms which live in the upper tail). Gate on tilt-above-baseline.
+            cand = tilt[flag]
+            if cand.size >= foot_flat_min_base_frames:
+                base = float(np.percentile(cand, 15))
+                flag = flag & ((tilt - base) < foot_flat_margin)
+            else:
+                flag = flag & (tilt < foot_flat_tilt)   # too few candidates → absolute cap
 
         if on_height_frac < 1.0 or on_speed_frac < 1.0:
             strict = flag & (h < hthr * on_height_frac) & (spd < speed_thresh * on_speed_frac)
@@ -928,8 +947,15 @@ def main():
                     help="Cap (s) on the hysteresis onset delay: a plant that never passes the strict "
                          "gate is trimmed by at most this, never dropped (default: 0.15)")
     ap.add_argument("--foot-flat-tilt", type=float, default=40.0,
-                    help="Max tilt (deg) of the human foot sole-normal from vertical for a foot to count "
-                         "as a flat plantar support (default: 40)")
+                    help="FALLBACK absolute cap: max tilt (deg) of the human foot frame local-Z from "
+                         "vertical, used only when a foot has too few candidate frames to self-calibrate "
+                         "its baseline (default: 40)")
+    ap.add_argument("--foot-flat-margin", type=float, default=6.0,
+                    help="Primary flatness gate: a foot counts as a flat plantar support when its frame "
+                         "tilt is within this many deg ABOVE the foot's own self-calibrated flat baseline "
+                         "(p15 of its candidate-contact tilt). Corrects the ~18deg toe-ankle frame offset "
+                         "+ L/R skew that makes the raw --foot-flat-tilt gate nearly inert. Set at the "
+                         "corpus break (clean plants <3deg above baseline, phantoms >=6deg). (default: 6)")
     ap.add_argument("--foot-yaw-weight", type=float, default=1.5,
                     help="Weight for the foot heading (yaw) align during contact: drives the foot "
                          "forward axis to the HUMAN foot heading so the planted foot follows the "
@@ -1040,6 +1066,7 @@ def main():
         hand_height=args.hand_contact_height,
         speed_thresh=args.contact_speed,
         foot_flat_tilt=args.foot_flat_tilt,
+        foot_flat_margin=args.foot_flat_margin,
         on_height_frac=args.contact_on_height_frac,
         on_speed_frac=args.contact_on_speed_frac,
         onset_max_delay=args.contact_onset_max_delay,
