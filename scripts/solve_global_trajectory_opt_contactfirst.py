@@ -104,6 +104,37 @@ SOLE_CORNER_SITES = {
 # Shared helpers (from base GlobalOPT)
 # ---------------------------------------------------------------------------
 
+FLOOR_BODY_NAME = "floor_collider"
+FLOOR_GEOM_NAME = "floor_collider_geom"
+
+
+def _load_model_with_floor(model_path):
+    """Load the robot MJCF and inject a floor PLANE geom as a mocap body — in
+    memory only, never written back to the hand-maintained asset XML.
+
+    Mocap (not a normal welded/static body): a static child of worldbody has its
+    world position baked in at compile time (mj_forward does NOT re-derive it from
+    a post-compile `model.geom_pos` mutation — verified empirically, geom_xpos
+    stays frozen). A mocap body's position IS re-applied every mj_forward via
+    `data.mocap_pos`, and — unlike a free joint — adds zero DOFs, so `model.nv`/
+    `N_ACT`/`DV_ACT_SLICE` and `_get_joint_limits`'s njnt walk are unaffected.
+
+    No contype/conaffinity wiring needed: the asset XML sets none anywhere, so
+    MuJoCo defaults (1/1) apply — the floor geom collides with everything already.
+
+    Returns (model, data, floor_geom_id, floor_mocap_id)."""
+    spec = mujoco.MjSpec.from_file(str(model_path))
+    floor_body = spec.worldbody.add_body(name=FLOOR_BODY_NAME, mocap=True)
+    floor_body.add_geom(name=FLOOR_GEOM_NAME, type=mujoco.mjtGeom.mjGEOM_PLANE,
+                        size=[0, 0, 0.01], pos=[0, 0, 0])
+    model = spec.compile()
+    data = mujoco.MjData(model)
+    floor_gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, FLOOR_GEOM_NAME)
+    floor_bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, FLOOR_BODY_NAME)
+    floor_mocap_id = int(model.body_mocapid[floor_bid])
+    return model, data, floor_gid, floor_mocap_id
+
+
 def _within_k_hops(model, b1, b2, k):
     for b, other in [(b1, b2), (b2, b1)]:
         cur = b
@@ -132,6 +163,22 @@ def _get_joint_limits(model):
     return lo, hi
 
 
+def _actuated_joint_indices(model, names):
+    """Actuated-joint indices (0..N_ACT-1, same ordering as qpos[7:]) for the
+    given joint names. Mirrors `_get_joint_limits`'s free-joint-skipping walk."""
+    by_name = {}
+    act_idx = 0
+    for j in range(model.njnt):
+        if int(model.jnt_type[j]) == 0:
+            continue
+        jname = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, j)
+        by_name[jname] = act_idx
+        act_idx += 1
+        if act_idx == N_ACT:
+            break
+    return [by_name[n] for n in names if n in by_name]
+
+
 def _delta_stats(qpos):
     dq = np.abs(np.diff(qpos[:, 7:], axis=0))
     mpf = dq.max(axis=1)
@@ -139,7 +186,19 @@ def _delta_stats(qpos):
             "mean": float(mpf.mean()), "n_spikes_05": int((mpf > 0.5).sum())}
 
 
-def _collision_stats(model, data, qpos):
+def _collision_stats(model, data, qpos, floor_gid=None, count_floor=False):
+    """Self-collision penetration, plus robot-vs-floor penetration when
+    `count_floor=True` (the injected floor plane — see `_load_model_with_floor`).
+
+    `floor_gid` (when the model has one — always, once `_load_model_with_floor`
+    is used) is needed EITHER WAY: the floor body's id is never 0 (it's its own
+    mocap child of worldbody, not worldbody itself), so the old `b1==0 or b2==0`
+    self-collision exclusion does not catch it — a raw floor contact would
+    otherwise silently leak into "self-collision" counting regardless of
+    `count_floor`. So floor pairs are always recognized and either counted
+    (count_floor=True, no k-hop filter — floor is never anatomically adjacent to
+    a robot body) or excluded outright (count_floor=False, same as an ordinary
+    self-collision-irrelevant pair)."""
     pen = []
     for t in range(qpos.shape[0]):
         data.qpos[:] = qpos[t]
@@ -147,9 +206,14 @@ def _collision_stats(model, data, qpos):
         mx = 0.0
         for c in range(data.ncon):
             ct = data.contact[c]
-            b1 = int(model.geom_bodyid[ct.geom1]); b2 = int(model.geom_bodyid[ct.geom2])
-            if b1 == 0 or b2 == 0 or _within_k_hops(model, b1, b2, COLL_HOPS):
-                continue
+            is_floor = floor_gid is not None and (ct.geom1 == floor_gid or ct.geom2 == floor_gid)
+            if is_floor:
+                if not count_floor:
+                    continue
+            else:
+                b1 = int(model.geom_bodyid[ct.geom1]); b2 = int(model.geom_bodyid[ct.geom2])
+                if b1 == 0 or b2 == 0 or _within_k_hops(model, b1, b2, COLL_HOPS):
+                    continue
             if ct.dist < 0:
                 mx = max(mx, abs(float(ct.dist)))
         pen.append(mx)
@@ -321,6 +385,93 @@ def _estimate_floor_z(model, data, qpos_warm, planted, resolved):
     return float(np.median(per_foot)) if per_foot else None
 
 
+def _detect_floor_sensitive_frames(model, data, qpos, floor_gid, floor_z,
+                                   min_pen=0.015, min_run=8, pad=5):
+    """Boolean (T,) mask: SUSTAINED (>= min_run consecutive frames) floor
+    penetration deeper than `min_pen` (default 1.5cm), padded `pad` frames
+    either side.
+
+    Used to locally boost Stage A's tracking weight (see `stage_a`'s
+    `lambda_track_frames`) so its floor-blind smoothing doesn't erode a sharp
+    upstream floor correction (Stage 3's `floor_collision_rows`) by blending it
+    back toward uncorrected neighbours — measured regression on
+    luigi_standProne_03: a Stage-3-fixed 2.4cm violation came out of plain
+    Stage-A smoothing at 13.9cm, WORSE than the original 11.5cm baseline
+    (overshoot/ringing past a narrow local fix).
+
+    Two things this is deliberately NOT, both measured:
+    1. NOT proximity — a first version flagged "within 3cm of the floor"
+       (widening the floor geom's `margin` to make MuJoCo report near-misses).
+       A legitimately, correctly planted foot also sits within a few cm of the
+       floor for its entire stance (that's what "planted" means), so this
+       flagged 100% of frames on any clip with a standing/kneeling phase,
+       boosted λ_track everywhere, and defeated Stage A's actual job (spikes
+       came back: 0→7).
+    2. NOT bare dist<0 either — the infinite floor plane, compared against a
+       large multi-body mesh across an entire clip, showed SOME (typically
+       sub-cm) negative dist on effectively every frame (802/802 measured;
+       median -0.55cm) even where visible worst-case penetration was fine —
+       an inherent floor-vs-large-mesh artefact / floor_z estimate imprecision,
+       not something worth protecting. `min_pen` filters to genuinely
+       consequential violations only.
+    3. NOT a HARD on/off mask either — 41.8% of frames turned out to be
+       genuinely, sustainedly violating (measured: 5 runs, one 120 frames long
+       during the prone phase, one 95 frames long spanning the whole
+       swing-to-plant transition — this is wider than the originally-targeted
+       ~12-frame peak, min_run didn't shrink it). A hard step in λ_track at
+       each protected run's boundary creates a sharp weight discontinuity in
+       the banded system, which itself produced a kink (spikes 0->7,
+       max_dq up to 1.187 rad). Returns a CONTINUOUS weight in [0,1]
+       (1.0 = fully protected, cosine-ramped to 0.0 over `pad` frames at each
+       boundary) instead of a boolean mask, so the caller can blend λ_track
+       smoothly rather than switch it."""
+    T = qpos.shape[0]
+    data.mocap_pos[int(model.body_mocapid[int(model.geom_bodyid[floor_gid])])] = [0.0, 0.0, floor_z]
+    viol = np.zeros(T, dtype=bool)
+    for t in range(T):
+        data.qpos[:] = qpos[t]
+        mujoco.mj_forward(model, data)
+        for c in range(data.ncon):
+            ct = data.contact[c]
+            if (ct.geom1 == floor_gid or ct.geom2 == floor_gid) and ct.dist < -min_pen:
+                viol[t] = True
+                break
+
+    weight = np.zeros(T, dtype=np.float64)
+    if not viol.any():
+        return weight
+
+    # Runs shorter than min_run don't count as sustained (kept as plain
+    # (start, end) pairs, not a boolean mask, so each run's cosine ramp can be
+    # built independently below).
+    runs = []
+    k = 0
+    while k < T:
+        if not viol[k]:
+            k += 1
+            continue
+        j = k
+        while j < T and viol[j]:
+            j += 1
+        if (j - k) >= min_run:
+            runs.append((k, j))
+        k = j
+
+    # Raised-cosine ramp 0->1 over `pad` frames (excludes both endpoints, so
+    # frame `pad` steps before the run is ~0 and the run's own first frame is
+    # 1.0 — same shape family as Stage 3's ramp_envelope).
+    ramp = 0.5 - 0.5 * np.cos(np.linspace(0, np.pi, pad + 2))[1:-1]
+    for k, j in runs:
+        run_weight = np.zeros(T, dtype=np.float64)
+        run_weight[k:j] = 1.0
+        lo = max(0, k - pad)
+        run_weight[lo:k] = ramp[-(k - lo):] if k > lo else ramp[:0]
+        hi = min(T, j + pad)
+        run_weight[j:hi] = ramp[::-1][:hi - j]
+        weight = np.maximum(weight, run_weight)
+    return weight
+
+
 def _foot_floor_err_cm(model, data, qpos, planted, resolved, floor_z):
     """Max |sole-corner Z − floor_z| over planted foot frames (cm). Combined
     on-floor + coplanar residual — the quantity the floor rows drive to zero, and
@@ -388,30 +539,64 @@ def _smooth_channel(sig, ab, lambda_track):
 
 
 def stage_a(qpos_ik, lambda_track, lambda_smooth, q_lo, q_hi,
-            smooth_root=True, root_lambda_smooth=None):
+            smooth_root=True, root_lambda_smooth=None, lambda_track_frames=None):
     """Closed-form per-channel tridiagonal smoothing.
 
     Actuated joints (qpos[7:]) always smoothed. With smooth_root, the free-base
     root is ALSO smoothed — position (qpos[0:3]) with the same tridiagonal solver
     and the quaternion (qpos[3:7]) via hemisphere-aligned component smoothing +
     renormalise. Without this the root passes through jumpy (per-frame IK root has
-    ~3cm / 10deg per-frame pops that read as the whole body flicking)."""
+    ~3cm / 10deg per-frame pops that read as the whole body flicking).
+
+    `lambda_track_frames`: optional override of the scalar `lambda_track`,
+    either (T,) [uniform across joints+root, e.g. locally boosted at
+    floor-sensitive frames] or (T, N_ACT) [PER-JOINT — see below]. Purpose:
+    this global smoothing pass is otherwise floor-blind and can erode a sharp,
+    narrow correction (Stage 3's floor-avoidance term) by blending it back
+    toward its uncorrected neighbours — measured on luigi_standProne_03:
+    uniform λ_track let Stage A re-inflate a Stage-3-fixed 2.4cm floor
+    violation to 13.9cm, WORSE than the original 11.5cm (smoothing
+    overshoots/rings past a sharp local fix). The underlying banded solve
+    (`_banded_smoother`/`_smooth_channel`) already broadcasts array vs scalar
+    `lambda_track` with no other changes needed.
+
+    2D (T, N_ACT) exists because a flat per-frame boost also suppressed
+    smoothing on joints that have NOTHING to do with the floor violation —
+    measured: WRIST_Z (wrist roll, left deliberately unconstrained by the
+    fist-alignment IK term, which only pins the palm-normal axis) started
+    flipping once its smoothing was locally disabled too (spikes 0->6, all
+    WRIST_Z, cosmetically inert but a real regression against the "0 spikes"
+    invariant). Per-joint lets the caller protect only the floor-relevant
+    chain (legs, or whichever joints actually move to fix a violation) and
+    leave unrelated redundant DOFs fully smoothed. Root position uses the
+    per-frame MAX across joint columns (root height correlates with any
+    floor-relevant protection, whichever joint it came from)."""
     T = qpos_ik.shape[0]
-    ab = _banded_smoother(T, lambda_track, lambda_smooth)
+    if lambda_track_frames is None:
+        ltrack = lambda_track
+        ltrack_root = lambda_track
+    elif np.ndim(lambda_track_frames) == 2:
+        ltrack = lambda_track_frames               # (T, N_ACT), indexed per joint below
+        ltrack_root = lambda_track_frames.max(axis=1)
+    else:
+        ltrack = lambda_track_frames                # (T,), uniform
+        ltrack_root = lambda_track_frames
     out = qpos_ik.copy()
     for j in range(N_ACT):
-        out[:, 7 + j] = np.clip(_smooth_channel(qpos_ik[:, 7 + j], ab, lambda_track),
+        ltrack_j = ltrack[:, j] if np.ndim(ltrack) == 2 else ltrack
+        ab = _banded_smoother(T, ltrack_j, lambda_smooth)
+        out[:, 7 + j] = np.clip(_smooth_channel(qpos_ik[:, 7 + j], ab, ltrack_j),
                                 q_lo[j], q_hi[j])
     if smooth_root:
         rls = lambda_smooth if root_lambda_smooth is None else root_lambda_smooth
-        abr = _banded_smoother(T, lambda_track, rls)
+        abr = _banded_smoother(T, ltrack_root, rls)
         for j in range(3):                        # root position
-            out[:, j] = _smooth_channel(qpos_ik[:, j], abr, lambda_track)
+            out[:, j] = _smooth_channel(qpos_ik[:, j], abr, ltrack_root)
         Q = qpos_ik[:, 3:7].copy()                # root quaternion (wxyz)
         for t in range(1, T):                     # hemisphere continuity
             if np.dot(Q[t], Q[t - 1]) < 0:
                 Q[t] = -Q[t]
-        Qs = np.column_stack([_smooth_channel(Q[:, k], abr, lambda_track) for k in range(4)])
+        Qs = np.column_stack([_smooth_channel(Q[:, k], abr, ltrack_root) for k in range(4)])
         n = np.linalg.norm(Qs, axis=1, keepdims=True); n[n < 1e-9] = 1.0
         out[:, 3:7] = Qs / n
     return out
@@ -539,7 +724,21 @@ def _build_contact(qpos_warm, tgt, wgt, planted, resolved, model, data,
     return H_blocks, g
 
 
-def _build_collision(qpos_warm, model, data, lambda_coll):
+def _build_collision(qpos_warm, model, data, lambda_coll, floor_gid=None, count_floor=False):
+    """Self-collision rows (existing), plus robot-vs-floor rows when
+    `count_floor=True` — same contact-point/Jacobian/margin machinery, just the
+    floor plane (a mocap body, zero DOF) as one side of the pair instead of
+    another robot link. Floor pairs skip the k-hop adjacency filter (never
+    anatomically adjacent) and the floor's own Jacobian naturally comes out zero
+    (mocap has no joints), so `jsep` reduces to the robot side alone with no
+    special-casing.
+
+    `floor_gid` must be passed whenever the model has an injected floor (i.e.
+    always, once `_load_model_with_floor` is used) REGARDLESS of `count_floor`:
+    the floor body's id is never 0 (own mocap child of worldbody), so without
+    recognizing it explicitly a raw floor contact would silently fall through
+    the old `b1==0 or b2==0` exclusion and get added as a bogus self-collision
+    row. `count_floor=False` recognizes-and-excludes it instead."""
     T = qpos_warm.shape[0]
     nv = model.nv
     sqw = float(np.sqrt(lambda_coll))
@@ -550,8 +749,12 @@ def _build_collision(qpos_warm, model, data, lambda_coll):
         mujoco.mj_forward(model, data)
         for cc in range(data.ncon):
             ct = data.contact[cc]
+            is_floor = floor_gid is not None and (ct.geom1 == floor_gid or ct.geom2 == floor_gid)
             b1 = int(model.geom_bodyid[ct.geom1]); b2 = int(model.geom_bodyid[ct.geom2])
-            if b1 == 0 or b2 == 0 or _within_k_hops(model, b1, b2, COLL_HOPS):
+            if is_floor:
+                if not count_floor:
+                    continue
+            elif b1 == 0 or b2 == 0 or _within_k_hops(model, b1, b2, COLL_HOPS):
                 continue
             pen = COLL_MARGIN - float(ct.dist)
             if pen <= 0:
@@ -580,14 +783,22 @@ def stage_b(qpos_warm, target_positions, role_names, role_to_body, target_weight
             model, data, q_lo, q_hi,
             lambda_track, lambda_smooth, lambda_coll,
             foot_flat_w, fist_w, downweight_factor, n_outer, trust,
-            collision_penalty=1000.0, floor_z=None, floor_w=0.0):
+            collision_penalty=1000.0, floor_z=None, floor_w=0.0,
+            floor_gid=None, count_floor=False):
+    """`floor_gid`: the injected floor plane's geom id, ALWAYS passed once
+    `_load_model_with_floor` is used (needed to correctly recognize-and-exclude
+    floor contacts from self-collision, regardless of `count_floor` — see
+    `_build_collision`/`_collision_stats` docstrings). `count_floor`: the actual
+    --floor-collision on/off toggle — whether floor contacts become hard
+    QP rows + count toward penetration stats."""
     T = qpos_warm.shape[0]
     N = T * N_ACT
     q_warm_act = qpos_warm[:, 7:].reshape(-1)
     floor_info = (f" floor_w={floor_w} floor_z={floor_z:.4f}"
                   if floor_w > 0.0 and floor_z is not None else " floor=OFF")
+    floor_coll_info = f" floor_collision=ON(gid={floor_gid})" if count_floor else " floor_collision=OFF"
     print(f"  Stage B: T={T} variables={N} n_outer={n_outer} trust={trust} "
-          f"soft_collision=ON penalty={collision_penalty}{floor_info}")
+          f"soft_collision=ON penalty={collision_penalty}{floor_info}{floor_coll_info}")
 
     H_smooth = _build_smoothness_hessian(T, lambda_smooth)
     A_jl = sp.eye(N, format="csc")
@@ -612,11 +823,13 @@ def stage_b(qpos_warm, target_positions, role_names, role_to_body, target_weight
     #   2) pen + slip — among acceptable-penetration iterates, minimise total drift.
     # Penetration gate: sub-tol self-penetration is soft-collision slack noise and
     # never traded for contact quality. Pressing floating feet onto the floor costs
-    # ~1–1.5 cm of extra self-penetration (legs extend), so with floor rows ON the
-    # gate widens to 2 cm — else keep-best keeps the (feet-4.7cm-apart) warm start.
-    PEN_TOL = 2.0 if floor_w > 0.0 and floor_z is not None else 1.0
+    # ~1–1.5 cm of extra self-penetration (legs extend), so with floor rows OR the
+    # hard floor-collision constraint ON the gate widens to 2 cm — else keep-best
+    # keeps the (feet-4.7cm-apart / floor-clipping) warm start.
+    floor_active = (floor_w > 0.0 and floor_z is not None) or count_floor
+    PEN_TOL = 2.0 if floor_active else 1.0
     def _iter_score(q):
-        cs = _collision_stats(model, data, q)
+        cs = _collision_stats(model, data, q, floor_gid=floor_gid, count_floor=count_floor)
         ss = _contact_slip_stats(model, data, q, tgt, wgt, planted, resolved)
         pen = cs["max_pen_cm"]; slip = ss["plant_slip_max_cm"]
         ferr = _foot_floor_err_cm(model, data, q, planted, resolved,
@@ -646,7 +859,8 @@ def stage_b(qpos_warm, target_positions, role_names, role_to_body, target_weight
         jl_lo = np.maximum(jl_lo_abs, delta - trust)
         jl_hi = np.minimum(jl_hi_abs, delta + trust)
 
-        A_coll, l_coll, u_coll = _build_collision(qpos_cur, model, data, lambda_coll)
+        A_coll, l_coll, u_coll = _build_collision(qpos_cur, model, data, lambda_coll,
+                                                  floor_gid=floor_gid, count_floor=count_floor)
         n_coll_rows = 0 if A_coll is None else A_coll.shape[0]
 
         slack_info = ""
@@ -785,6 +999,14 @@ def main():
                          "grounding shift for absolute z=0); zero = drive soles to world "
                          "z=0 directly (grounding becomes a near no-op, but legs must "
                          "reach 0 from Stage-A root height).")
+    ap.add_argument("--floor-collision", choices=["on", "off"], default="on",
+                    help="Hard mesh-accurate robot-vs-floor collision (a plane geom "
+                         "injected in-memory, reusing the self-collision soft-slack QP "
+                         "machinery). Unlike --floor-weight (a soft pin, planted feet "
+                         "only), this stops ANY fullmesh geometry — swing feet, hands, "
+                         "a tilted toe mid-get-up — from passing through the floor. "
+                         "on = default; off to bisect/regression-check against the old "
+                         "behaviour.")
     args = ap.parse_args()
 
     z = np.load(args.ik_npz, allow_pickle=True)
@@ -800,8 +1022,7 @@ def main():
     contact_sites = meta.get("contact_pos_sites", {})
     target_weights = meta.get("target_weights", {r: 1.0 for r in role_names})
 
-    model = mujoco.MjModel.from_xml_path(str(args.model))
-    data = mujoco.MjData(model)
+    model, data, floor_gid, floor_mocap_id = _load_model_with_floor(args.model)
 
     role_to_body = {}
     for ri, role in enumerate(role_names):
@@ -833,28 +1054,88 @@ def main():
         for t in np.where(col)[0]:
             downweight_roles[t].add(role)
 
-    def all_stats(q):
-        return (_delta_stats(q), _collision_stats(model, data, q),
+    # floor_gid is passed to _collision_stats in EVERY call below, count_floor=False
+    # by default — this is required (not optional) once the model has an injected
+    # floor: without recognizing the floor geom explicitly, its contacts would
+    # silently leak into "self-collision" counting (its body id isn't 0, so the
+    # old bodyid==0 exclusion doesn't catch it). count_floor=True only once the
+    # floor plane has actually been positioned + enabled for Stage B, below.
+    def all_stats(q, count_floor=False):
+        return (_delta_stats(q), _collision_stats(model, data, q, floor_gid=floor_gid,
+                                                   count_floor=count_floor),
                 _tracking_stats(q, target_positions, role_to_body, role_names, model, data),
                 _contact_slip_stats(model, data, q, tgt, wgt, planted, resolved))
 
     print("\nComputing baseline stats...")
     s_ik = all_stats(qpos_ik)
 
+    # floor_z: needed for the soft on-floor pin (--floor-weight), the hard
+    # floor-collision constraint (--floor-collision), AND (new) protecting
+    # floor-sensitive frames during Stage A smoothing below — so compute it
+    # up front from the WARM (Stage-3) input, before Stage A runs, rather than
+    # gating behind floor_weight alone or waiting for Stage A's output.
+    # _estimate_floor_z only needs planted-foot geometry, which barely moves
+    # under smoothing, so qpos_ik vs qpos_a makes no meaningful difference here.
+    want_floor_z = args.floor_weight > 0.0 or args.floor_collision == "on"
+    floor_z = None
+    if want_floor_z:
+        floor_z = 0.0 if args.floor_mode == "zero" else \
+            _estimate_floor_z(model, data, qpos_ik, planted, resolved)
+        print(f"  floor: weight={args.floor_weight} mode={args.floor_mode} "
+              f"collision={args.floor_collision} floor_z={floor_z}")
+
+    # Locally boost Stage A's tracking weight at floor-sensitive frames (see
+    # _detect_floor_sensitive_frames docstring) so this floor-blind smoothing
+    # pass doesn't erode an upstream floor correction. Boost factor: strong
+    # enough that λ_track dominates λ_smooth locally (λ_smooth is typically
+    # ~100-300x the default λ_track=1 at the native 120Hz rate scaling).
+    #
+    # Gated specifically on --floor-collision (not the broader want_floor_z,
+    # which also covers the PRE-EXISTING --floor-weight on-floor pin, default
+    # ON at 200 in the pipeline) — this protection is new/unvalidated and must
+    # not change behaviour for the already-shipped --floor-weight-only path.
+    # Joints deliberately left unconstrained by Stage 3's contact IK (fist
+    # alignment only pins the palm-normal axis, not roll about it) — excluded
+    # from the boost below (kept at plain λ_track, fully smoothed) since
+    # they're irrelevant to floor clearance and boosting them just let their
+    # own free-floating angle stop being regularized: measured spikes 0->6,
+    # all WRIST_Z, when a flat (non-per-joint) boost was used instead.
+    UNCONSTRAINED_ROLL_JOINTS = ["LEFT_WRIST_Z", "RIGHT_WRIST_Z",
+                                 "LEFT_GRIPPER_Z", "RIGHT_GRIPPER_Z"]
+
+    lambda_track_frames = None
+    if floor_z is not None and args.floor_collision == "on":
+        sens_w = _detect_floor_sensitive_frames(model, data, qpos_ik, floor_gid, floor_z)
+        if sens_w.any():
+            boost = max(args.lambda_track, args.lambda_smooth * 2.0)
+            # Continuous blend, not a step: sens_w in [0,1] (1.0 = fully
+            # protected core, cosine-ramped to 0 over `pad` frames at each
+            # violation run's boundary) — see docstring for why a hard on/off
+            # switch reintroduced spikes.
+            per_frame = args.lambda_track + sens_w * (boost - args.lambda_track)
+            lambda_track_frames = np.tile(per_frame[:, None], (1, N_ACT))
+            excl = _actuated_joint_indices(model, UNCONSTRAINED_ROLL_JOINTS)
+            lambda_track_frames[:, excl] = args.lambda_track
+            print(f"  floor-sensitive frames (Stage-A protection): "
+                  f"{int((sens_w > 0.99).sum())}/{qpos_ik.shape[0]} fully protected "
+                  f"({int((sens_w > 0).sum())} incl. ramp), boosted λ_track={boost:.0f}")
+
     print("Stage A: closed-form smoothing...")
     qpos_a = stage_a(qpos_ik, args.lambda_track, args.lambda_smooth, q_lo, q_hi,
                      smooth_root=not args.no_root_smooth,
-                     root_lambda_smooth=(args.root_smooth if args.root_smooth > 0 else None))
+                     root_lambda_smooth=(args.root_smooth if args.root_smooth > 0 else None),
+                     lambda_track_frames=lambda_track_frames)
     s_a = all_stats(qpos_a)
 
     qpos_b = None
     if args.n_outer > 0:
-        floor_z = None
-        if args.floor_weight > 0.0:
-            floor_z = 0.0 if args.floor_mode == "zero" else \
-                _estimate_floor_z(model, data, qpos_a, planted, resolved)
-            print(f"  floor rows: weight={args.floor_weight} mode={args.floor_mode} "
-                  f"floor_z={floor_z}")
+        count_floor = args.floor_collision == "on" and floor_z is not None
+        if count_floor:
+            # Position the injected floor plane at this clip's estimated floor
+            # height, in the SAME ungrounded frame the whole solve operates in —
+            # valid because Stage 4.5's rigid shift later zeroes this exact
+            # reference (see plan doc / wiki concepts/globalopt.md).
+            data.mocap_pos[floor_mocap_id] = [0.0, 0.0, floor_z]
         print("Stage B: contact-aware QP + SCA...")
         qpos_b = stage_b(qpos_a, target_positions, role_names, role_to_body, target_weights,
                          tgt, wgt, planted, resolved, downweight_roles,
@@ -863,8 +1144,9 @@ def main():
                          args.foot_flat_weight, args.fist_weight,
                          args.contact_downweight, args.n_outer, args.trust,
                          collision_penalty=args.collision_penalty,
-                         floor_z=floor_z, floor_w=args.floor_weight)
-        s_b = all_stats(qpos_b)
+                         floor_z=floor_z, floor_w=args.floor_weight,
+                         floor_gid=floor_gid, count_floor=count_floor)
+        s_b = all_stats(qpos_b, count_floor=count_floor)
 
     print("\n" + "=" * 120)
     _stats_row("per-frame IK (warm)", *s_ik)

@@ -50,6 +50,7 @@ HAND_WEIGHT="${HAND_WEIGHT:-32}"         # soft pin on a PLANTED palm  (8 defaul
 # lifting-off hands (standup_side_05 right_hand 14.7->6.8cm). Frame-count knob -> x4
 # for 120 Hz (2 @ 30 Hz).
 PLANT_MIN_RUN="${PLANT_MIN_RUN:-8}"
+CONTACT_PREROLL="${CONTACT_PREROLL:-8}"    # frames of look-ahead before touchdown (0 = no anticipation)
 # Stage-3 coplanar-feet targets: when both feet are contact-labelled, snap their
 # ankle-height targets to a common Z so the IK produces coplanar feet. Fixes the
 # root cause of the "one foot floats in RDX" bug — the retargeted foot-height
@@ -64,6 +65,12 @@ COPLANAR_FEET_MODE="${COPLANAR_FEET_MODE:-mean}"
 # already coplanar so one shift plants both).
 FLOOR_WEIGHT="${FLOOR_WEIGHT:-200}"
 FLOOR_MODE="${FLOOR_MODE:-estimate}"      # estimate (lower foot's ground) | zero (soles->z=0)
+# Hard mesh-accurate robot-vs-floor collision: injects a floor plane geom
+# in-memory (never touches the hand-maintained asset XML) and reuses the
+# self-collision soft-slack QP machinery against it. Unlike FLOOR_WEIGHT (soft
+# pin, planted feet only), this stops ANY fullmesh geometry — swing feet,
+# hands, a tilted toe mid-get-up — from passing through the floor. on|off.
+FLOOR_COLLISION="${FLOOR_COLLISION:-off}"   # validated on 1 clip only so far — opt-in pending corpus validation, see collision.md
 RENDER_EXTRA="${RENDER_EXTRA:-}"          # extra render flags, e.g. "--fixed-cam"
 RENDER="${RENDER:-1}"                      # 1 = render Stage 5 mp4 | 0 = skip (faster; JSON export still runs)
 # --- Z-grounding (Stage 4.5) ---
@@ -166,7 +173,7 @@ for entry in "${CLIPS[@]}"; do
     python scripts/solve_fbx_canonical_alex_contactfirst.py \
       --canonical "$src" --out "$cf" \
       --stride "$STRIDE" --max-frames 99999 --ik-iters "$IK_ITERS" \
-      --contact-min-run 12 --contact-ramp 16 --contact-preroll 8 \
+      --contact-min-run 12 --contact-ramp 16 --contact-preroll "$CONTACT_PREROLL" \
       --coplanar-feet-mode "$COPLANAR_FEET_MODE" \
       --log-every 200 $solve_extra \
       || { echo "  [FAIL] contact-first"; fail=$((fail+1)); continue; }
@@ -180,6 +187,7 @@ for entry in "${CLIPS[@]}"; do
     --foot-weight "$FOOT_WEIGHT" --hand-weight "$HAND_WEIGHT" \
     --plant-min-run "$PLANT_MIN_RUN" \
     --floor-weight "$FLOOR_WEIGHT" --floor-mode "$FLOOR_MODE" \
+    --floor-collision "$FLOOR_COLLISION" \
     --collision-penalty 1000 $go_extra \
     || { echo "  [FAIL] globalopt"; fail=$((fail+1)); continue; }
 

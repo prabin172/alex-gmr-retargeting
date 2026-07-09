@@ -33,6 +33,38 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 MODEL_DEFAULT = REPO_ROOT / "assets/alex/alex_floating_base_with_sites.xml"
 
+FLOOR_BODY_NAME = "floor_collider"
+FLOOR_GEOM_NAME = "floor_collider_geom"
+
+
+def _load_model_with_floor(model_path):
+    """Load the robot MJCF and inject a floor PLANE geom as a mocap body — in
+    memory only, never written back to the hand-maintained asset XML.
+
+    Mocap (not a normal welded/static body): a static child of worldbody has its
+    world position baked in at compile time (mj_forward does NOT re-derive it
+    from a post-compile `model.geom_pos` mutation). A mocap body's position IS
+    re-applied every mj_forward via `data.mocap_pos`, and — unlike a free joint —
+    adds zero DOFs, so `nv`/joint-limit indexing is unaffected.
+
+    No contype/conaffinity wiring needed: the asset XML sets none anywhere, so
+    MuJoCo defaults (1/1) apply — the floor geom collides with everything
+    already. Mirrors `_load_model_with_floor` in
+    `solve_global_trajectory_opt_contactfirst.py` (Stage 4) — same technique,
+    duplicated rather than shared since these are independent CLI scripts.
+
+    Returns (model, data, floor_geom_id, floor_mocap_id)."""
+    spec = mujoco.MjSpec.from_file(str(model_path))
+    floor_body = spec.worldbody.add_body(name=FLOOR_BODY_NAME, mocap=True)
+    floor_body.add_geom(name=FLOOR_GEOM_NAME, type=mujoco.mjtGeom.mjGEOM_PLANE,
+                        size=[0, 0, 0.01], pos=[0, 0, 0])
+    model = spec.compile()
+    data = mujoco.MjData(model)
+    floor_gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, FLOOR_GEOM_NAME)
+    floor_bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, FLOOR_BODY_NAME)
+    floor_mocap_id = int(model.body_mocapid[floor_bid])
+    return model, data, floor_gid, floor_mocap_id
+
 # Position-only mapping: canonical human role -> real Alex body.
 # No added palm/sole/contact sites.
 ROLE_TO_ALEX_BODY = {
@@ -179,6 +211,25 @@ FOOT_POS_ROLE = {"left_foot": "left_ankle", "right_foot": "right_ankle"}
 
 # Foot effector -> the knee position role above it (shank-tilt clamp).
 FOOT_KNEE_ROLE = {"left_foot": "left_knee", "right_foot": "right_knee"}
+
+# Sole corner sites per foot — mirrors solve_global_trajectory_opt_contactfirst.py's
+# SOLE_CORNER_SITES exactly (same model, same sites). Used only to measure the
+# ankle-body-to-sole-plane clearance for the target-space floor estimate (see
+# `main()`'s floor-placement block) — this script does not add on-floor QP rows.
+SOLE_CORNER_SITES = {
+    "left_foot": [
+        "alex_left_sole_corner_toe_body_left_site",
+        "alex_left_sole_corner_toe_body_right_site",
+        "alex_left_sole_corner_heel_body_left_site",
+        "alex_left_sole_corner_heel_body_right_site",
+    ],
+    "right_foot": [
+        "alex_right_sole_corner_toe_body_left_site",
+        "alex_right_sole_corner_toe_body_right_site",
+        "alex_right_sole_corner_heel_body_left_site",
+        "alex_right_sole_corner_heel_body_right_site",
+    ],
+}
 
 
 def detect_contacts_from_human(positions, role_to_idx, fps, *,
@@ -618,6 +669,7 @@ def self_collision_rows(
     margin: float,
     gain: float,
     exclude_hops: int = 2,
+    floor_gid: int | None = None,
 ) -> tuple[list, list]:
     """
     Build QP rows that push apart self-colliding body pairs.
@@ -640,6 +692,16 @@ def self_collision_rows(
     w=20 gives the best collision reduction with negligible tracking regression.
     Above ~20 the QP becomes over-constrained and the solver can no longer route
     around collisions, so it oscillates in a stuck configuration.
+
+    `floor_gid` must be passed whenever the model has an injected floor plane
+    (i.e. always, once `_load_model_with_floor` is used), REGARDLESS of whether
+    floor avoidance itself is enabled: the floor body's id is never 0 (its own
+    mocap child of worldbody, not worldbody itself), so the old `b1==0 or
+    b2==0` "skip floor/static contacts" check silently stopped catching it once
+    a floor geom existed — a raw floor contact would get treated as a
+    self-colliding ROBOT LINK and repelled accordingly, corrupting the solve
+    (confirmed: with the floor left in and unexcluded, tracking error runs away
+    to metres within ~200 frames on luigi_standProne_03).
     """
     rows: list[np.ndarray] = []
     rhs_vals: list[float] = []
@@ -648,6 +710,8 @@ def self_collision_rows(
 
     for c_idx in range(data.ncon):
         ct = data.contact[c_idx]
+        if floor_gid is not None and (ct.geom1 == floor_gid or ct.geom2 == floor_gid):
+            continue
         b1 = int(model.geom_bodyid[ct.geom1])
         b2 = int(model.geom_bodyid[ct.geom2])
 
@@ -687,6 +751,86 @@ def self_collision_rows(
     return rows, rhs_vals
 
 
+def floor_collision_rows(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    nv: int,
+    weight: float,
+    floor_gid: int,
+    margin: float = 0.0,
+    gain: float = 5.0,
+) -> tuple[list, list]:
+    """Mesh-accurate robot-vs-floor avoidance — same shape as
+    `self_collision_rows`, against the injected floor plane (see
+    `_load_model_with_floor`) instead of another robot body. No k-hop exclusion
+    (floor is never anatomically adjacent) and the floor's own Jacobian comes
+    out zero (mocap body, no joints), so `jac_sep` reduces to the robot side
+    alone with no special-casing.
+
+    `margin=0.0` (unlike self-collision's 2cm) is deliberate: a genuinely
+    planted foot/hand sits AT the floor by design (foot-flat/foot-hold/palm-pin
+    put it there) — a nonzero margin would read that as "too close" and push it
+    back up, fighting the contact terms. Only real penetration is corrected.
+
+    This is what upstream-fixes the "hands forced into the ground during the
+    push" / "foot asked to go through the ground during the step" defect: Stage
+    3's per-frame IK has root-position freedom (unlike Stage 4's Stage B, which
+    only touches joint angles with the root frozen from Stage A), so a
+    root-level sunk pose CAN be corrected here, not just a local limb dip.
+
+    ONE ROW PER COLLIDING BODY, deepest contact only — MuJoCo's convex-hull-vs-
+    plane narrow phase returns MULTIPLE simultaneous contact points per body
+    (measured: 3 per body here), unlike the sparser point contacts typical of
+    self_collision_rows' link-vs-link case. Emitting a row per raw contact
+    silently multiplies a body's effective weight by however many contact
+    points it happens to generate (confirmed: weight=20 diverged to metres of
+    tracking error within ~200 frames with the raw per-contact version; the
+    same weight is stable once deduplicated to one row per body)."""
+    sqw = float(np.sqrt(weight))
+    deepest: dict[int, tuple] = {}   # robot body id -> (penetration, contact, b1, b2)
+
+    for c_idx in range(data.ncon):
+        ct = data.contact[c_idx]
+        if ct.geom1 != floor_gid and ct.geom2 != floor_gid:
+            continue
+        b1 = int(model.geom_bodyid[ct.geom1])
+        b2 = int(model.geom_bodyid[ct.geom2])
+
+        penetration = margin - float(ct.dist)
+        if penetration <= 0:
+            continue
+
+        robot_bid = b2 if b1 == model.geom_bodyid[floor_gid] else b1
+        prev = deepest.get(robot_bid)
+        if prev is None or penetration > prev[0]:
+            deepest[robot_bid] = (penetration, ct, b1, b2)
+
+    rows: list[np.ndarray] = []
+    rhs_vals: list[float] = []
+
+    for penetration, ct, b1, b2 in deepest.values():
+        normal = ct.frame[:3].copy()
+        if float(np.dot(normal, data.xpos[b1] - data.xpos[b2])) < 0:
+            normal = -normal
+
+        jacp1 = np.zeros((3, nv), dtype=np.float64)
+        jacp2 = np.zeros((3, nv), dtype=np.float64)
+        mujoco.mj_jac(model, data, jacp1, None, ct.pos, b1)
+        mujoco.mj_jac(model, data, jacp2, None, ct.pos, b2)
+
+        jac_sep = normal @ (jacp1 - jacp2)
+
+        if np.linalg.norm(jac_sep) < 1e-9:
+            continue
+
+        target = min(penetration, 0.05) * gain
+
+        rows.append(sqw * jac_sep)
+        rhs_vals.append(sqw * target)
+
+    return rows, rhs_vals
+
+
 def solve_frame_position_ik(
     model,
     data,
@@ -716,6 +860,10 @@ def solve_frame_position_ik(
     coll_margin=0.02,
     coll_gain=5.0,
     coll_hops=2,
+    floor_weight=0.0,
+    floor_gid=None,
+    floor_margin=0.0,
+    floor_gain=5.0,
 ):
     data.qpos[:] = q_init
     mujoco.mj_forward(model, data)
@@ -856,13 +1004,28 @@ def solve_frame_position_ik(
                         rhs2.append(np.array([np.sqrt(kb_weight) * (min_flex - cur)]))
 
         # Self-collision repulsion: push apart any non-adjacent penetrating body pairs.
+        # floor_gid passed here REGARDLESS of floor_weight (the avoidance
+        # toggle) — the injected floor geom must always be excluded from this
+        # scan once present, or its contacts get treated as self-colliding
+        # robot links (see self_collision_rows docstring).
         if coll_weight > 0.0:
             coll_rows, coll_rhs = self_collision_rows(
                 model, data, nv, coll_weight, coll_margin, coll_gain,
-                exclude_hops=coll_hops,
+                exclude_hops=coll_hops, floor_gid=floor_gid,
             )
             rows2.extend(coll_rows)
             rhs2.extend([np.array([v]) for v in coll_rhs])
+
+        # Floor avoidance: unlike Stage 4's Stage B (root frozen, joints only),
+        # this per-frame solve has root-position freedom, so it can correct a
+        # root-level sunk pose, not just a local limb dip. See
+        # floor_collision_rows docstring.
+        if floor_weight > 0.0 and floor_gid is not None:
+            floor_rows, floor_rhs = floor_collision_rows(
+                model, data, nv, floor_weight, floor_gid, floor_margin, floor_gain,
+            )
+            rows2.extend(floor_rows)
+            rhs2.extend([np.array([v]) for v in floor_rhs])
 
         I_nv = np.eye(nv)
 
@@ -930,6 +1093,23 @@ def main():
     ap.add_argument("--coll-hops", type=int, default=2,
                     help="Kinematic-tree hop threshold for exclusion beyond MuJoCo's built-in 1-hop filter "
                          "(default: 2, which also excludes grandparent-grandchild pairs like HEAD↔TORSO)")
+    ap.add_argument("--floor-weight", type=float, default=0.0,
+                    help="Robot-vs-floor avoidance weight (0=disabled, EXPERIMENTAL — default OFF, "
+                         "opt-in only). Mesh-accurate (injected floor plane geom, reuses the "
+                         "mj_forward contact narrow-phase) and root-aware (this per-frame solve has "
+                         "root-position freedom, unlike Stage 4's Stage B) — but on "
+                         "luigi_standProne_03, weight=20 (after fixing two real bugs: the "
+                         "self_collision_rows floor leak, and one-row-per-raw-contact tripling the "
+                         "effective weight) improves the reported LEFT_FOOT violation but creates a "
+                         "WORSE new one (RIGHT_GRIPPER 35.8cm) elsewhere — a genuine multi-effector "
+                         "priority tension, not a tuned/validated fix yet. See collision.md. See "
+                         "floor_collision_rows docstring.")
+    ap.add_argument("--floor-margin", type=float, default=0.0,
+                    help="Repulsion activates within this margin (m) of the floor (default: 0.0 — "
+                         "unlike --coll-margin's 2cm buffer, a genuinely planted foot/hand sits AT "
+                         "the floor by design; a nonzero margin would fight the contact terms)")
+    ap.add_argument("--floor-gain", type=float, default=5.0,
+                    help="Correction speed: target separation per metre of floor penetration (default: 5.0)")
     ap.add_argument("--foot-contact-height", type=float, default=0.07,
                     help="Foot marker height (m) above clip floor below which a foot is in contact (default: 0.07)")
     ap.add_argument("--hand-contact-height", type=float, default=0.08,
@@ -1039,8 +1219,7 @@ def main():
     if missing:
         raise RuntimeError(f"Canonical missing required roles: {missing}")
 
-    model = mujoco.MjModel.from_xml_path(str(args.model))
-    data = mujoco.MjData(model)
+    model, data, floor_gid, floor_mocap_id = _load_model_with_floor(args.model)
 
     role_to_body_id = {
         role: body_id(model, body_name)
@@ -1148,6 +1327,7 @@ def main():
     achieved_ori_list = []
     ori_err_deg_list = []
     n_self_coll_list = []
+    n_floor_pen_list = []
     contact_flags_list = []
     contact_align_err_deg_list = []
 
@@ -1159,6 +1339,11 @@ def main():
         coll_margin=args.coll_margin,
         coll_gain=args.coll_gain,
         coll_hops=args.coll_hops,
+        # Always passed (not gated behind --floor-weight): self_collision_rows
+        # must exclude the injected floor geom regardless of whether floor
+        # AVOIDANCE is enabled, or it treats floor contacts as self-colliding
+        # robot links and corrupts the solve. See self_collision_rows docstring.
+        floor_gid=floor_gid,
     )
 
     print(f"Self-collision: weight={args.coll_weight}  margin={args.coll_margin} m  "
@@ -1205,6 +1390,99 @@ def main():
         sd = float(np.linalg.norm(first_src_pos[role_to_idx[mk]] - src_pelvis0_pos))
         ad = float(np.linalg.norm(palm_rest_pos[eff] - alex_pelvis_rest))
         palm_pos_scale[eff] = float(np.clip(ad / max(sd, 1e-6), 0.4, 2.5))
+
+    # Alex-frame floor height (target-space derivation — collisionFixPlan.md Fix
+    # A). The old pelvis-delta-transform estimate (human floor_z -> Alex frame
+    # via root_scale) measured ~8cm too high on luigi_standProne_03 (-0.0355 vs
+    # the actual plant height -0.115), which made the floor-repulsion term fight
+    # every prone-phase contact frame. Target space is self-consistent: derive
+    # the floor from where the SAME ankle position TARGETS the IK is already
+    # being asked to track put the foot, instead of transforming a separate
+    # human-frame reference.
+    #
+    # Computed UNCONDITIONALLY (not gated behind --floor-weight): the palm-pin
+    # floor clamp below (Fix B) needs it independent of whether the Stage-3
+    # floor-REPULSION term is enabled, so the two fixes can be validated in
+    # isolation (see collisionFixPlan.md's validation ladder). Only the
+    # repulsion term's own inputs (mocap position, floor_kwargs) are gated on
+    # --floor-weight.
+    # Ankle-to-sole clearance: a fixed geometric property of the robot (how far
+    # the ankle joint sits above the sole plane with a flat foot), NOT something
+    # that should vary per clip. Measure it from a NEUTRAL default pose in a
+    # throwaway MjData — NOT from `data`'s achieved rest pose, which for a
+    # prone-start clip like luigi_standProne_03 has the ankle in a contorted,
+    # non-flat configuration (measured: 13.9cm there vs the correct ~7.0cm at
+    # neutral — a nearly 2x error that would have put the floor 7cm too low).
+    neutral_data = mujoco.MjData(model)
+    neutral_data.qpos[:] = 0.0
+    neutral_data.qpos[3] = 1.0   # root quaternion w
+    mujoco.mj_forward(model, neutral_data)
+    clearances = []
+    for eff, sole_names in SOLE_CORNER_SITES.items():
+        ankle_bid = role_to_body_id[FOOT_POS_ROLE[eff]]
+        sole_z = [neutral_data.site_xpos[site_id(model, s)][2] for s in sole_names]
+        clearances.append(float(neutral_data.xpos[ankle_bid][2] - min(sole_z)))
+    ankle_clearance = float(np.mean(clearances))
+
+    # Median ankle-target z at CONTACT ONSET (first few frames of each planted
+    # run), pooled over both feet, in TARGET space (position-only — no IK,
+    # cheap). Reuse `contacts_solved` (already computed above, line ~1296) —
+    # must be bit-identical to what the per-frame loop below treats as
+    # "planted".
+    #
+    # Onset-only, not whole-run: the raw morphology-scaled human target keeps
+    # DRIFTING DOWN through a plant (measured: left ankle target ranges -0.038
+    # at touchdown to -0.067 by run-end, as the human's own foot keeps
+    # flattening/settling in the source mocap) — but the actual per-frame loop
+    # FREEZES the tracked target near onset (the foot-hold anchor, `w_env >=
+    # foot_hold_latch`, ~half the contact-ramp into the run) and holds it, so
+    # the robot never actually tracks that later drift. Pooling the whole run
+    # measured 2.8cm too low (-0.0663) vs the real solved/frozen anchor
+    # (-0.0384); pooling just the onset window matches it almost exactly
+    # (onset-frame check: -0.039).
+    ONSET_WINDOW = 10   # frames; run-start proxy for the foot-hold-latch frame
+    planted_ankle_z = []
+    for eff in FOOT_POS_ROLE:
+        flag = contacts_solved[eff]
+        k = 0
+        while k < len(flag):
+            if not flag[k]:
+                k += 1
+                continue
+            j = k
+            while j < len(flag) and flag[j]:
+                j += 1
+            for kk in range(k, min(k + ONSET_WINDOW, j)):
+                t = make_targets_for_frame(src_positions[frame_ids[kk]], role_to_idx,
+                                           first_src_pos, target_rest_positions,
+                                           root_scale, role_scales)
+                planted_ankle_z.append(float(t[FOOT_POS_ROLE[eff]][2]))
+            k = j
+
+    if planted_ankle_z:
+        alex_floor_z = float(np.median(planted_ankle_z)) - ankle_clearance
+    else:
+        # No foot-contact frames in this clip (none in the corpus currently) —
+        # fall back to the human-frame transform.
+        human_pelvis0_z = float(first_src_pos[role_to_idx["pelvis"]][2])
+        alex_floor_z = float(target_rest_positions["pelvis"][2]) \
+            + root_scale * (floor_z - human_pelvis0_z)
+        print("  [warn] no planted-foot frames — floor_z falling back to pelvis-delta transform")
+
+    print(f"Floor estimate (target-space): ankle_clearance={ankle_clearance:.4f} "
+          f"alex_floor_z={alex_floor_z:.4f} (human floor_z={floor_z:.4f}) "
+          f"n_planted={len(planted_ankle_z)} median_ankle_target_z="
+          f"{float(np.median(planted_ankle_z)) if planted_ankle_z else float('nan'):.4f}")
+
+    floor_kwargs = {}
+    if args.floor_weight > 0.0:
+        data.mocap_pos[floor_mocap_id] = [0.0, 0.0, alex_floor_z]
+        floor_kwargs = dict(
+            floor_weight=args.floor_weight,
+            floor_margin=args.floor_margin, floor_gain=args.floor_gain,
+        )
+        print(f"Floor repulsion (Stage-3 QP term): ON weight={args.floor_weight} "
+              f"margin={args.floor_margin}")
 
     rest_errs = {
         role: float(np.linalg.norm(initial_targets[role] - data.xpos[bid]))
@@ -1358,6 +1636,15 @@ def main():
                         rel0 = first_src_pos[role_to_idx[mk]] - src_pelvis0
                         rel = src_positions[src_i][role_to_idx[mk]] - src_pelvis
                         tgt = palm_rest_pos[eff] + root_delta + palm_pos_scale[eff] * (rel - rel0)
+                        # Floor clamp (Fix B, collisionFixPlan.md): the scaled
+                        # human hand-contact target can map below Alex's floor
+                        # (measured: 6.5-7.2cm on luigi_standProne_03's push
+                        # phase) — the palm pin then faithfully tracks the fist
+                        # underground. Palm site IS the support surface, so
+                        # clearance 0 is correct (no margin). Independent of
+                        # --floor-weight (see alex_floor_z computation above).
+                        if alex_floor_z is not None:
+                            tgt[2] = max(tgt[2], alex_floor_z)
                         pos_site_constraints.append(
                             (effector_site_id[eff], tgt, CONTACT_POS_WEIGHT * w_env)
                         )
@@ -1411,14 +1698,25 @@ def main():
             skip_pos_roles=skip_pos_roles,
             iters=args.ik_iters,
             **coll_kwargs,
+            **floor_kwargs,
         )
 
         mujoco.mj_forward(model, data)
 
-        # Count remaining self-collisions post-solve (using same filter as the constraint)
+        # Count remaining self-collisions post-solve (using same filter as the
+        # constraint). Floor contacts are excluded here too — the injected
+        # floor body's id is never 0, so the old cb1>0/cb2>0 filter alone
+        # doesn't catch it (same leak class as self_collision_rows/
+        # floor_collision_rows; see _load_model_with_floor).
         n_self_coll = 0
+        n_floor_pen = 0
         for c_idx in range(data.ncon):
             ct = data.contact[c_idx]
+            is_floor = ct.geom1 == floor_gid or ct.geom2 == floor_gid
+            if is_floor:
+                if ct.dist < 0:
+                    n_floor_pen += 1
+                continue
             cb1 = int(model.geom_bodyid[ct.geom1])
             cb2 = int(model.geom_bodyid[ct.geom2])
             if cb1 > 0 and cb2 > 0 and ct.dist < 0:
@@ -1433,6 +1731,7 @@ def main():
         qpos_list.append(q.copy())
         err_list.append(errs)
         n_self_coll_list.append(n_self_coll)
+        n_floor_pen_list.append(n_floor_pen)
 
         role_order = list(ROLE_TO_ALEX_BODY.keys())
         target_pos_list.append(np.asarray([targets[r] for r in role_order], dtype=np.float64))
@@ -1474,6 +1773,11 @@ def main():
         mean_err = np.mean(list(errs.values()))
         max_err = np.max(list(errs.values()))
         coll_str = f"  coll={n_self_coll}" if n_self_coll > 0 else ""
+        # Only meaningful once the floor plane is actually positioned
+        # (--floor-weight > 0) — otherwise it sits at its unused default and
+        # this count is noise.
+        if args.floor_weight > 0.0:
+            coll_str += f"  floor_pen={n_floor_pen}" if n_floor_pen > 0 else ""
         active = [e for e in eff_order if frame_contacts.get(e, False)]
         con_str = ""
         if active:
@@ -1529,6 +1833,10 @@ def main():
     n_coll_arr = np.asarray(n_self_coll_list, dtype=np.int32)
     print(f"\nSelf-collision summary: {n_coll_arr.sum()} total penetrating frames "
           f"({(n_coll_arr > 0).mean() * 100:.1f}% of frames)")
+    if args.floor_weight > 0.0:
+        n_floor_arr = np.asarray(n_floor_pen_list, dtype=np.int32)
+        print(f"Floor-penetration summary: {n_floor_arr.sum()} total penetrating contacts "
+              f"({(n_floor_arr > 0).mean() * 100:.1f}% of frames)")
     if args.shank_clamp:
         cc = " ".join(f"{e}:{n}" for e, n in shank_clamp_count.items())
         print(f"Shank-tilt clamp engaged (frames): {cc}")
