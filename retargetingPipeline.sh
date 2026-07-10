@@ -17,6 +17,7 @@
 # collision — no model/flag knobs needed for the shipped setup.
 #
 # Env knobs (all optional):
+#   CF_DIR         (default outputs/contactfirst)             Stage-3 output dir.
 #   GO_DIR         (default outputs/global_opt_contactfirst)  Stage-4 output dir.
 #   GR_DIR         (default outputs/grounded_contactfirst)    Stage-4.5 output dir.
 #   RENDER_MESH / RENDER_DIR / RENDER_EXTRA  render-stage controls (see below).
@@ -58,6 +59,13 @@ CONTACT_PREROLL="${CONTACT_PREROLL:-8}"    # frames of look-ahead before touchdo
 # both are labelled planted, which a rigid grounding shift can't reconcile.
 # mean = distribute (lowest self-collision) | min = snap to lower foot | off = legacy.
 COPLANAR_FEET_MODE="${COPLANAR_FEET_MODE:-mean}"
+# Stage-3 fullmesh robot-vs-floor repulsion. This is the proper upstream fix
+# path for swing feet / hands below the floor: Stage 3 can move the root, unlike
+# Stage 4's joint-only collision cleanup. Default OFF until the validation
+# ladder in collisionFixPlan.md passes; use S3_FLOOR_WEIGHT=20 for the test run.
+S3_FLOOR_WEIGHT="${S3_FLOOR_WEIGHT:-0}"
+S3_FLOOR_MARGIN="${S3_FLOOR_MARGIN:-0}"
+S3_FLOOR_GAIN="${S3_FLOOR_GAIN:-5}"
 # On-floor + coplanar rows: drive each PLANTED foot's 4 sole-corner Zs to a shared
 # floor height (the lower foot's warm-start ground). Co-plants both feet in the
 # SOLVE, which a rigid 1-DOF grounding shift cannot. 0 = off. Pairs with
@@ -76,6 +84,9 @@ RENDER="${RENDER:-1}"                      # 1 = render Stage 5 mp4 | 0 = skip (
 # --- Z-grounding (Stage 4.5) ---
 GROUND_MODE="${GROUND_MODE:-constant-contact}"   # constant-contact (single shift keyed to planted feet — no bobbing, feet stay down) | perframe (plant every frame, wanders) | constant (single shift, global lowest)
 GROUND_SMOOTH="${GROUND_SMOOTH:-80}"      # perframe: tridiagonal smoothing on the shift series (5 @ 30 Hz × 16)
+GROUND_PERCENTILE="${GROUND_PERCENTILE:-1}"              # constant mode: 0 = lift all frames above floor; 1 = robust near-min
+GROUND_CONTACT_PERCENTILE="${GROUND_CONTACT_PERCENTILE:-50}"  # constant-contact: planted-foot sole percentile
+GROUND_STILL_SPEED="${GROUND_STILL_SPEED:-0.05}"         # constant-contact: still-plant speed threshold (m/s)
 # --- Render mesh (Stage 5) ---
 # visual    = full-body Alex visual mesh (legs+arms+torso), hands as closed fists
 # collision = fullmesh collision convex hulls (what the solver actually uses)
@@ -87,7 +98,7 @@ case "$RENDER_MESH" in
   *)         RMODEL="$RENDER_MESH" ;;
 esac
 IN=outputs/canonical_human/fbx_fresh
-CF=outputs/contactfirst
+CF="${CF_DIR:-outputs/contactfirst}"
 mkdir -p "$IN"
 GO="${GO_DIR:-outputs/global_opt_contactfirst}"
 GR="${GR_DIR:-outputs/grounded_contactfirst}"
@@ -103,7 +114,8 @@ EXPORT_50HZ="${EXPORT_50HZ:-1}"           # also emit a 50 Hz set (IHMC 1.json r
 IH50="${IHMC_DIR_50:-outputs/ihmcJsons50hz}"
 mkdir -p "$CF" "$GO" "$GR" "$RD" "$IH"
 [ "$EXPORT_50HZ" = "1" ] && mkdir -p "$IH50"
-echo "Render mesh: $RENDER_MESH -> $RMODEL   |  ground: $GROUND_MODE (smooth=$GROUND_SMOOTH)"
+echo "Stage-3 floor: weight=$S3_FLOOR_WEIGHT margin=$S3_FLOOR_MARGIN gain=$S3_FLOOR_GAIN   |  Stage-4 floor collision: $FLOOR_COLLISION"
+echo "Render mesh: $RENDER_MESH -> $RMODEL   |  ground: $GROUND_MODE (smooth=$GROUND_SMOOTH pct=$GROUND_PERCENTILE contact_pct=$GROUND_CONTACT_PERCENTILE)"
 
 # clip name  ->  source FBX path (stages 1-2 produce the canonical NPZ + with_orient NPZ).
 # Optional 3rd field: extra contact-first SOLVER flags. 4th: extra GLOBALOPT flags.
@@ -127,8 +139,8 @@ CLIPS=(
   "standupSquatCrouch_01|data/raw/inhouse/crouchStand/PrabinRef_StandupSquatCrouch_01.fbx||"
   "kneelingFall_02|data/raw/inhouse/KneelingFall/PrabinRef_KneelingFall_02.fbx||"
   "kneelingFall_03|data/raw/inhouse/KneelingFall/PrabinRef_KneelingFall_03.fbx||"
-  "luigi_standProne_03|data/raw/inhouse/LuigiStand/LuigiRef_StandProne_03.fbx|--contact-preroll 0 --contact-on-speed-frac 0.25 --contact-onset-max-delay 0.35|"
-  "luigi_standSupine_08|data/raw/inhouse/LuigiStand/LuigiRef_StandSupine_08.fbx||"
+  "luigi_standProne_03|data/raw/inhouse/LuigiStand/LuigiRef_StandProne_03.fbx|--contact-preroll 0 --contact-on-speed-frac 0.25 --contact-onset-max-delay 0.35 --floor-weight 20 --floor-margin 0 --floor-gain 5 --floor-refine|--floor-collision on"
+  "luigi_standSupine_08|data/raw/inhouse/LuigiStand/LuigiRef_StandSupine_08.fbx|--floor-weight 20 --floor-margin 0 --floor-gain 5 --floor-refine --floor-phase-aware|--floor-collision on --floor-phase-aware on"
 )
 
 # Optional substring filter on the clip NAME: run only clips whose name contains
@@ -175,6 +187,7 @@ for entry in "${CLIPS[@]}"; do
       --stride "$STRIDE" --max-frames 99999 --ik-iters "$IK_ITERS" \
       --contact-min-run 12 --contact-ramp 16 --contact-preroll "$CONTACT_PREROLL" \
       --coplanar-feet-mode "$COPLANAR_FEET_MODE" \
+      --floor-weight "$S3_FLOOR_WEIGHT" --floor-margin "$S3_FLOOR_MARGIN" --floor-gain "$S3_FLOOR_GAIN" \
       --log-every 200 $solve_extra \
       || { echo "  [FAIL] contact-first"; fail=$((fail+1)); continue; }
   fi
@@ -195,6 +208,8 @@ for entry in "${CLIPS[@]}"; do
   echo "  [ground] $GROUND_MODE ..."
   python scripts/post_process_ground_contactfirst.py \
     --npz "$go" --out "$gr" --mode "$GROUND_MODE" --smooth-shift "$GROUND_SMOOTH" \
+    --percentile "$GROUND_PERCENTILE" --contact-percentile "$GROUND_CONTACT_PERCENTILE" \
+    --still-speed "$GROUND_STILL_SPEED" \
     || { echo "  [FAIL] ground"; fail=$((fail+1)); continue; }
 
   # Stage 5 — render REAL TIME:  fps = source_fps / stride ; no extra frame skip

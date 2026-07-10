@@ -23,6 +23,31 @@ The SCA loop is **not** monotone in penetration: collision rows are linearized o
 
 > **Contacts are soft, not equalities**: every contact term is `add_soft` (weight 160 foot / 32 hand), never a hard equality. Residual slip is a high-weight equilibrium, not zero by construction. (The old "hard equality" docstring is already corrected.)
 
+## Hard mesh floor collision (2026-07-09/10, `--floor-collision`, opt-in per-clip)
+Separate from the soft on-floor rows above (which only ever touch **planted feet**). A floor
+plane geom is injected in-memory (`_load_model_with_floor`, `mujoco.MjSpec` mocap body — never
+touches the asset XML), and `_build_collision` treats floor-vs-robot contacts exactly like
+self-collision pairs (same soft-slack QP rows, `count_floor=True`), catching **any** fullmesh
+geometry — swing feet, hands, a tilted toe — not just planted feet. `floor_gid` must always be
+recognized (its body id is never 0) even when `count_floor=False`, else floor contacts silently
+leak into self-collision counting. First shipped on `luigi_standProne_03` only (paired with a
+Stage-3 floor-repulsion term + 2-pass arm refinement for onset transitions, see
+[[contact-first-ik]]); root-cause history in `collision.md`/`collisionFixPlan.md` (repo root).
+
+**Phase-aware gating (2026-07-10, `--floor-phase-aware`)**: a single clip-wide `floor_z` is
+calibrated to the standing/planted-foot stance and misreads a lying/supine phase's legitimately-
+low pelvis as violation (see [[grounding]]'s "Get-up floor residual is BETWEEN-PHASE"). Same
+between-phase root-Z non-invariance, just hitting the Stage 3/4 collision term instead of Stage
+4.5's registration percentile. `floor_phase_weight()` (duplicated in both solver scripts):
+smoothstep of pelvis/root height between the clip's low reference and its planted-foot/standing
+height, thresholded at 0.5 to gate `count_floor`/collision rows on/off per frame instead of
+clip-wide. Enabled it on `luigi_standSupine_08`: fixed the false pelvis violation AND caught a
+real bug the untouched baseline had — `RIGHT_FOOT` genuinely clipped 4.4cm through the floor
+during the stand-up transition, invisible to the planted-foot-only eval check. Small cost at the
+phase boundary (~5 frames, self-pen to 2.1cm, no spikes) plus a real slip/flat-error increase
+(1.6→4.3cm, 0→5.2deg) — accepted trade. No-op for single-phase clips. See `wiki/log.md`
+2026-07-10 and `SESSION_HANDOFF.md` for the full validation.
+
 ## FOOT_WEIGHT ceiling — residual slip is a smoothness floor, not a weight deficit (2026-07-08)
 The 6.3 cm standup_side_04 slip was **stale** — it predates the Stage-3 coplanar targets + on-floor rows. On the CURRENT config the same clip's plant-slip is **1.9 cm**. Ran `scripts/diagnose_foot_slip.py` (per-frame foot XY deviation from the frozen anchor vs max inter-limb penetration, ±6-frame windowed correlation per the mimic-repo review):
 - slip↔penetration corr **−0.08** (exact and windowed) — worst-slip frames are collision-**free** (0/9 frames ≥1.5 cm slip sit within ±6 fr of any pen ≥0.5 cm). NOT collision-bound; the earlier leg-crossing prior was wrong *for the slip* (the 1.61 cm peak pen lands in different frames).

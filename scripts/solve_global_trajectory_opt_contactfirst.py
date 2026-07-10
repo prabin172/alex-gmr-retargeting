@@ -186,7 +186,8 @@ def _delta_stats(qpos):
             "mean": float(mpf.mean()), "n_spikes_05": int((mpf > 0.5).sum())}
 
 
-def _collision_stats(model, data, qpos, floor_gid=None, count_floor=False):
+def _collision_stats(model, data, qpos, floor_gid=None, count_floor=False,
+                     floor_active_frames=None):
     """Self-collision penetration, plus robot-vs-floor penetration when
     `count_floor=True` (the injected floor plane — see `_load_model_with_floor`).
 
@@ -198,17 +199,24 @@ def _collision_stats(model, data, qpos, floor_gid=None, count_floor=False):
     `count_floor`. So floor pairs are always recognized and either counted
     (count_floor=True, no k-hop filter — floor is never anatomically adjacent to
     a robot body) or excluded outright (count_floor=False, same as an ordinary
-    self-collision-irrelevant pair)."""
+    self-collision-irrelevant pair).
+
+    `floor_active_frames` (T,) bool, optional: per-frame override on top of
+    `count_floor` for phase-aware clips (see `floor_phase_weight`) — a frame
+    with `floor_active_frames[t] == False` never counts a floor contact even
+    when `count_floor=True` (a lying-phase pelvis reading "penetration" against
+    a floor_z calibrated to the standing phase is not a real violation)."""
     pen = []
     for t in range(qpos.shape[0]):
         data.qpos[:] = qpos[t]
         mujoco.mj_forward(model, data)
+        active_t = count_floor and (floor_active_frames is None or bool(floor_active_frames[t]))
         mx = 0.0
         for c in range(data.ncon):
             ct = data.contact[c]
             is_floor = floor_gid is not None and (ct.geom1 == floor_gid or ct.geom2 == floor_gid)
             if is_floor:
-                if not count_floor:
+                if not active_t:
                     continue
             else:
                 b1 = int(model.geom_bodyid[ct.geom1]); b2 = int(model.geom_bodyid[ct.geom2])
@@ -385,8 +393,32 @@ def _estimate_floor_z(model, data, qpos_warm, planted, resolved):
     return float(np.median(per_foot)) if per_foot else None
 
 
+def floor_phase_weight(z_signal, planted_any, lo_pct=5, hi_pct=95):
+    """Per-frame [0,1] weight gating floor-collision strength by posture phase.
+
+    Duplicated from solve_fbx_canonical_alex_contactfirst.py (independent CLI
+    scripts, no shared imports — same pattern as `_load_model_with_floor`).
+    See that copy's docstring for the full rationale: a single clip-wide
+    floor_z is calibrated to the standing/planted-foot stance and is not valid
+    for a lying/supine/prone phase in the same clip (wiki/concepts/
+    grounding.md, "Get-up floor residual is BETWEEN-PHASE"). Here `z_signal`
+    is the SOLVED root qpos Z (qpos_ik[:, 2]) rather than Stage 3's pelvis
+    target — Stage 4 already has the full trajectory upfront, no causality
+    issue. `planted_any`: OR of all foot `planted` masks from
+    `_compute_anchors`."""
+    z = np.asarray(z_signal, dtype=np.float64)
+    pool = z[planted_any] if np.any(planted_any) else z
+    hi = float(np.percentile(pool, hi_pct))
+    lo = float(np.percentile(z, lo_pct))
+    if hi - lo < 1e-6:
+        return np.ones_like(z)
+    frac = np.clip((z - lo) / (hi - lo), 0.0, 1.0)
+    return frac * frac * (3.0 - 2.0 * frac)   # smoothstep
+
+
 def _detect_floor_sensitive_frames(model, data, qpos, floor_gid, floor_z,
-                                   min_pen=0.015, min_run=8, pad=5):
+                                   min_pen=0.015, min_run=8, pad=5,
+                                   floor_active_frames=None):
     """Boolean (T,) mask: SUSTAINED (>= min_run consecutive frames) floor
     penetration deeper than `min_pen` (default 1.5cm), padded `pad` frames
     either side.
@@ -424,11 +456,18 @@ def _detect_floor_sensitive_frames(model, data, qpos, floor_gid, floor_z,
        max_dq up to 1.187 rad). Returns a CONTINUOUS weight in [0,1]
        (1.0 = fully protected, cosine-ramped to 0.0 over `pad` frames at each
        boundary) instead of a boolean mask, so the caller can blend λ_track
-       smoothly rather than switch it."""
+       smoothly rather than switch it.
+
+    `floor_active_frames` (T,) bool, optional: phase gate (see
+    `floor_phase_weight`) — a frame with `floor_active_frames[t] == False`
+    never registers a floor violation here either, so Stage A doesn't get
+    told to protect a lying-phase "penetration" that isn't real."""
     T = qpos.shape[0]
     data.mocap_pos[int(model.body_mocapid[int(model.geom_bodyid[floor_gid])])] = [0.0, 0.0, floor_z]
     viol = np.zeros(T, dtype=bool)
     for t in range(T):
+        if floor_active_frames is not None and not floor_active_frames[t]:
+            continue
         data.qpos[:] = qpos[t]
         mujoco.mj_forward(model, data)
         for c in range(data.ncon):
@@ -724,7 +763,8 @@ def _build_contact(qpos_warm, tgt, wgt, planted, resolved, model, data,
     return H_blocks, g
 
 
-def _build_collision(qpos_warm, model, data, lambda_coll, floor_gid=None, count_floor=False):
+def _build_collision(qpos_warm, model, data, lambda_coll, floor_gid=None, count_floor=False,
+                     floor_active_frames=None):
     """Self-collision rows (existing), plus robot-vs-floor rows when
     `count_floor=True` — same contact-point/Jacobian/margin machinery, just the
     floor plane (a mocap body, zero DOF) as one side of the pair instead of
@@ -738,7 +778,11 @@ def _build_collision(qpos_warm, model, data, lambda_coll, floor_gid=None, count_
     the floor body's id is never 0 (own mocap child of worldbody), so without
     recognizing it explicitly a raw floor contact would silently fall through
     the old `b1==0 or b2==0` exclusion and get added as a bogus self-collision
-    row. `count_floor=False` recognizes-and-excludes it instead."""
+    row. `count_floor=False` recognizes-and-excludes it instead.
+
+    `floor_active_frames` (T,) bool, optional: phase gate (see
+    `floor_phase_weight`) — frame t skips floor rows entirely when
+    `floor_active_frames[t] == False`, even with `count_floor=True`."""
     T = qpos_warm.shape[0]
     nv = model.nv
     sqw = float(np.sqrt(lambda_coll))
@@ -747,12 +791,13 @@ def _build_collision(qpos_warm, model, data, lambda_coll, floor_gid=None, count_
     for t in range(T):
         data.qpos[:] = qpos_warm[t]
         mujoco.mj_forward(model, data)
+        floor_active_t = count_floor and (floor_active_frames is None or bool(floor_active_frames[t]))
         for cc in range(data.ncon):
             ct = data.contact[cc]
             is_floor = floor_gid is not None and (ct.geom1 == floor_gid or ct.geom2 == floor_gid)
             b1 = int(model.geom_bodyid[ct.geom1]); b2 = int(model.geom_bodyid[ct.geom2])
             if is_floor:
-                if not count_floor:
+                if not floor_active_t:
                     continue
             elif b1 == 0 or b2 == 0 or _within_k_hops(model, b1, b2, COLL_HOPS):
                 continue
@@ -784,13 +829,15 @@ def stage_b(qpos_warm, target_positions, role_names, role_to_body, target_weight
             lambda_track, lambda_smooth, lambda_coll,
             foot_flat_w, fist_w, downweight_factor, n_outer, trust,
             collision_penalty=1000.0, floor_z=None, floor_w=0.0,
-            floor_gid=None, count_floor=False):
+            floor_gid=None, count_floor=False, floor_active_frames=None):
     """`floor_gid`: the injected floor plane's geom id, ALWAYS passed once
     `_load_model_with_floor` is used (needed to correctly recognize-and-exclude
     floor contacts from self-collision, regardless of `count_floor` — see
     `_build_collision`/`_collision_stats` docstrings). `count_floor`: the actual
     --floor-collision on/off toggle — whether floor contacts become hard
-    QP rows + count toward penetration stats."""
+    QP rows + count toward penetration stats. `floor_active_frames` (T,) bool,
+    optional: phase gate on top of `count_floor` (see `floor_phase_weight`) —
+    threaded into every `_build_collision`/`_collision_stats` call below."""
     T = qpos_warm.shape[0]
     N = T * N_ACT
     q_warm_act = qpos_warm[:, 7:].reshape(-1)
@@ -829,7 +876,8 @@ def stage_b(qpos_warm, target_positions, role_names, role_to_body, target_weight
     floor_active = (floor_w > 0.0 and floor_z is not None) or count_floor
     PEN_TOL = 2.0 if floor_active else 1.0
     def _iter_score(q):
-        cs = _collision_stats(model, data, q, floor_gid=floor_gid, count_floor=count_floor)
+        cs = _collision_stats(model, data, q, floor_gid=floor_gid, count_floor=count_floor,
+                              floor_active_frames=floor_active_frames)
         ss = _contact_slip_stats(model, data, q, tgt, wgt, planted, resolved)
         pen = cs["max_pen_cm"]; slip = ss["plant_slip_max_cm"]
         ferr = _foot_floor_err_cm(model, data, q, planted, resolved,
@@ -860,7 +908,8 @@ def stage_b(qpos_warm, target_positions, role_names, role_to_body, target_weight
         jl_hi = np.minimum(jl_hi_abs, delta + trust)
 
         A_coll, l_coll, u_coll = _build_collision(qpos_cur, model, data, lambda_coll,
-                                                  floor_gid=floor_gid, count_floor=count_floor)
+                                                  floor_gid=floor_gid, count_floor=count_floor,
+                                                  floor_active_frames=floor_active_frames)
         n_coll_rows = 0 if A_coll is None else A_coll.shape[0]
 
         slack_info = ""
@@ -1007,6 +1056,17 @@ def main():
                          "a tilted toe mid-get-up — from passing through the floor. "
                          "on = default; off to bisect/regression-check against the old "
                          "behaviour.")
+    ap.add_argument("--floor-phase-aware", choices=["on", "off"], default="off",
+                    help="Gate --floor-collision off during a clip's low/lying-phase frames "
+                         "(root-qpos-Z smoothstep between the clip's low reference and its "
+                         "planted-foot/standing height — see floor_phase_weight). Off by "
+                         "default: identity, byte-for-byte unchanged from before this flag "
+                         "existed. Needed for clips with a genuine standing+lying phase split "
+                         "(e.g. get-ups) — forcing hard floor collision through the lying "
+                         "phase misreads the legitimately-low pelvis/hip as a violation "
+                         "(measured on luigi_standSupine_08: RIGHT_HIP_X_LINK 14.4cm, the SCA "
+                         "loop could never resolve it since it wasn't real). No-op for "
+                         "single-phase clips (root Z barely varies -> all-1s weight).")
     args = ap.parse_args()
 
     z = np.load(args.ik_npz, allow_pickle=True)
@@ -1060,9 +1120,10 @@ def main():
     # silently leak into "self-collision" counting (its body id isn't 0, so the
     # old bodyid==0 exclusion doesn't catch it). count_floor=True only once the
     # floor plane has actually been positioned + enabled for Stage B, below.
-    def all_stats(q, count_floor=False):
+    def all_stats(q, count_floor=False, floor_active_frames=None):
         return (_delta_stats(q), _collision_stats(model, data, q, floor_gid=floor_gid,
-                                                   count_floor=count_floor),
+                                                   count_floor=count_floor,
+                                                   floor_active_frames=floor_active_frames),
                 _tracking_stats(q, target_positions, role_to_body, role_names, model, data),
                 _contact_slip_stats(model, data, q, tgt, wgt, planted, resolved))
 
@@ -1083,6 +1144,24 @@ def main():
             _estimate_floor_z(model, data, qpos_ik, planted, resolved)
         print(f"  floor: weight={args.floor_weight} mode={args.floor_mode} "
               f"collision={args.floor_collision} floor_z={floor_z}")
+
+    # Phase-aware floor gating (see floor_phase_weight docstring): a single
+    # clip-wide floor_z is calibrated to the standing/planted-foot stance and
+    # misreads a legitimately-low lying/supine phase as penetration (measured
+    # on luigi_standSupine_08: RIGHT_HIP_X_LINK 14.4cm "penetration" the QP
+    # could never resolve, since it wasn't real). Opt-in, off by default —
+    # identity (all-1s active mask) when off, byte-for-byte unchanged from
+    # before this flag existed.
+    floor_active_frames = None
+    if args.floor_collision == "on" and args.floor_phase_aware == "on":
+        planted_any = np.zeros(T, dtype=bool)
+        for eff, info in resolved.items():
+            if info["kind"] == "foot":
+                planted_any |= planted[eff]
+        floor_phase_w = floor_phase_weight(qpos_ik[:, 2], planted_any)
+        floor_active_frames = floor_phase_w >= 0.5
+        print(f"  floor-phase-aware: root_z-based weight min={floor_phase_w.min():.2f} "
+              f"max={floor_phase_w.max():.2f} active={floor_active_frames.mean() * 100:.1f}% of frames")
 
     # Locally boost Stage A's tracking weight at floor-sensitive frames (see
     # _detect_floor_sensitive_frames docstring) so this floor-blind smoothing
@@ -1105,7 +1184,8 @@ def main():
 
     lambda_track_frames = None
     if floor_z is not None and args.floor_collision == "on":
-        sens_w = _detect_floor_sensitive_frames(model, data, qpos_ik, floor_gid, floor_z)
+        sens_w = _detect_floor_sensitive_frames(model, data, qpos_ik, floor_gid, floor_z,
+                                                floor_active_frames=floor_active_frames)
         if sens_w.any():
             boost = max(args.lambda_track, args.lambda_smooth * 2.0)
             # Continuous blend, not a step: sens_w in [0,1] (1.0 = fully
@@ -1145,8 +1225,9 @@ def main():
                          args.contact_downweight, args.n_outer, args.trust,
                          collision_penalty=args.collision_penalty,
                          floor_z=floor_z, floor_w=args.floor_weight,
-                         floor_gid=floor_gid, count_floor=count_floor)
-        s_b = all_stats(qpos_b, count_floor=count_floor)
+                         floor_gid=floor_gid, count_floor=count_floor,
+                         floor_active_frames=floor_active_frames)
+        s_b = all_stats(qpos_b, count_floor=count_floor, floor_active_frames=floor_active_frames)
 
     print("\n" + "=" * 120)
     _stats_row("per-frame IK (warm)", *s_ik)

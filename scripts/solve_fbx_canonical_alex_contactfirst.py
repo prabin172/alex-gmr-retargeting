@@ -212,6 +212,24 @@ FOOT_POS_ROLE = {"left_foot": "left_ankle", "right_foot": "right_ankle"}
 # Foot effector -> the knee position role above it (shank-tilt clamp).
 FOOT_KNEE_ROLE = {"left_foot": "left_knee", "right_foot": "right_knee"}
 
+# Arm-chain joints (shoulder -> gripper), used ONLY by the floor-transition arm
+# refinement pass (refine_arm_floor_transitions) to build a per-DOF posture_reg
+# vector that locks everything except one arm during a local re-solve.
+ARM_CHAIN_JOINTS = {
+    "left_hand": ["LEFT_SHOULDER_Y", "LEFT_SHOULDER_X", "LEFT_SHOULDER_Z",
+                  "LEFT_ELBOW_Y", "LEFT_WRIST_Z", "LEFT_WRIST_X", "LEFT_GRIPPER_Z"],
+    "right_hand": ["RIGHT_SHOULDER_Y", "RIGHT_SHOULDER_X", "RIGHT_SHOULDER_Z",
+                   "RIGHT_ELBOW_Y", "RIGHT_WRIST_Z", "RIGHT_WRIST_X", "RIGHT_GRIPPER_Z"],
+}
+
+# Arm-chain BODIES (wrist + gripper links) checked for floor engagement onset —
+# the geometry that can independently touch the floor before the hand-contact
+# detector (which is human-marker-based, not geometric) declares contact.
+ARM_CHAIN_FLOOR_BODIES = {
+    "left_hand": ["LEFT_WRIST_Z_LINK", "LEFT_WRIST_X_LINK", "LEFT_GRIPPER_Z_LINK"],
+    "right_hand": ["RIGHT_WRIST_Z_LINK", "RIGHT_WRIST_X_LINK", "RIGHT_GRIPPER_Z_LINK"],
+}
+
 # Sole corner sites per foot — mirrors solve_global_trajectory_opt_contactfirst.py's
 # SOLE_CORNER_SITES exactly (same model, same sites). Used only to measure the
 # ankle-body-to-sole-plane clearance for the target-space floor estimate (see
@@ -395,6 +413,39 @@ def ramp_envelope(flag, ramp, preroll):
                     if p < n and not base[p]:
                         env[p] = max(env[p], cosramp(ramp - k + 1))
     return env
+
+
+def floor_phase_weight(z_signal, planted_any, lo_pct=5, hi_pct=95):
+    """Per-frame [0,1] weight gating floor-collision strength by posture phase.
+
+    A single clip-wide floor_z (this file's own target-space estimate, or
+    Stage 4's `_estimate_floor_z`) is calibrated to the STANDING stance and is
+    NOT valid for a lying/supine/prone phase in the same clip — the free-
+    floating root's own vertical trajectory is not phase-invariant in this
+    pipeline's local frame (documented in wiki/concepts/grounding.md, "Get-up
+    floor residual is BETWEEN-PHASE": a foot plants several cm lower in the
+    lying phase than in the terminal standing stance, even though the true
+    physical floor is one flat plane). Forcing full-strength hard floor
+    collision through a lying phase misreads the legitimately-low pelvis/hip
+    as a violation (measured on luigi_standSupine_08: RIGHT_HIP_X_LINK 14.4cm
+    "penetration" that the QP could never resolve, since it isn't real).
+
+    Rather than clustering explicit phase windows, use `z_signal` (pelvis
+    height — target-space here, root qpos Z in Stage 4) directly: smoothstep
+    from `lo_pct` (clip-wide low reference, e.g. the lying phase) to `hi_pct`
+    of the standing/planted-foot frames (the terminal stance height, matching
+    what floor_z itself is calibrated to). No plants at all, or a clip with no
+    real phase separation (hi≈lo, e.g. a standing-only push) -> returns all-1s,
+    i.e. behaves exactly like the un-gated original (identity, no regression
+    risk for single-phase clips)."""
+    z = np.asarray(z_signal, dtype=np.float64)
+    pool = z[planted_any] if np.any(planted_any) else z
+    hi = float(np.percentile(pool, hi_pct))
+    lo = float(np.percentile(z, lo_pct))
+    if hi - lo < 1e-6:
+        return np.ones_like(z)
+    frac = np.clip((z - lo) / (hi - lo), 0.0, 1.0)
+    return frac * frac * (3.0 - 2.0 * frac)   # smoothstep
 
 
 def mj_name(model, objtype, idx):
@@ -864,12 +915,24 @@ def solve_frame_position_ik(
     floor_gid=None,
     floor_margin=0.0,
     floor_gain=5.0,
+    q_ref=None,
 ):
+    """`q_ref`: regularization target for the posture_reg term, decoupled from
+    `q_init` (the IK's warm-start / iteration starting point). Defaults to
+    `q_init` (original behaviour: "pull toward where you started"). Used by
+    refine_arm_floor_transitions to warm-start EVERY joint from Pass 1's own
+    solved pose each frame (a good starting guess) while regularizing
+    differently per joint: the target arm's chain toward the previously
+    REFINED frame (temporal continuity across the transition), everything
+    else toward Pass 1's OWN value for that exact frame (so locked joints
+    keep following their already-fine original trajectory instead of being
+    frozen — freezing them for the whole window created a NEW discontinuity
+    at the window's exit boundary when the freeze let go)."""
     data.qpos[:] = q_init
     mujoco.mj_forward(model, data)
+    q_ref = (q_init if q_ref is None else q_ref).copy()
 
     nv = model.nv
-    q_ref = q_init.copy()
 
     hold = hold_pos_roles or set()
 
@@ -983,10 +1046,19 @@ def solve_frame_position_ik(
         # Pull actuated joints toward q_ref (start of this frame's solve).
         # Root DOFs (0-5) are left at zero — the position/orientation tasks steer them.
         # Actuated joints: dq[6:35] corresponds to qpos[7:36].
+        #
+        # posture_reg may be a scalar (uniform, the original behaviour) OR a
+        # per-DOF array of length nv — used by the floor-transition arm
+        # refinement pass (see refine_arm_floor_transitions) to LOCK unrelated
+        # joints near q_ref (huge weight) while leaving one arm's chain at the
+        # normal light weight, so a local re-solve can't disturb the rest of
+        # the body while still being free to move the root (root DOFs 0-5
+        # are unaffected either way, per the comment above).
         desired_dq = np.zeros(nv)
         desired_dq[6:] = q_ref[7:] - data.qpos[7:]
-        rows2.append(np.sqrt(posture_reg) * np.eye(nv))
-        rhs2.append(np.sqrt(posture_reg) * desired_dq)
+        preg = np.full(nv, posture_reg) if np.isscalar(posture_reg) else np.asarray(posture_reg)
+        rows2.append(np.diag(np.sqrt(preg)))
+        rhs2.append(np.sqrt(preg) * desired_dq)
 
         # One-sided knee-flexion bias: KNEE_Y straight (q=0) sits exactly at the
         # joint's lower limit AND the leg Jacobian singularity. Weakly push any
@@ -1074,6 +1146,137 @@ def solve_frame_position_ik(
     return data.qpos.copy()
 
 
+def _detect_arm_floor_onset_windows(model, data, qpos, floor_gid, preroll, ramp):
+    """For each hand effector, find frames where its wrist/gripper chain first
+    touches the floor (true penetration, dist<0) after being clear, and return
+    windows [onset-preroll, onset+ramp] (clipped to the clip) with the onset
+    frame index — the swing/reach transition that Stage 3's flat floor
+    repulsion currently corrects in ONE frame with no ease-in (see
+    collisionFixPlan.md wrist-flick diagnosis).
+
+    Only ONSET (clear->penetrating) transitions matter — a body that starts
+    already penetrating and stays that way isn't a sudden reconfiguration."""
+    T = qpos.shape[0]
+    windows = {}   # eff -> list of (lo, onset, hi)
+    for eff, body_names in ARM_CHAIN_FLOOR_BODIES.items():
+        body_ids = {body_id(model, n) for n in body_names}
+        was_pen = False
+        runs = []
+        for t in range(T):
+            data.qpos[:] = qpos[t]
+            mujoco.mj_forward(model, data)
+            pen = False
+            for c in range(data.ncon):
+                ct = data.contact[c]
+                if ct.geom1 != floor_gid and ct.geom2 != floor_gid:
+                    continue
+                other = ct.geom2 if ct.geom1 == floor_gid else ct.geom1
+                if int(model.geom_bodyid[other]) in body_ids and ct.dist < 0:
+                    pen = True
+                    break
+            if pen and not was_pen:
+                lo = max(0, t - preroll)
+                hi = min(T - 1, t + ramp)
+                runs.append((lo, t, hi))
+            was_pen = pen
+        if runs:
+            windows[eff] = runs
+    return windows
+
+
+def refine_arm_floor_transitions(
+    model, data, qpos_pass1, windows, frame_cache, role_to_body_id,
+    ori_role_to_body_id, floor_weight, floor_margin, floor_gain,
+    coll_kwargs, arm_posture_reg=0.02, lock_weight=1.0e4, iters=30,
+):
+    """Second pass (collisionFixPlan.md / notes.md two-pass idea, scoped): for
+    each detected floor-onset window, LOCALLY re-solve just the affected arm's
+    chain over a short window around the transition, instead of letting Stage
+    3's single whole-body per-frame solve absorb a sudden floor-repulsion
+    demand as one large joint reconfiguration (measured: RIGHT_WRIST_X slammed
+    68deg in one frame into its hard joint limit — see collisionFixPlan.md).
+
+    Mechanism: process the window frame-by-frame, warm-starting AND
+    regularizing (posture_reg) each frame against the PREVIOUSLY REFINED frame
+    (not its own Pass-1 raw q_ref) — this is what forces temporal continuity
+    THROUGH the transition instead of jumping to it. A per-DOF posture_reg
+    vector locks every joint except the target arm's 7-joint chain at a huge
+    weight (root DOFs are always free — the posture_reg term never touches
+    them, see solve_frame_position_ik), so the local re-solve can't disturb
+    the rest of the already-good Pass-1 body, and floor_weight is
+    cosine-ramped 0->1 across the preroll leading up to the onset frame
+    (mirrors the existing contact_ramp/contact_preroll pattern used for
+    hand/foot contact, which floor_collision_rows otherwise has none of).
+
+    `frame_cache[t]` must hold the EXACT (targets, ori_targets,
+    align_constraints, pos_site_constraints, skip_pos_roles, skip_ori_body_ids,
+    ori_weight_scale, pos_weight_scale, hold_pos_roles) tuple Pass 1 used for
+    frame t — reused verbatim rather than recomputed, since target
+    construction has cross-frame state (the foot-hold anchor) that only Pass
+    1's sequential loop computes correctly."""
+    qpos_out = qpos_pass1.copy()
+    nv = model.nv
+
+    for eff, runs in windows.items():
+        chain_dofadr = [joint_info(model, n)[1] for n in ARM_CHAIN_JOINTS[eff]]
+        for lo, onset, hi in runs:
+            preg = np.full(nv, lock_weight)
+            preg[0:6] = 0.0                      # root: posture_reg never applies here anyway
+            for d in chain_dofadr:
+                preg[d] = arm_posture_reg
+
+            ramp_len = onset - lo
+            q_prev = qpos_out[max(lo - 1, 0)].copy()
+            for t in range(lo, hi + 1):
+                if ramp_len > 0 and t <= onset:
+                    w = 0.5 - 0.5 * np.cos(np.pi * (t - lo) / ramp_len)
+                else:
+                    w = 1.0
+                (targets, ori_targets, align_constraints, pos_site_constraints,
+                 skip_pos_roles, skip_ori_body_ids, ori_weight_scale,
+                 pos_weight_scale, hold_pos_roles) = frame_cache[t]
+
+                # Warm-start EVERY joint from Pass 1's OWN solved pose at this
+                # exact frame (a good starting guess — avoids drift). Regularize
+                # (q_ref) differently per joint: the target arm's chain toward
+                # q_prev (the PREVIOUSLY REFINED frame — this is what forces
+                # temporal continuity across the transition); every other joint
+                # toward its OWN Pass-1 value at this frame (so a "locked" joint
+                # keeps following whatever it was already smoothly doing,
+                # instead of being frozen at a stale value for the whole window
+                # — freezing was the bug in an earlier version: it created a
+                # NEW discontinuity when the freeze let go at the window exit).
+                q_init_t = qpos_pass1[t].copy()
+                q_ref_t = qpos_pass1[t].copy()
+                q_ref_t[7:] = np.where(
+                    np.isin(np.arange(nv - 6), np.asarray(chain_dofadr) - 6),
+                    q_prev[7:], q_ref_t[7:])
+
+                # NOTE: coll_kwargs already carries floor_gid (see main()'s
+                # coll_kwargs docstring — always passed, independent of floor
+                # avoidance, so self_collision_rows correctly excludes the
+                # floor geom) — do not pass it again here.
+                q_t = solve_frame_position_ik(
+                    model, data, role_to_body_id, targets, q_init_t,
+                    ori_role_to_body_id=ori_role_to_body_id, ori_targets=ori_targets,
+                    align_constraints=align_constraints,
+                    skip_ori_body_ids=skip_ori_body_ids,
+                    pos_site_constraints=pos_site_constraints,
+                    skip_pos_roles=skip_pos_roles,
+                    ori_weight_scale=ori_weight_scale, pos_weight_scale=pos_weight_scale,
+                    hold_pos_roles=hold_pos_roles,
+                    iters=iters, posture_reg=preg, q_ref=q_ref_t,
+                    floor_weight=w * floor_weight,
+                    floor_margin=floor_margin, floor_gain=floor_gain,
+                    **coll_kwargs,
+                )
+                qpos_out[t] = q_t
+                q_prev = q_t
+            print(f"  [floor-refine] {eff}: window [{lo},{hi}] onset={onset} "
+                  f"({hi - lo + 1} frames re-solved)")
+    return qpos_out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--canonical", required=True, type=Path)
@@ -1110,6 +1313,41 @@ def main():
                          "the floor by design; a nonzero margin would fight the contact terms)")
     ap.add_argument("--floor-gain", type=float, default=5.0,
                     help="Correction speed: target separation per metre of floor penetration (default: 5.0)")
+    ap.add_argument("--floor-phase-aware", dest="floor_phase_aware", action="store_true",
+                    default=False,
+                    help="Scale --floor-weight per-frame by floor_phase_weight() (pelvis-target-Z "
+                         "smoothstep between the clip's low phase and its planted-foot/standing "
+                         "phase). Default off (identity, byte-for-byte same as before this flag "
+                         "existed). For clips with a genuine lying/standing phase split (e.g. "
+                         "get-ups): forcing full floor collision through the lying phase misreads "
+                         "the legitimately-low pelvis as a violation (see floor_phase_weight "
+                         "docstring) — this ramps the term down there instead of applying it "
+                         "uniformly. No-op (all-1s) for single-phase clips.")
+    ap.add_argument("--floor-refine", dest="floor_refine", action="store_true", default=True,
+                    help="Second pass (only runs when --floor-weight > 0): when a hand's wrist/"
+                         "gripper chain first touches the floor (an onset the whole-body per-frame "
+                         "solve otherwise absorbs as ONE large joint reconfiguration — measured: "
+                         "RIGHT_WRIST_X slammed 68deg into its hard limit in a single frame), locally "
+                         "re-solve just that arm over a short window around the transition, warm-"
+                         "started/regularized against the PREVIOUSLY REFINED frame for temporal "
+                         "continuity, with floor_weight cosine-ramped in (matching the existing "
+                         "contact_ramp/contact_preroll pattern, which the flat floor term otherwise "
+                         "lacks). Default on (inert unless --floor-weight > 0). See "
+                         "refine_arm_floor_transitions / collisionFixPlan.md.")
+    ap.add_argument("--no-floor-refine", dest="floor_refine", action="store_false")
+    ap.add_argument("--floor-refine-preroll", type=int, default=8,
+                    help="Frames before a floor-onset event over which floor_weight ramps 0->1 "
+                         "(default: 8, matching --contact-ramp's scale)")
+    ap.add_argument("--floor-refine-ramp", type=int, default=8,
+                    help="Frames the refined window extends PAST the onset frame (default: 8)")
+    ap.add_argument("--floor-refine-posture-reg", type=float, default=0.02,
+                    help="posture_reg for the target arm's own 7 joints during refinement — higher "
+                         "than the global default (1e-3) to bias toward the previous refined frame "
+                         "for smoothness, without fighting the position/floor targets (default: 0.02)")
+    ap.add_argument("--floor-refine-lock-weight", type=float, default=1.0e4,
+                    help="posture_reg for every OTHER joint during refinement — locks them near the "
+                         "previous frame so the local re-solve can't disturb the rest of the already-"
+                         "good Pass-1 body (root DOFs are always free regardless). Default: 1e4.")
     ap.add_argument("--foot-contact-height", type=float, default=0.07,
                     help="Foot marker height (m) above clip floor below which a foot is in contact (default: 0.07)")
     ap.add_argument("--hand-contact-height", type=float, default=0.08,
@@ -1475,14 +1713,26 @@ def main():
           f"{float(np.median(planted_ankle_z)) if planted_ankle_z else float('nan'):.4f}")
 
     floor_kwargs = {}
+    floor_phase_w = np.ones(len(frame_ids))
     if args.floor_weight > 0.0:
         data.mocap_pos[floor_mocap_id] = [0.0, 0.0, alex_floor_z]
         floor_kwargs = dict(
-            floor_weight=args.floor_weight,
             floor_margin=args.floor_margin, floor_gain=args.floor_gain,
         )
         print(f"Floor repulsion (Stage-3 QP term): ON weight={args.floor_weight} "
               f"margin={args.floor_margin}")
+        if args.floor_phase_aware:
+            planted_any = np.zeros(len(frame_ids), dtype=bool)
+            for eff in FOOT_POS_ROLE:
+                planted_any |= contacts_solved[eff]
+            pelvis_z_target = np.array([
+                make_targets_for_frame(src_positions[frame_ids[t]], role_to_idx, first_src_pos,
+                                       target_rest_positions, root_scale, role_scales)["pelvis"][2]
+                for t in range(len(frame_ids))
+            ])
+            floor_phase_w = floor_phase_weight(pelvis_z_target, planted_any)
+            print(f"Floor phase weight: min={floor_phase_w.min():.2f} max={floor_phase_w.max():.2f} "
+                  f"active(>=0.5)={(floor_phase_w >= 0.5).mean() * 100:.1f}% of frames")
 
     rest_errs = {
         role: float(np.linalg.norm(initial_targets[role] - data.xpos[bid]))
@@ -1512,6 +1762,13 @@ def main():
 
     # Frames where the knee target needed the shank-tilt feasibility projection.
     shank_clamp_count = {eff: 0 for eff in FOOT_KNEE_ROLE}
+
+    # Per-frame constraint cache for the floor-transition arm refinement pass
+    # (refine_arm_floor_transitions, run after this loop) — each entry is
+    # reused VERBATIM rather than recomputed, since target construction has
+    # cross-frame state (foot_hold_anchor) only this sequential loop tracks
+    # correctly.
+    frame_cache = []
 
     for ti, src_i in enumerate(frame_ids):
         targets = make_targets_for_frame(
@@ -1678,6 +1935,10 @@ def main():
                     targets[lpr][2] = (1.0 - wcp) * zl + wcp * z_common
                     targets[rpr][2] = (1.0 - wcp) * zr + wcp * z_common
 
+        frame_cache.append((targets, ori_targets, align_constraints, pos_site_constraints,
+                           skip_pos_roles, skip_ori_body_ids, ori_weight_scale,
+                           pos_weight_scale, hold_pos_roles))
+
         q = solve_frame_position_ik(
             model,
             data,
@@ -1699,6 +1960,7 @@ def main():
             iters=args.ik_iters,
             **coll_kwargs,
             **floor_kwargs,
+            floor_weight=(args.floor_weight * float(floor_phase_w[ti]) if floor_kwargs else 0.0),
         )
 
         mujoco.mj_forward(model, data)
@@ -1787,6 +2049,28 @@ def main():
             con_str = f"  contact[{angs}]"
         if ti % args.log_every == 0 or ti == len(frame_ids) - 1:
             print(f"frame {ti:04d} source={src_i:04d} mean_err={mean_err:.4f} max_err={max_err:.4f}{coll_str}{con_str}")
+
+    # Floor-transition arm refinement (Pass 2) — see refine_arm_floor_transitions
+    # docstring / collisionFixPlan.md. Only meaningful once floor avoidance is
+    # active; inert (and skipped) otherwise.
+    if args.floor_weight > 0.0 and args.floor_refine:
+        qpos_pass1 = np.asarray(qpos_list)
+        windows = _detect_arm_floor_onset_windows(
+            model, data, qpos_pass1, floor_gid,
+            args.floor_refine_preroll, args.floor_refine_ramp)
+        if windows:
+            qpos_refined = refine_arm_floor_transitions(
+                model, data, qpos_pass1, windows, frame_cache,
+                role_to_body_id, ori_role_to_body_id,
+                args.floor_weight, args.floor_margin, args.floor_gain,
+                coll_kwargs,
+                arm_posture_reg=args.floor_refine_posture_reg,
+                lock_weight=args.floor_refine_lock_weight,
+                iters=args.ik_iters,
+            )
+            qpos_list = list(qpos_refined)
+        else:
+            print("  [floor-refine] no floor-onset transitions detected — nothing to refine")
 
     metadata = {
         "format": "alex_contactfirst_v1",
