@@ -3,11 +3,21 @@
 LLM-maintained knowledge base. Read this first, then open ONLY the pages the task needs.
 Math ground truth = `METHOD.md` (repo root). Current state = `SESSION_HANDOFF.md`. Wiki = condensed operational knowledge on top of both.
 
+## Active redesign (branch `phasic-v2`) — M0-M6 DONE
+`plan.md` (repo root) + `planLog.md` (build/verify trail) — phase-decoupled rebuild replacing the
+per-clip floor hacks with an upstream floor=0 invariant. **Start here:
+[phasic-architecture](concepts/phasic-architecture.md)** for the full phase map, contract, settled
+decisions, and ONE-config/ablation status. Pages below still describe the pre-redesign (`main`
+branch) pipeline in places unless a phasic-v2 note/FOOTGUN says otherwise.
+
 ## Concepts
+- [phasic-architecture](concepts/phasic-architecture.md) — phasic-v2 phase map (P0-P5), contracts, settled decisions, ablation, ONE-config status
 - [pipeline](concepts/pipeline.md) — 6 stages, scripts, batch entrypoint, env knobs
 - [design-philosophy](concepts/design-philosophy.md) — feasibility > verbatim; one config for all actions; settled decisions (don't re-litigate)
 - [contact-first-ik](concepts/contact-first-ik.md) — Stage 3: detection, hysteresis, blending, θ·axis flat, shank clamp, foot-hold, fist pin
 - [globalopt](concepts/globalopt.md) — Stage 4: tridiagonal Stage A + contact-aware QP Stage B, soft-slack self-collision
+- [physics-plausibility](concepts/physics-plausibility.md) — Stage 4.6 (phasic-v2, opt-in): velocity/acceleration box QP, MuJoCo tangent-space retraction
+- [limb-cleanup](concepts/limb-cleanup.md) — Stage 4.7 (phasic-v2, opt-in): root-frozen per-limb QP fixing isolated swing-limb floor/self-collision violations
 - [morphology-scaling](concepts/morphology-scaling.md) — rest-relative delta scaling, s_root vs per-role s_r
 - [orientation-frames](concepts/orientation-frames.md) — semantic frames from landmarks, world-delta transfer, facing-yaw snap
 - [grounding](concepts/grounding.md) — Stage 4.5 mesh-exact z-min planting

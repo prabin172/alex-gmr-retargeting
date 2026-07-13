@@ -418,7 +418,7 @@ def floor_phase_weight(z_signal, planted_any, lo_pct=5, hi_pct=95):
 
 def _detect_floor_sensitive_frames(model, data, qpos, floor_gid, floor_z,
                                    min_pen=0.015, min_run=8, pad=5,
-                                   floor_active_frames=None):
+                                   floor_active_frames=None, body_filter=None):
     """Boolean (T,) mask: SUSTAINED (>= min_run consecutive frames) floor
     penetration deeper than `min_pen` (default 1.5cm), padded `pad` frames
     either side.
@@ -461,7 +461,22 @@ def _detect_floor_sensitive_frames(model, data, qpos, floor_gid, floor_z,
     `floor_active_frames` (T,) bool, optional: phase gate (see
     `floor_phase_weight`) — a frame with `floor_active_frames[t] == False`
     never registers a floor violation here either, so Stage A doesn't get
-    told to protect a lying-phase "penetration" that isn't real."""
+    told to protect a lying-phase "penetration" that isn't real.
+
+    `body_filter` (set of body ids, optional): restrict which contacting body
+    counts toward `viol[t]`. Exists because a single `min_pen` doesn't
+    transfer evenly across body geometry: on luigi_standProne_03, the LEFT
+    swing foot's mesh contact bottoms out around ~1.1cm deep (never crossing
+    the default 1.5cm) even though the sole-corner SITE this codebase's other
+    floor checks use reads ~1.5cm+ -- Stage A then smooths this
+    unprotected, borderline dig from ~1.5cm to ~13cm. Lowering `min_pen`
+    globally to catch it ALSO widens protection onto unrelated hand-floor
+    windows elsewhere in the same clip, revealing a Stage-3 wrist jump Stage A
+    was separately (and correctly) smoothing away (measured: a NEW 26deg jump
+    at a hand-contact frame that a global threshold change touches by
+    accident). `body_filter` lets the caller run a SECOND, foot-scoped pass at
+    a lower threshold and combine (np.maximum) with the default-threshold,
+    unrestricted pass — tightens only where the swing-foot dig actually is."""
     T = qpos.shape[0]
     data.mocap_pos[int(model.body_mocapid[int(model.geom_bodyid[floor_gid])])] = [0.0, 0.0, floor_z]
     viol = np.zeros(T, dtype=bool)
@@ -472,9 +487,14 @@ def _detect_floor_sensitive_frames(model, data, qpos, floor_gid, floor_z,
         mujoco.mj_forward(model, data)
         for c in range(data.ncon):
             ct = data.contact[c]
-            if (ct.geom1 == floor_gid or ct.geom2 == floor_gid) and ct.dist < -min_pen:
-                viol[t] = True
-                break
+            if not (ct.geom1 == floor_gid or ct.geom2 == floor_gid) or ct.dist >= -min_pen:
+                continue
+            if body_filter is not None:
+                other = ct.geom2 if ct.geom1 == floor_gid else ct.geom1
+                if int(model.geom_bodyid[other]) not in body_filter:
+                    continue
+            viol[t] = True
+            break
 
     weight = np.zeros(T, dtype=np.float64)
     if not viol.any():
@@ -1056,6 +1076,29 @@ def main():
                          "a tilted toe mid-get-up — from passing through the floor. "
                          "on = default; off to bisect/regression-check against the old "
                          "behaviour.")
+    ap.add_argument("--sens-foot-min-pen", type=float, default=0.015,
+                    help="Foot-scoped SECOND floor-sensitivity pass (see _detect_floor_"
+                         "sensitive_frames' body_filter docstring): a lower --sens-min-pen-style "
+                         "threshold applied ONLY to leg/foot body contacts, combined (max) with "
+                         "the default-threshold pass. Catches a swing foot's shallower mesh-"
+                         "contact depth without also widening protection onto hand-floor windows "
+                         "(scoping to feet only avoided a measured new wrist jump a global "
+                         "threshold change caused). Default: 0.015 (equals --sens-min-pen, i.e. "
+                         "no-op/inert unless explicitly lowered).")
+    ap.add_argument("--sens-min-pen", type=float, default=0.015,
+                    help="_detect_floor_sensitive_frames' penetration threshold (m) for "
+                         "protecting Stage A from smoothing away a Stage-3 floor correction. "
+                         "Measured against MESH CONTACT depth (data.contact.dist), which reads "
+                         "SHALLOWER than the sole-corner-SITE depth this codebase's other floor "
+                         "checks use (e.g. eval_artifacts_corpus.py's anyPen) -- on "
+                         "luigi_standProne_03's swing-foot dig, site-depth was 1.5cm but the "
+                         "mesh contact never exceeded 1.1cm, so the default 1.5cm threshold "
+                         "misses this window entirely (protection weight stays exactly 0 across "
+                         "it) and Stage A's floor-blind smoothing drags it from a borderline "
+                         "~1.5cm miss to ~13cm. Lower cautiously -- the docstring's own warning: "
+                         "too low re-flags legitimately-planted stances (near-floor for their "
+                         "whole stance by definition) and defeats Stage A's actual smoothing job "
+                         "(measured regression: spikes 0->7). Default: 0.015 = 1.5cm.")
     ap.add_argument("--floor-phase-aware", choices=["on", "off"], default="off",
                     help="Gate --floor-collision off during a clip's low/lying-phase frames "
                          "(root-qpos-Z smoothstep between the clip's low reference and its "
@@ -1185,8 +1228,29 @@ def main():
     lambda_track_frames = None
     if floor_z is not None and args.floor_collision == "on":
         sens_w = _detect_floor_sensitive_frames(model, data, qpos_ik, floor_gid, floor_z,
+                                                min_pen=args.sens_min_pen,
                                                 floor_active_frames=floor_active_frames)
-        if sens_w.any():
+        # Foot-scoped SECOND pass at a lower threshold (see _detect_floor_
+        # sensitive_frames' body_filter docstring): a swing foot's mesh
+        # contact reads shallower than the sole-corner-site depth this
+        # codebase's other floor checks use, so the default threshold above
+        # misses it. Restricted to leg/foot bodies ONLY so it can't also
+        # widen protection onto unrelated hand-floor windows (that caused a
+        # measured NEW wrist jump when tried as a single global threshold
+        # change). No-op (sens_w unchanged) when args.sens_foot_min_pen
+        # equals args.sens_min_pen (its default).
+        sens_w_foot = None
+        if args.sens_foot_min_pen < args.sens_min_pen:
+            LEG_FOOT_BODIES = ["LEFT_HIP_X_LINK", "LEFT_HIP_Z_LINK", "LEFT_THIGH", "LEFT_SHIN",
+                               "LEFT_ANKLE_Y_LINK", "LEFT_FOOT",
+                               "RIGHT_HIP_X_LINK", "RIGHT_HIP_Z_LINK", "RIGHT_THIGH", "RIGHT_SHIN",
+                               "RIGHT_ANKLE_Y_LINK", "RIGHT_FOOT"]
+            foot_bids = {mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, n) for n in LEG_FOOT_BODIES}
+            sens_w_foot = _detect_floor_sensitive_frames(
+                model, data, qpos_ik, floor_gid, floor_z,
+                min_pen=args.sens_foot_min_pen, body_filter=foot_bids,
+                floor_active_frames=floor_active_frames)
+        if sens_w.any() or (sens_w_foot is not None and sens_w_foot.any()):
             boost = max(args.lambda_track, args.lambda_smooth * 2.0)
             # Continuous blend, not a step: sens_w in [0,1] (1.0 = fully
             # protected core, cosine-ramped to 0 over `pad` frames at each
@@ -1196,9 +1260,26 @@ def main():
             lambda_track_frames = np.tile(per_frame[:, None], (1, N_ACT))
             excl = _actuated_joint_indices(model, UNCONSTRAINED_ROLL_JOINTS)
             lambda_track_frames[:, excl] = args.lambda_track
+            # Foot-scoped boost (see body_filter docstring): applied ONLY to
+            # leg/ankle JOINT COLUMNS, never wrist/shoulder/spine, regardless
+            # of which frames sens_w_foot flags — this is what actually
+            # prevents the cross-contamination a frame-uniform boost caused
+            # (measured: a foot-scoped DETECTION alone still produced a new
+            # wrist jump, because the old code applied its result to every
+            # joint at the flagged frame, not just the leg).
+            if sens_w_foot is not None and sens_w_foot.any():
+                LEG_JOINTS = ["LEFT_HIP_X", "LEFT_HIP_Z", "LEFT_HIP_Y", "LEFT_KNEE_Y",
+                              "LEFT_ANKLE_Y", "LEFT_ANKLE_X",
+                              "RIGHT_HIP_X", "RIGHT_HIP_Z", "RIGHT_HIP_Y", "RIGHT_KNEE_Y",
+                              "RIGHT_ANKLE_Y", "RIGHT_ANKLE_X"]
+                leg_idx = _actuated_joint_indices(model, LEG_JOINTS)
+                per_frame_foot = args.lambda_track + sens_w_foot * (boost - args.lambda_track)
+                for j in leg_idx:
+                    lambda_track_frames[:, j] = np.maximum(lambda_track_frames[:, j], per_frame_foot)
+            sens_w_report = np.maximum(sens_w, sens_w_foot) if sens_w_foot is not None else sens_w
             print(f"  floor-sensitive frames (Stage-A protection): "
-                  f"{int((sens_w > 0.99).sum())}/{qpos_ik.shape[0]} fully protected "
-                  f"({int((sens_w > 0).sum())} incl. ramp), boosted λ_track={boost:.0f}")
+                  f"{int((sens_w_report > 0.99).sum())}/{qpos_ik.shape[0]} fully protected "
+                  f"({int((sens_w_report > 0).sum())} incl. ramp), boosted λ_track={boost:.0f}")
 
     print("Stage A: closed-form smoothing...")
     qpos_a = stage_a(qpos_ik, args.lambda_track, args.lambda_smooth, q_lo, q_hi,

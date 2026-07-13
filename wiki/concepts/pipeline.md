@@ -2,6 +2,12 @@
 
 Human MoCap (FBX) → canonical skeleton → contact-first MuJoCo QP IK → smoothed, grounded `qpos (T,36)` for IHMC Alex. Kinematic only — downstream physics-RL supplies torques. Full math: `METHOD.md`.
 
+> **phasic-v2 branch note**: this page describes the `main`-branch stage list. The `phasic-v2`
+> branch adds Stage 2.5 (canonical grounding, before Stage 3) and two opt-in stages, 4.6
+> (physics-plausibility) and 4.7 (limb-cleanup), between grounding (4.5) and render (5). See
+> [[phasic-architecture]] for the full phase map and [[physics-plausibility]]/[[limb-cleanup]] for
+> the new stages themselves.
+
 ## Stages
 
 | # | Stage | Script | Notes |

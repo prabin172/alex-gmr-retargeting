@@ -11,6 +11,7 @@ Single QP over actuated increments `δQ ∈ ℝ^{T·29}` (root left from Stage A
 - **Objective**: block-tridiag smoothness Hessian + per-frame tracking (contacting effector's own role down-weighted ×0.1) + contact terms.
 - **Contact anchor = per-interval median**: contact intervals split into stationary sub-segments (contact-point speed < 0.05 m/s), each anchored to its median position at foot weight **160**, hand weight **32** (soft! ×4 the 40/8 CLI defaults — pipeline passes `--foot-weight 160 --hand-weight 32`); non-stationary contact frames follow per-frame IK at ×0.15. Foot-flat (w 3.0) + fist-down (w 0.8) rows on planted frames.
 - **On-floor / coplanar rows** (2026-07-06, `--floor-weight`, pipeline `FLOOR_WEIGHT=200`): on planted frames, drive each foot's **4 sole-corner** site Zs to a shared `floor_z` (row `J_z·δq = floor_z − corner_z`). One row type gives on-floor + flat + inter-foot **coplanarity** at once. `floor_z` = median of the two feet's warm-start ground heights (`--floor-mode estimate`) so both share the correction — Stage B holds the root fixed, so leg-only reach saturates ~3 cm if one foot must travel the full gap. The position pin drops to **X,Y only** on these frames so it doesn't fight the height row; the plant-slip metric is likewise **horizontal-only for feet** (vertical foot motion is the deliberate correction, not slip). This is only a *cleanup* — the real coplanarity fix is upstream (Stage-3 coplanar targets, [[contact-first-ik]]); with those, these rows close the residual to ~0.5 cm. Cost: peak self-penetration 0.5→~1.4 cm.
+  > **FOOTGUN (2026-07-10, phasic-v2 M3) — `floor_z` under `--floor-mode estimate` is Alex's OWN achieved-qpos-frame height, NOT the canonical-human z=0 invariant** ([[grounding]], Stage 2.5). Measured corpus-wide: ranges **-0.05 (standing clips) to -0.88 (shovel/kneeling clips)** — a single clip's root Z itself spans e.g. 0.008 (lying) to 0.816 (standing). This is legitimate and expected (Alex's achieved-rest pose + morphology-scaled targets define their own frame, independent of the human canonical positions); Stage 4.5's grounding shift is what reconciles it to world z=0 at the very end. **Do not force `--floor-mode zero` expecting it to align with the upstream invariant** — tested directly on `standup_01` (the smallest-offset, best-case clip): 17.65cm penetration, 100% self-collision, 1 spike. `--floor-mode estimate` is correct as the default; it's not a phase-blind or stale estimate the way Stage 3's OLD floor_z was pre-M2 — it's freshly derived from Stage 3's OWN (now floor-corrected) output every run.
 - **Stillness debounce `plant_min_run=8` frames** (×4 knob, ≈2 @30Hz): a sub-segment must be still for ≥8 frames to count as a plant; shorter dips → moving (low weight, follow IK). Kills phantom 1-frame plants from velocity zero-crossings on a lifting-off hand. standup_side_05 right_hand slip 14.7→6.8 cm (25 single-frame blips removed). See [[metrics]].
 - **Hard constraints ONLY**: joint-limit box, trust region ±0.15 rad, self-collision inequalities (λ_coll=5).
 - **Soft-slack self-collision (always-on)**: one slack s≥0 per collision row + quadratic penalty ρ=1000. Exists because fullmesh legs made the hard inequalities primal-infeasible (424 rows vs ~80–194) → hard QP silently no-op'd (|δQ|max=0). Soft version always feasible, degrades gracefully; the old hard path + `--soft-collision` toggle are gone. See [[fullmesh-vs-primitive]].
@@ -47,6 +48,47 @@ during the stand-up transition, invisible to the planted-foot-only eval check. S
 phase boundary (~5 frames, self-pen to 2.1cm, no spikes) plus a real slip/flat-error increase
 (1.6→4.3cm, 0→5.2deg) — accepted trade. No-op for single-phase clips. See `wiki/log.md`
 2026-07-10 and `SESSION_HANDOFF.md` for the full validation.
+
+## Stage A floor-blind smoothing can AMPLIFY a borderline Stage-3 penetration (2026-07-13, `_detect_floor_sensitive_frames`)
+Stage A's per-channel tridiagonal smoothing has no floor awareness — it can blend a sharp, correct
+Stage-3 floor fix back toward its uncorrected neighbours (originally documented via
+`luigi_standProne_03`: a Stage-3-fixed 2.4cm violation came out of plain smoothing at 13.9cm,
+worse than the original 11.5cm). `_detect_floor_sensitive_frames`/`lambda_track_frames` (already
+built, gated on `--floor-collision on`) exists to locally boost Stage A's tracking weight at
+sustained mesh-contact floor violations so smoothing can't erode them — a continuous cosine-ramped
+weight, NOT a hard mask (a hard on/off step itself created spikes, `wiki/log.md`).
+
+**Found this protection has a blind spot (2026-07-13)**: measured a get-up-class swing-foot dig
+directly per-stage on `luigi_standProne_03` fr320 (ungrounded Alex frame, vs `alex_floor_z`):
+Stage 3 raw ≈ −1.5cm (borderline), Stage A alone ≈ −14cm, full Stage A+B ≈ −9cm (Stage B
+partially recovers ~5cm on top of Stage A's worse result, but nets far below Stage 3's own
+output). `_detect_floor_sensitive_frames`'s protection weight was **exactly 0.0 across this
+entire window** despite protecting 113/802 OTHER frames in the same clip — its `min_pen=0.015`
+(1.5cm) default is checked against MuJoCo mesh-CONTACT depth (`ct.dist`), which reads shallower
+(~1.1cm measured) than the sole-corner-SITE depth this codebase's other floor checks use, so a
+genuinely dig-prone window never crosses the threshold. **This is a second, independent mechanism
+from the knee-140° embodiment gap** ([[tradeoffs-limits]]) — this one is Stage-4-INTRODUCED
+(Stage 3's own output is nearly fine), the knee-140° one is Stage-3-originating (Stage 3 itself
+already deep). Confirmed the split on 3 clips: `luigi_standProne_03` (Stage4 adds ~7.5cm),
+`luigi_standSupine_08` (+2.6cm, but Stage 3 already at −17.8cm — the OTHER mechanism dominates
+there), `standup_side_05` (+3.1cm).
+
+**Fix**: `--sens-foot-min-pen` (new, default = `--sens-min-pen` = exact no-op) — a SECOND
+`_detect_floor_sensitive_frames` pass restricted to leg/foot bodies (new `body_filter` param) at a
+lower threshold, combined into a genuinely per-JOINT `lambda_track_frames` matrix (the 2D
+capability already existed, just wasn't exercised this way) so the lower threshold's boost lands
+ONLY on the 12 leg/ankle joint columns, never wrist/shoulder/spine. **A naive single global
+threshold lower (no scoping) "fixed" the dig but caused a NEW 26°/frame WRIST_X jump at an
+unrelated hand-push-phase frame** — the old code applied ANY flagged frame's boost to every joint
+uniformly (bar a small hand-roll exclusion list); scoping to feet-only detection alone was not
+enough, the joint-scoped APPLICATION was the fix. Verified on `luigi_standProne_03`
+(`SENS_FOOT_MIN_PEN=0.008`): `anyPen` 10.1→3.2cm, 0 spikes, rendered frames confirm a clean
+natural crouch (no contortion, unlike the rejected `--swing-clear`,
+`wiki/experiments/retired-approaches.md`). Corpus (fresh Stage-3+4, 20 clips): 18/20 byte-identical
+(mechanism gated on `--floor-collision on`, only 2 clips have it per-clip);
+`luigi_standSupine_08` MIXED (anyPen improves 14.0→10.7 but coll% 16.2→30.2, plPen 0.8→3.0) —
+confirms it targets the WRONG mechanism for that clip (the knee-140° one). Full trail:
+`planLog.md`/`wiki/log.md` 2026-07-13.
 
 ## FOOT_WEIGHT ceiling — residual slip is a smoothness floor, not a weight deficit (2026-07-08)
 The 6.3 cm standup_side_04 slip was **stale** — it predates the Stage-3 coplanar targets + on-floor rows. On the CURRENT config the same clip's plant-slip is **1.9 cm**. Ran `scripts/diagnose_foot_slip.py` (per-frame foot XY deviation from the frozen anchor vs max inter-limb penetration, ±6-frame windowed correlation per the mimic-repo review):
