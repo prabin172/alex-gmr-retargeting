@@ -28,6 +28,13 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
+from contact_labels import (
+    CONTACT_EFFECTORS,
+    detect_contacts_from_human,
+    debounce_flags,
+    ramp_envelope,
+)
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -138,45 +145,11 @@ ORI_WEIGHTS = {
 # ---------------------------------------------------------------------------
 # Contact-first configuration
 # ---------------------------------------------------------------------------
-# Each end effector that can take ground support. `markers` are canonical human
-# roles used to detect contact; `body` is the Alex body whose axis we align;
-# `axis_local` is that body's local axis to drive; `world_dir` is where it must
-# point during contact; `ori_role` is the world-delta orientation term to
-# suppress while in contact (the contact constraint replaces it).
-CONTACT_EFFECTORS = {
-    "left_foot": dict(
-        markers=["left_ankle", "left_toe"],
-        body="LEFT_FOOT",
-        axis_local=np.array([0.0, 0.0, 1.0]),   # foot up-axis
-        world_dir=np.array([0.0, 0.0, 1.0]),    # -> world +Z (flat)
-        ori_role="left_foot",
-        # Only treat as a flat support when the *human* foot is itself near-flat:
-        # the canonical foot frame's local-Z (sole normal) within tilt of world +Z.
-        flat_ori_role="left_foot",
-    ),
-    "right_foot": dict(
-        markers=["right_ankle", "right_toe"],
-        body="RIGHT_FOOT",
-        axis_local=np.array([0.0, 0.0, 1.0]),
-        world_dir=np.array([0.0, 0.0, 1.0]),
-        ori_role="right_foot",
-        flat_ori_role="right_foot",
-    ),
-    "left_hand": dict(
-        markers=["left_wrist", "left_hand_middle"],
-        body="LEFT_GRIPPER_Z_LINK",
-        axis_local=np.array([1.0, 0.0, 0.0]),   # gripper +X = palm/finger-front normal
-        world_dir=np.array([0.0, 0.0, -1.0]),   # -> world -Z (press down)
-        ori_role="left_hand",
-    ),
-    "right_hand": dict(
-        markers=["right_wrist", "right_hand_middle"],
-        body="RIGHT_GRIPPER_Z_LINK",
-        axis_local=np.array([1.0, 0.0, 0.0]),
-        world_dir=np.array([0.0, 0.0, -1.0]),
-        ori_role="right_hand",
-    ),
-}
+# CONTACT_EFFECTORS (imported above from contact_labels.py): `markers` are
+# canonical human roles used to detect contact; `body` is the Alex body whose
+# axis we align; `axis_local` is that body's local axis to drive; `world_dir` is
+# where it must point during contact; `ori_role` is the world-delta orientation
+# term to suppress while in contact (the contact constraint replaces it).
 
 # Weight of the contact axis-alignment term (replaces the human ori term while
 # in contact). Feet: high (foot-flat is the goal and the gate ensures it is
@@ -211,6 +184,17 @@ FOOT_POS_ROLE = {"left_foot": "left_ankle", "right_foot": "right_ankle"}
 
 # Foot effector -> the knee position role above it (shank-tilt clamp).
 FOOT_KNEE_ROLE = {"left_foot": "left_knee", "right_foot": "right_knee"}
+
+# Leg-chain joints (hip -> ankle), used by refine_leg_floor_transitions to build
+# a per-DOF posture_reg vector that locks everything except one leg (mirrors
+# ARM_CHAIN_JOINTS below for refine_arm_floor_transitions). Names match
+# refine_limbs_contactfirst.py's LIMB_CHAINS for consistency across scripts.
+LEG_CHAIN_JOINTS = {
+    "left_foot": ["LEFT_HIP_X", "LEFT_HIP_Z", "LEFT_HIP_Y", "LEFT_KNEE_Y",
+                  "LEFT_ANKLE_Y", "LEFT_ANKLE_X"],
+    "right_foot": ["RIGHT_HIP_X", "RIGHT_HIP_Z", "RIGHT_HIP_Y", "RIGHT_KNEE_Y",
+                   "RIGHT_ANKLE_Y", "RIGHT_ANKLE_X"],
+}
 
 # Arm-chain joints (shoulder -> gripper), used ONLY by the floor-transition arm
 # refinement pass (refine_arm_floor_transitions) to build a per-DOF posture_reg
@@ -249,170 +233,6 @@ SOLE_CORNER_SITES = {
     ],
 }
 
-
-def detect_contacts_from_human(positions, role_to_idx, fps, *,
-                               orientation_mats=None, ori_to_idx=None,
-                               foot_height=0.07, hand_height=0.08,
-                               speed_thresh=0.4, foot_flat_tilt=40.0, floor_pct=1.0,
-                               foot_flat_margin=6.0, foot_flat_min_base_frames=20,
-                               on_height_frac=1.0, on_speed_frac=1.0,
-                               onset_max_delay=0.15):
-    """Per-frame ground-contact flags for each effector, from human mocap.
-
-    An effector is "in contact" at frame t when the lowest of its markers is
-    within `*_height` metres of the clip floor AND moving slower than
-    `speed_thresh` (m/s). The floor is the low percentile of the feet markers'
-    height across the whole clip.
-
-    Onset hysteresis (`on_height_frac`/`on_speed_frac` < 1): the START of each
-    contact interval is delayed until the effector passes STRICTER thresholds
-    (height*frac, speed*frac) — the loose thresholds fire while it is still
-    descending into a pose. The delay is capped at `onset_max_delay` seconds so
-    a crouched plant that hovers under the loose gate without ever passing the
-    strict one is trimmed, never dropped (uncapped hysteresis deleted whole
-    genuine plant intervals on get-up clips). Release unchanged. 1.0/1.0 = off.
-
-    For effectors with a `flat_ori_role`, contact additionally requires the
-    *human* segment to be near-flat. This distinguishes a flat plantar support
-    from a foot that is merely near the floor while folded (toes/side down during
-    a get-up), where forcing the robot foot flat would just fight tracking.
-
-    IMPORTANT — the flatness gate is RELATIVE to a per-foot self-calibrated
-    baseline, not absolute. The canonical foot frame's local-Z is NOT the true
-    sole normal: `x = toe−ankle` is the foot's bone axis, declined ~18° below
-    horizontal (ankle sits above the grounded toe), so a perfectly FLAT foot reads
-    ~18° tilt (+ a ~4° L/R skew) — pure frame geometry, not motion (see
-    wiki/concepts/orientation-frames.md FOOTGUN). Gating raw `tilt < 40°` is
-    therefore nearly inert. Instead we estimate each foot's own flat baseline as
-    the p15 of its tilt over height+speed candidate-contact frames (robust to the
-    tilted phantoms in the tail), and require `tilt − baseline < foot_flat_margin`.
-    Falls back to the absolute `tilt < foot_flat_tilt` cap if a foot has fewer
-    than `foot_flat_min_base_frames` candidate frames (baseline unreliable).
-
-    Returns: (dict effector -> bool array (N,), floor_z).
-    """
-    N = positions.shape[0]
-    dt = 1.0 / float(fps)
-
-    def marker_z(role):
-        return positions[:, role_to_idx[role], 2]
-
-    def marker_speed(role):
-        p = positions[:, role_to_idx[role], :]
-        v = np.zeros(N)
-        v[1:] = np.linalg.norm(np.diff(p, axis=0), axis=1) / dt
-        v[0] = v[1] if N > 1 else 0.0
-        return v
-
-    # Floor estimate from the feet markers (lowest they reach).
-    foot_roles = [r for eff in ("left_foot", "right_foot")
-                  for r in CONTACT_EFFECTORS[eff]["markers"] if r in role_to_idx]
-    foot_min_z = np.min([marker_z(r) for r in foot_roles], axis=0)
-    floor_z = float(np.percentile(foot_min_z, floor_pct))
-
-    contacts = {}
-    for eff, cfg in CONTACT_EFFECTORS.items():
-        markers = [r for r in cfg["markers"] if r in role_to_idx]
-        if not markers:
-            contacts[eff] = np.zeros(N, dtype=bool)
-            continue
-        h = np.min([marker_z(r) for r in markers], axis=0) - floor_z
-        spd = np.min([marker_speed(r) for r in markers], axis=0)
-        hthr = foot_height if "foot" in eff else hand_height
-        flag = (h < hthr) & (spd < speed_thresh)
-
-        flat_role = cfg.get("flat_ori_role")
-        if flat_role is not None and orientation_mats is not None and ori_to_idx is not None \
-                and flat_role in ori_to_idx:
-            up = orientation_mats[:, ori_to_idx[flat_role], :, 2]  # frame local-Z (NOT true sole normal)
-            tilt = np.degrees(np.arccos(np.clip(np.abs(up @ np.array([0.0, 0.0, 1.0])), -1, 1)))
-            # Per-foot self-calibrated flat baseline from height+speed candidate frames
-            # (p15 = the foot's flattest ≈ its anatomical ~18° declination; robust to
-            # tilted phantoms which live in the upper tail). Gate on tilt-above-baseline.
-            cand = tilt[flag]
-            if cand.size >= foot_flat_min_base_frames:
-                base = float(np.percentile(cand, 15))
-                flag = flag & ((tilt - base) < foot_flat_margin)
-            else:
-                flag = flag & (tilt < foot_flat_tilt)   # too few candidates → absolute cap
-
-        if on_height_frac < 1.0 or on_speed_frac < 1.0:
-            strict = flag & (h < hthr * on_height_frac) & (spd < speed_thresh * on_speed_frac)
-            cap = max(0, int(round(onset_max_delay * fps)))
-            out = np.zeros(N, dtype=bool)
-            t = 0
-            while t < N:
-                if not flag[t]:
-                    t += 1
-                    continue
-                a = t
-                while t < N and flag[t]:
-                    t += 1
-                b = t                                   # loose interval [a, b)
-                s = np.where(strict[a:b])[0]
-                onset = a + (min(int(s[0]), cap) if len(s) else cap)
-                out[min(onset, b - 1):b] = True         # trim the start, never drop
-            flag = out
-
-        contacts[eff] = flag
-
-    return contacts, floor_z
-
-
-def debounce_flags(flag, min_run):
-    """Remove ON/OFF runs shorter than min_run (fill gaps, drop specks).
-
-    Kills marginal-threshold flicker without touching genuine long contacts."""
-    if min_run <= 1:
-        return flag.copy()
-    out = flag.copy().astype(bool)
-    n = len(out)
-    # drop short ON specks, then fill short OFF gaps
-    for target in (True, False):
-        i = 0
-        while i < n:
-            j = i
-            while j < n and out[j] == out[i]:
-                j += 1
-            if out[i] == target and (j - i) < min_run and not (i == 0 and j == n):
-                out[i:j] = not target
-            i = j
-    return out
-
-
-def ramp_envelope(flag, ramp, preroll):
-    """Per-frame contact weight in [0,1] from a boolean contact timeline.
-
-    `preroll` extends each contact earlier (anticipation: begin easing the foot/
-    hand toward the support face before touchdown). `ramp` applies a cosine rise
-    into each leading edge and fall out of each trailing edge, so the contact
-    constraints cross-fade in/out instead of snapping at full weight."""
-    n = len(flag)
-    base = flag.copy().astype(bool)
-    if preroll > 0:
-        pr = base.copy()
-        idx = np.where(base)[0]
-        for i in idx:
-            pr[max(0, i - preroll):i] = True
-        base = pr
-    env = base.astype(np.float64)
-    if ramp > 0:
-        def cosramp(k):   # k=1..ramp -> rises toward 1
-            return 0.5 * (1.0 - np.cos(np.pi * k / (ramp + 1)))
-        for i in range(n):
-            if not base[i]:
-                continue
-            if i == 0 or not base[i - 1]:            # leading edge -> ramp preceding frames
-                for k in range(1, ramp + 1):
-                    p = i - k
-                    if p >= 0 and not base[p]:
-                        env[p] = max(env[p], cosramp(ramp - k + 1))
-            if i == n - 1 or not base[i + 1]:        # trailing edge -> ramp following frames
-                for k in range(1, ramp + 1):
-                    p = i + k
-                    if p < n and not base[p]:
-                        env[p] = max(env[p], cosramp(ramp - k + 1))
-    return env
 
 
 def floor_phase_weight(z_signal, planted_any, lo_pct=5, hi_pct=95):
@@ -529,7 +349,18 @@ def load_canonical(npz_path: Path):
     ori_to_idx = {r: i for i, r in enumerate(orientation_roles)}
     orientation_mats = np.asarray(z["orientation_mats"], dtype=np.float64)
 
-    return roles, role_to_idx, positions, fps, orientation_roles, ori_to_idx, orientation_mats
+    # Persisted contact labels from Stage 2.5 (scripts/ground_canonical_human.py,
+    # phasic-v2 M1). None/None when absent (a plain _with_orient.npz that never
+    # went through grounding) -- main() falls back to on-the-fly detection.
+    persisted_contacts = None
+    persisted_eff_names = None
+    if "contact_flags" in z.files and "contact_effector_names" in z.files:
+        persisted_eff_names = [str(x) for x in z["contact_effector_names"]]
+        flags = np.asarray(z["contact_flags"], dtype=bool)
+        persisted_contacts = {e: flags[:, i] for i, e in enumerate(persisted_eff_names)}
+
+    return (roles, role_to_idx, positions, fps, orientation_roles, ori_to_idx, orientation_mats,
+            persisted_contacts, persisted_eff_names)
 
 
 def measure_alex_pelvis_to_head(model, data, role_to_body_id):
@@ -669,6 +500,51 @@ def rotmat_to_rotvec(R):
     ], dtype=np.float64) / (2.0 * np.sin(theta))
 
     return theta * axis
+
+
+def _expmap(rotvec):
+    """Axis-angle (world-frame small rotation vector) -> rotation matrix (Rodrigues)."""
+    th = float(np.linalg.norm(rotvec))
+    if th < 1e-12:
+        return np.eye(3)
+    k = np.asarray(rotvec, dtype=np.float64) / th
+    K = np.array([[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]])
+    return np.eye(3) + np.sin(th) * K + (1.0 - np.cos(th)) * (K @ K)
+
+
+def cap_foot_pitch(R, max_toe_down_rad, lift_frac):
+    """Rotate a foot orientation target R so its forward (+X local) axis points no
+    more than `max_toe_down_rad` below horizontal. `lift_frac` in [0,1] ramps the
+    correction (1 = full cap, 0 = untouched); used to fade the cap in over the swing
+    phase via the contact envelope. Only ever tilts the toe UP, never down. Yaw
+    (foot heading) and orthonormality are preserved (verified). Used by the
+    swing-foot toe-clearance path (--swing-clear); see the main loop for rationale."""
+    R = np.asarray(R, dtype=np.float64)
+    fwd = R @ np.array([1.0, 0.0, 0.0])
+    pitch = float(np.arcsin(np.clip(-fwd[2], -1.0, 1.0)))   # +ve = toe-down
+    if pitch <= max_toe_down_rad or lift_frac <= 0.0:
+        return R
+    delta = lift_frac * (pitch - max_toe_down_rad)
+    a = np.array([-fwd[1], fwd[0], 0.0])   # horizontal axis perpendicular to fwd's vertical plane
+    na = float(np.linalg.norm(a))
+    a = a / na if na > 1e-6 else np.array([0.0, 1.0, 0.0])  # foot near-vertical: fall back to world +Y
+    R1 = _expmap(a * delta) @ R
+    R2 = _expmap(-a * delta) @ R
+    p1 = float(np.arcsin(np.clip(-(R1 @ np.array([1.0, 0.0, 0.0]))[2], -1.0, 1.0)))
+    p2 = float(np.arcsin(np.clip(-(R2 @ np.array([1.0, 0.0, 0.0]))[2], -1.0, 1.0)))
+    return R1 if abs(p1 - max_toe_down_rad) < abs(p2 - max_toe_down_rad) else R2
+
+
+def _swing_posture_reg(nv, leg_dofs, boost):
+    """Per-DOF posture_reg for the swing-clear temporal-continuity term: the base
+    1e-3 everywhere, plus `boost` added on the hip/knee leg DOFs only. `boost` is
+    already ramped by the de-pitch strength, so at boost=0 this is uniform 1e-3
+    (identical to the scalar default -> exact no-op off de-pitch frames)."""
+    preg = np.full(nv, 1e-3, dtype=np.float64)
+    if boost > 0.0:
+        for d in leg_dofs:
+            preg[d] += boost
+    return preg
 
 
 def body_xmat(data, body_id):
@@ -916,7 +792,28 @@ def solve_frame_position_ik(
     floor_margin=0.0,
     floor_gain=5.0,
     q_ref=None,
+    floor_hard=False,
+    swing_clear_sites=None,
+    diag_out=None,
 ):
+    """`floor_hard` (hierarchical-v1 H2): route floor_collision_rows into the
+    level-1 (hard) tier instead of level-2 (soft) -- only meaningful when
+    `hierarchical=True` (rows1 is otherwise concatenated with rows2 into a
+    single weighted solve, so the routing is a no-op). Deliberately does NOT
+    touch hand contacts (see --hard-tier's help text / wiki/experiments/
+    retired-approaches.md) -- hands stay in rows2 exactly as before, whatever
+    `hierarchical`/`floor_hard` are set to.
+
+    `diag_out` (optional mutable dict): if provided, filled in-place after
+    the iteration loop with `floor_pen_cm` (deepest floor penetration
+    remaining, any geom) and `hold_slip_cm` (max XY distance between an
+    active hold_pos_roles target -- already the frozen anchor blend by the
+    time this function is called -- and its ACHIEVED position). Adapts
+    plan.md's original OSQP-slack-and-log H2 sketch to this solver's actual
+    architecture (damped least-squares nullspace projection, not OSQP -- it
+    never reports infeasible, so the analogous signal is "how far did the
+    hard tier's own tasks land from where they were asked to be" rather
+    than a slack variable)."""
     """`q_ref`: regularization target for the posture_reg term, decoupled from
     `q_init` (the IK's warm-start / iteration starting point). Defaults to
     `q_init` (original behaviour: "pull toward where you started"). Used by
@@ -1096,8 +993,31 @@ def solve_frame_position_ik(
             floor_rows, floor_rhs = floor_collision_rows(
                 model, data, nv, floor_weight, floor_gid, floor_margin, floor_gain,
             )
-            rows2.extend(floor_rows)
-            rhs2.extend([np.array([v]) for v in floor_rhs])
+            if floor_hard:
+                rows1.extend(floor_rows)
+                rhs1.extend([np.array([v]) for v in floor_rhs])
+            else:
+                rows2.extend(floor_rows)
+                rhs2.extend([np.array([v]) for v in floor_rhs])
+
+        # Swing-foot toe-clearance (--swing-clear, soft half). One-sided Z rows:
+        # any listed sole-corner site currently below its clearance target is
+        # pulled UP to it, weighted per (site, clear_z, weight). Soft (level 2) and
+        # re-evaluated every IK iteration against the CURRENT site height, so the
+        # correction is exactly the residual dip and the solver stays near its
+        # warm-start (continuous) -- unlike the hard pitch cap, this cannot force a
+        # large leg reconfiguration / branch flip. Only swing (non-planted) feet
+        # are ever listed (see main loop), so planted feet are untouched.
+        if swing_clear_sites:
+            for _sid, _clear_z, _w in swing_clear_sites:
+                cur_z = float(data.site_xpos[_sid][2])
+                if cur_z >= _clear_z or _w <= 0.0:
+                    continue
+                jacp = np.zeros((3, nv), dtype=np.float64)
+                mujoco.mj_jacSite(model, data, jacp, None, _sid)
+                sqw = float(np.sqrt(_w))
+                rows2.append(sqw * jacp[2:3, :])
+                rhs2.append(np.array([sqw * (_clear_z - cur_z)]))
 
         I_nv = np.eye(nv)
 
@@ -1142,6 +1062,23 @@ def solve_frame_position_ik(
         data.qpos[3:7] /= np.linalg.norm(data.qpos[3:7])
 
         mujoco.mj_forward(model, data)
+
+    if diag_out is not None:
+        max_floor_pen = 0.0
+        if floor_gid is not None:
+            for cc in range(data.ncon):
+                ct = data.contact[cc]
+                if ct.geom1 != floor_gid and ct.geom2 != floor_gid:
+                    continue
+                max_floor_pen = max(max_floor_pen, -float(ct.dist))
+        diag_out["floor_pen_cm"] = max_floor_pen * 100.0
+        max_hold_slip = 0.0
+        for role in hold:
+            bid = role_to_body_id.get(role)
+            if bid is None or role not in targets:
+                continue
+            max_hold_slip = max(max_hold_slip, float(np.linalg.norm((data.xpos[bid] - targets[role])[:2])))
+        diag_out["hold_slip_cm"] = max_hold_slip * 100.0
 
     return data.qpos.copy()
 
@@ -1277,6 +1214,169 @@ def refine_arm_floor_transitions(
     return qpos_out
 
 
+def _leg_floor_pen_flags(model, data, qpos, alex_floor_z, sole_corner_sids, pen_tol):
+    """Per-frame boolean: does this foot's lowest sole corner sit more than
+    `pen_tol` below `alex_floor_z`? Purely geometric (mesh-accurate site
+    height vs the same target-space floor estimate the rest of Stage 3 uses)
+    -- deliberately independent of the contact-flag 'planted' label, since the
+    failure mode this feeds (refine_leg_floor_transitions) can be labelled
+    EITHER way: a swinging foot (unplanted) or a genuinely 'planted' foot
+    whose registration/phase-gating still leaves it penetrating (e.g. the
+    knee-140deg-saturated deep-tuck case, see wiki/results/tradeoffs-limits.md)."""
+    T = qpos.shape[0]
+    flags = np.zeros(T, dtype=bool)
+    for t in range(T):
+        data.qpos[:] = qpos[t]
+        mujoco.mj_forward(model, data)
+        z = min(float(data.site_xpos[s][2]) for s in sole_corner_sids)
+        flags[t] = (z - alex_floor_z) < -pen_tol
+    return flags
+
+
+def refine_leg_floor_transitions(
+    model, data, qpos_pass1, frame_cache, role_to_body_id, ori_role_to_body_id,
+    alex_floor_z, ankle_clearance, coll_kwargs,
+    pen_tol=0.015, ramp=20, preroll=20,
+    leg_posture_reg=0.02, lock_weight=1.0e4,
+    root_pos_relief=0.3, foot_flat_weight=3.0, iters=30,
+):
+    """Third floor-transition refine pass (mirrors refine_arm_floor_transitions's
+    architecture, targets a DIFFERENT failure mode). A prior attempt at get-up
+    swing-foot floor penetration (`--swing-clear`, an orientation-pitch-cap
+    only) drove the numbers down but CONTORTED the leg on TUCKED phases --
+    forcing a foot flat while it sits folded under the body, without letting
+    the leg/root reconfigure, demands a locally infeasible pose (rejected on
+    visual review, see wiki/experiments/retired-approaches.md). The root cause
+    there wasn't the orientation cap per se, it was that nothing else was
+    given room to move.
+
+    This pass instead SYNTHESIZES A TEMPORARY PLANT for the ramped window: the
+    ankle position target is blended toward floor+clearance and a foot-flat
+    align_constraint (the SAME mechanism a genuine contact uses) is turned on
+    -- i.e. treat the foot as if it just committed to the ground, exactly like
+    an already-proven real plant, rather than only editing its orientation.
+    Critically, pelvis/torso POSITION TRACKING is ALSO relaxed
+    (pos_weight_scale) during the window so the ROOT (translation, and
+    indirectly pitch via the whole-body solve) is actually free to rise/shift
+    to make room for the leg -- Stage 3 already solves root position freely
+    (posture_reg never touches DOFs 0-5, same convention as
+    refine_arm_floor_transitions), the missing piece was that pelvis/torso's
+    OWN heavy tracking weight was fighting that freedom every single frame.
+
+    Detection is geometric (see _leg_floor_pen_flags), not contact-flag-based,
+    so it also catches a nominally-'planted' foot left penetrating by
+    phase-aware gating (the luigi_standSupine_08 knee-140 case).
+
+    Same temporal-continuity trick as the arm pass: warm-start every touched
+    frame from Pass 1's OWN value (good initial guess), regularize the leg
+    chain toward the PREVIOUSLY REFINED frame (not a frozen value -- avoids
+    creating a new discontinuity at the window's exit), lock everything else
+    at `lock_weight` so a local re-solve can't disturb an already-good body.
+    Uses `ramp_envelope` (imported from contact_labels, the SAME cosine
+    onset/release ramp every contact term in this codebase uses) so a
+    multi-frame sustained dig gets a full-strength plateau, not just a
+    fixed-width bump around a single onset instant -- unlike the arm pass's
+    abrupt bumps, a tuck-phase dig can last many tens of frames."""
+    qpos_out = qpos_pass1.copy()
+    nv = model.nv
+
+    for eff, sole_sids in SOLE_CORNER_SITES.items():
+        sids = [site_id(model, s) for s in sole_sids]
+        pen_flags = _leg_floor_pen_flags(model, data, qpos_pass1, alex_floor_z, sids, pen_tol)
+        if not pen_flags.any():
+            continue
+        alpha = ramp_envelope(pen_flags, ramp, preroll)
+
+        # Contiguous nonzero segments of alpha are independent "windows" for
+        # q_prev-reset purposes (a later, separate dig event on the same foot
+        # must not warm-continuity from a much earlier one).
+        T = qpos_pass1.shape[0]
+        touched = np.where(alpha > 1e-9)[0]
+        if touched.size == 0:
+            continue
+        segments = []
+        seg_start = touched[0]
+        prev_t = touched[0]
+        for t in touched[1:]:
+            if t != prev_t + 1:
+                segments.append((seg_start, prev_t))
+                seg_start = t
+            prev_t = t
+        segments.append((seg_start, prev_t))
+
+        ank_role = FOOT_POS_ROLE[eff]
+        cfg = CONTACT_EFFECTORS[eff]
+        foot_bid = body_id(model, cfg["body"])
+        ori_bid = ori_role_to_body_id[cfg["ori_role"]]
+        chain_dofadr = [joint_info(model, n)[1] for n in LEG_CHAIN_JOINTS[eff]]
+
+        preg = np.full(nv, lock_weight)
+        preg[0:6] = 0.0                     # root: always free, matches arm-refine
+        for d in chain_dofadr:
+            preg[d] = leg_posture_reg
+
+        n_frames_touched = 0
+        for lo, hi in segments:
+            q_prev = qpos_out[max(lo - 1, 0)].copy()
+            for t in range(lo, hi + 1):
+                w = float(alpha[t])
+                if w <= 0.0:
+                    continue
+                (targets, ori_targets, align_constraints, pos_site_constraints,
+                 skip_pos_roles, skip_ori_body_ids, ori_weight_scale,
+                 pos_weight_scale, hold_pos_roles) = frame_cache[t]
+
+                # Synthetic plant: blend the ankle Z target toward floor+clearance
+                # (never touches XY -- this is a vertical rest correction, not a
+                # foot relocation) and add a foot-flat align constraint, ramped
+                # by w. Copy dicts/lists -- must not mutate frame_cache (shared
+                # across effectors/other refine passes).
+                targets_t = dict(targets)
+                rest_z = alex_floor_z + ankle_clearance
+                tgt = targets[ank_role].copy()
+                tgt[2] = (1.0 - w) * tgt[2] + w * rest_z
+                targets_t[ank_role] = tgt
+
+                align_constraints_t = list(align_constraints) + [
+                    (foot_bid, cfg["axis_local"], cfg["world_dir"], foot_flat_weight * w, True)
+                ]
+                ori_weight_scale_t = dict(ori_weight_scale)
+                ori_weight_scale_t[ori_bid] = min(ori_weight_scale_t.get(ori_bid, 1.0), 1.0 - w)
+
+                # Relax pelvis/torso tracking so the root is actually free to
+                # rise/shift to make room for the leg (see docstring) -- scaled
+                # from 1.0 (untouched) down to root_pos_relief at full w.
+                pos_weight_scale_t = dict(pos_weight_scale)
+                for role in ("pelvis", "torso"):
+                    base = pos_weight_scale_t.get(role, 1.0)
+                    pos_weight_scale_t[role] = base * (1.0 - w * (1.0 - root_pos_relief))
+
+                q_init_t = qpos_pass1[t].copy()
+                q_ref_t = qpos_pass1[t].copy()
+                q_ref_t[7:] = np.where(
+                    np.isin(np.arange(nv - 6), np.asarray(chain_dofadr) - 6),
+                    q_prev[7:], q_ref_t[7:])
+
+                q_t = solve_frame_position_ik(
+                    model, data, role_to_body_id, targets_t, q_init_t,
+                    ori_role_to_body_id=ori_role_to_body_id, ori_targets=ori_targets,
+                    align_constraints=align_constraints_t,
+                    skip_ori_body_ids=skip_ori_body_ids,
+                    pos_site_constraints=pos_site_constraints,
+                    skip_pos_roles=skip_pos_roles,
+                    ori_weight_scale=ori_weight_scale_t, pos_weight_scale=pos_weight_scale_t,
+                    hold_pos_roles=hold_pos_roles,
+                    iters=iters, posture_reg=preg, q_ref=q_ref_t,
+                    **coll_kwargs,
+                )
+                qpos_out[t] = q_t
+                q_prev = q_t
+                n_frames_touched += 1
+        print(f"  [leg-floor-refine] {eff}: {len(segments)} window(s), "
+              f"{n_frames_touched} frames re-solved (pen_tol={pen_tol*100:.1f}cm)")
+    return qpos_out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--canonical", required=True, type=Path)
@@ -1348,6 +1448,39 @@ def main():
                     help="posture_reg for every OTHER joint during refinement — locks them near the "
                          "previous frame so the local re-solve can't disturb the rest of the already-"
                          "good Pass-1 body (root DOFs are always free regardless). Default: 1e4.")
+    ap.add_argument("--leg-floor-refine", dest="leg_floor_refine", action="store_true", default=False,
+                    help="Third floor-transition refine pass (see refine_leg_floor_transitions): a "
+                         "tucked/deep-crouch leg whose rigid foot plate or knee-range limit drives it "
+                         "through the floor even with a faithful human copy (the knee-140deg embodiment "
+                         "gap, wiki/results/tradeoffs-limits.md) gets a local re-solve that synthesizes "
+                         "a temporary PLANT (ankle blended to floor+clearance, foot-flat align turned "
+                         "on) AND relaxes pelvis/torso tracking so the root can rise/shift to make room. "
+                         "Supersedes the rejected --swing-clear (orientation-cap-only, contorted tucked "
+                         "legs). Default off, independent of --floor-weight/--floor-refine.")
+    ap.add_argument("--leg-floor-refine-pen-tol", type=float, default=0.015,
+                    help="With --leg-floor-refine: trigger when a foot's lowest sole corner sits more "
+                         "than this (m) below the target-space floor estimate (default: 0.015 = 1.5cm)")
+    ap.add_argument("--leg-floor-refine-preroll", type=int, default=20,
+                    help="With --leg-floor-refine: frames the ramp extends BEFORE a penetration onset "
+                         "(default: 20 — wider than the arm pass's 8, since a tuck-phase dig develops "
+                         "more gradually than a sudden reach)")
+    ap.add_argument("--leg-floor-refine-ramp", type=int, default=20,
+                    help="With --leg-floor-refine: cosine ramp width (frames) at each penetration run's "
+                         "onset/release edge (default: 20)")
+    ap.add_argument("--leg-floor-refine-posture-reg", type=float, default=0.02,
+                    help="With --leg-floor-refine: posture_reg for the target leg's own 6 joints during "
+                         "refinement (default: 0.02, matches the arm pass)")
+    ap.add_argument("--leg-floor-refine-lock-weight", type=float, default=1.0e4,
+                    help="With --leg-floor-refine: posture_reg for every OTHER joint (default: 1e4, "
+                         "matches the arm pass; root DOFs always free regardless)")
+    ap.add_argument("--leg-floor-refine-root-relief", type=float, default=0.3,
+                    help="With --leg-floor-refine: at full window strength, scale pelvis/torso position "
+                         "tracking weight to this fraction of normal (default: 0.3) so the root is free "
+                         "to rise/shift and relieve a knee-saturated leg instead of the foot being "
+                         "forced flat while pelvis/torso stay rigidly pinned to the human copy.")
+    ap.add_argument("--leg-floor-refine-flat-weight", type=float, default=3.0,
+                    help="With --leg-floor-refine: foot-flat align_constraint weight at full window "
+                         "strength (default: 3.0, matches --foot-flat-weight's default)")
     ap.add_argument("--foot-contact-height", type=float, default=0.07,
                     help="Foot marker height (m) above clip floor below which a foot is in contact (default: 0.07)")
     ap.add_argument("--hand-contact-height", type=float, default=0.08,
@@ -1379,6 +1512,57 @@ def main():
                          "forward axis to the HUMAN foot heading so the planted foot follows the "
                          "human's small heading change instead of free-drifting (inner/outer slip). "
                          "0 disables (default: 1.5)")
+    ap.add_argument("--swing-clear", dest="swing_clear", action="store_true", default=False,
+                    help="Swing-foot toe-clearance: on airborne (non-planted) foot frames, cap the "
+                         "toe-down pitch of the foot ORIENTATION target so the IK spends Alex's unused "
+                         "ankle dorsiflexion headroom to lift the toe instead of copying the human's "
+                         "plantarflexed low-step pose (which drives the rigid ~20cm foot plate's toe "
+                         "corner through the floor -- measured 10-18cm on the get-up clip class). "
+                         "Ramped by the contact envelope (full cap airborne, fades to 0 as the foot "
+                         "plants). Deliberately deviates from the human mid-step (feasible+smooth > "
+                         "faithful-but-underground). Default off.")
+    ap.add_argument("--swing-max-pitch", type=float, default=5.0,
+                    help="With --swing-clear: max allowed toe-down pitch (deg) of a swing foot's "
+                         "forward axis below horizontal. 5 (aggressive) drives swing-foot floor "
+                         "penetration ~10->1.5cm on the get-up class. It is SAFE from the per-frame-IK "
+                         "branch flip (which Stage-4 cannot smooth) BECAUSE of the paired "
+                         "--swing-continuity-reg, which stops the redundant leg from jumping branches. "
+                         "Without that reg, caps below ~9 flip; see planLog swing-clear. (default: 5)")
+    ap.add_argument("--swing-clear-height", type=float, default=1.0,
+                    help="With --swing-clear: proximity gate ZERO height (m) -- the de-pitch fades to 0 "
+                         "when a swing foot's achieved ankle sits this far above the floor. Default 1.0 "
+                         "= effectively OFF (un-gated): at the shipped 10deg cap the gate is unnecessary "
+                         "and only trims the benefit. It exists for AGGRESSIVE-cap experiments, where "
+                         "gating out high feet avoids some (not all) branch flips (experimental).")
+    ap.add_argument("--swing-clear-band", type=float, default=0.04,
+                    help="With --swing-clear: width (m) of the gate ramp below --swing-clear-height "
+                         "(full de-pitch below height-band, zero above height). Only relevant when the "
+                         "gate is active (swing-clear-height set low, experimental) (default: 0.04).")
+    ap.add_argument("--swing-clear-weight", type=float, default=0.0,
+                    help="With --swing-clear: least-squares weight of the OPTIONAL soft one-sided "
+                         "toe-clearance rows (a swing foot's sole corner below floor+margin pulled UP). "
+                         "Default 0 (OFF): in testing the soft term fought the plant machinery and did "
+                         "not improve on the gated pitch cap alone. Kept for experiments.")
+    ap.add_argument("--swing-coll-boost", type=float, default=3.0,
+                    help="With --swing-clear: multiply Stage-3 self-collision repulsion weight by "
+                         "(1 + this * de-pitch strength) on de-pitch frames, so the paired continuity "
+                         "reg (which holds hip/knee near the previous pose) cannot cancel self-collision "
+                         "avoidance -- e.g. the thigh jamming the torso on a kneeling get-up. 0 = off "
+                         "(default: 3.0).")
+    ap.add_argument("--swing-continuity-reg", type=float, default=0.9,
+                    help="With --swing-clear: temporal-continuity posture reg on the hip/knee DOFs "
+                         "(NOT the ankle -- it must stay free to flatten), applied only on de-pitch "
+                         "frames and RAMPED by the de-pitch strength. Pulls the redundant leg toward "
+                         "the PREVIOUS frame's pose so an aggressive cap can't make the per-frame IK "
+                         "jump to a different solution BRANCH (a large single-frame flip GlobalOPT "
+                         "cannot smooth -- the root problem). 0.9 is the shipped value (cap 5 -> ~1.5cm "
+                         "swing pen, 0 spikes). 0 = off (aggressive cap then flips). (default: 0.9)")
+    ap.add_argument("--swing-clear-margin", type=float, default=0.005,
+                    help="With --swing-clear: clearance height (m) a swing foot's sole corner is held "
+                         "above the floor by the soft term. Kept near 0 (like floor_collision_rows' "
+                         "margin=0): a larger margin lifts a PLANTING foot off the floor and fights "
+                         "foot-hold/foot-flat (tug-of-war -> branch flip). Corrects real penetration "
+                         "only (default: 0.005 = 5mm).")
     ap.add_argument("--contact-min-run", type=int, default=3,
                     help="Debounce: remove contact ON/OFF runs shorter than this many SOLVED "
                          "frames (kills marginal-threshold flicker). 1 disables (default: 3)")
@@ -1412,6 +1596,27 @@ def main():
                          "and hierarchy still regresses on pivoting get-up contacts (standup_natural_01 "
                          "tracking +13%, jumps +35% even with hands demoted to soft).")
     ap.add_argument("--no-hierarchical", dest="hierarchical", action="store_false")
+    ap.add_argument("--hard-tier", dest="hard_tier", action="store_true", default=False,
+                    help="hierarchical-v1 H2 (plan.md): forces --hierarchical on -- SAFE, verified "
+                         "on standup_natural_01 (the exact clip the ORIGINAL --hierarchical "
+                         "regression named, wiki/experiments/retired-approaches.md) to behave the "
+                         "same order-of-magnitude as the non-hierarchical baseline (mean_err "
+                         "0.08-0.11 either way) when hands stay soft. Does NOT promote floor to "
+                         "hard -- see --floor-hard, which is a SEPARATE flag, default off, and "
+                         "CONFIRMED BROKEN (not just untested): combining floor-collision rows "
+                         "into the SAME level-1 tier as foot-hold position-equality rows caused a "
+                         "44-METRE divergence on standup_natural_01 (mean_err 0.05m -> 44.4m by "
+                         "frame 657) -- a conflicting-equality-row blowup, isolated via direct A/B "
+                         "against this flag alone (which does NOT blow up). Do not combine "
+                         "--hard-tier with --floor-hard without a redesign (e.g. a proper nested "
+                         "3-tier priority: hold > floor > tracking, not floor competing WITHIN the "
+                         "same undifferentiated level-1 system as hold). See planLog.md H2.")
+    ap.add_argument("--floor-hard", dest="floor_hard_flag", action="store_true", default=False,
+                    help="SEPARATE from --hard-tier, default off, CONFIRMED BROKEN -- do not use "
+                         "without a redesign. See --hard-tier's help text and planLog.md H2 for "
+                         "the 44-metre divergence this caused on standup_natural_01. Kept in the "
+                         "codebase (not deleted) per this project's retired-approaches convention "
+                         "-- don't resurrect without new evidence.")
     ap.add_argument("--foot-flat-weight", type=float, default=3.0,
                     help="Foot-flat (up-axis->+Z) align weight during contact. NOTE: raising this to "
                          "out-prioritise the hold backfires - the cross-product orientation error has a "
@@ -1451,7 +1656,8 @@ def main():
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
 
-    roles, role_to_idx, src_positions, fps, orientation_roles, ori_to_idx, orientation_mats = load_canonical(args.canonical)
+    (roles, role_to_idx, src_positions, fps, orientation_roles, ori_to_idx, orientation_mats,
+     persisted_contacts, persisted_eff_names) = load_canonical(args.canonical)
 
     missing = [r for r in ROLE_TO_ALEX_BODY if r not in role_to_idx]
     if missing:
@@ -1473,27 +1679,61 @@ def main():
         for role, body_name in ORI_TO_ALEX_BODY.items()
     }
 
-    # Contact-first: detect ground contact per effector from the human data,
-    # and resolve the Alex bodies whose axes we align during contact.
+    # Contact-first: ground contact per effector from the human data, and resolve
+    # the Alex bodies whose axes we align during contact.
+    #
+    # Prefer PERSISTED labels from Stage 2.5 (scripts/ground_canonical_human.py,
+    # phasic-v2 M1/T1.3) -- one detector, run once, upstream of morphology
+    # scaling, instead of every consumer re-deriving its own. Stage 2.5 also
+    # rigidly shifts the canonical positions so the floor is z=0 BY
+    # CONSTRUCTION; floor_z is therefore 0.0 here, not re-estimated (the old
+    # 1st-percentile-of-feet-markers estimate is deleted, per plan.md T1.3 --
+    # it was exactly the kind of per-stage floor re-estimation this redesign
+    # replaces with a single upstream invariant).
+    #
+    # Falls back to on-the-fly detection (the pre-phasic-v2 behaviour, floor_z
+    # re-estimated) only when given a plain _with_orient.npz that never went
+    # through Stage 2.5 -- keeps this script runnable standalone / on old data.
     contact_first = not args.no_contact_first
-    contacts, floor_z = detect_contacts_from_human(
-        src_positions, role_to_idx, fps,
-        orientation_mats=orientation_mats, ori_to_idx=ori_to_idx,
-        foot_height=args.foot_contact_height,
-        hand_height=args.hand_contact_height,
-        speed_thresh=args.contact_speed,
-        foot_flat_tilt=args.foot_flat_tilt,
-        foot_flat_margin=args.foot_flat_margin,
-        on_height_frac=args.contact_on_height_frac,
-        on_speed_frac=args.contact_on_speed_frac,
-        onset_max_delay=args.contact_onset_max_delay,
-    )
+    if persisted_contacts is not None:
+        contacts = persisted_contacts
+        floor_z = 0.0
+        print(f"  [contacts] using PERSISTED labels from {args.canonical.name} "
+              f"({', '.join(persisted_eff_names)}); floor_z=0.0 (invariant)")
+    else:
+        print(f"  [contacts] WARNING: {args.canonical.name} has no persisted contact_flags "
+              f"(not run through Stage 2.5 / scripts/ground_canonical_human.py) -- "
+              f"falling back to on-the-fly detection with a re-estimated floor_z")
+        contacts, floor_z = detect_contacts_from_human(
+            src_positions, role_to_idx, fps,
+            orientation_mats=orientation_mats, ori_to_idx=ori_to_idx,
+            foot_height=args.foot_contact_height,
+            hand_height=args.hand_contact_height,
+            speed_thresh=args.contact_speed,
+            foot_flat_tilt=args.foot_flat_tilt,
+            foot_flat_margin=args.foot_flat_margin,
+            on_height_frac=args.contact_on_height_frac,
+            on_speed_frac=args.contact_on_speed_frac,
+            onset_max_delay=args.contact_onset_max_delay,
+        )
     effector_body_id = {
         eff: body_id(model, cfg["body"]) for eff, cfg in CONTACT_EFFECTORS.items()
     }
     effector_site_id = {
         eff: site_id(model, cfg["site"]) for eff, cfg in CONTACT_POS.items()
     }
+    # Sole-corner site ids per foot for the swing-foot toe-clearance term.
+    sole_corner_sids = {
+        eff: [site_id(model, s) for s in names]
+        for eff, names in SOLE_CORNER_SITES.items()
+    }
+    # Hip+knee DOF addresses (NOT ankle -- the ankle must stay free to dorsiflex and
+    # flatten the foot). The swing-clear temporal-continuity reg boosts ONLY these, so
+    # it stops the redundant leg from branch-flipping without suppressing the de-pitch
+    # itself or touching the arms/spine (a global boost caused a wrist flip in testing).
+    _leg_cont_joints = ["LEFT_HIP_X", "LEFT_HIP_Z", "LEFT_HIP_Y", "LEFT_KNEE_Y",
+                        "RIGHT_HIP_X", "RIGHT_HIP_Z", "RIGHT_HIP_Y", "RIGHT_KNEE_Y"]
+    leg_cont_dofs = [joint_info(model, nm)[1] for nm in _leg_cont_joints]
 
     # Shank-tilt clamp limits from the model's ankle joint ranges. With the foot
     # flat, shank forward-lean = -ANKLE_Y and leftward-lean = +ANKLE_X (chain:
@@ -1662,24 +1902,80 @@ def main():
         clearances.append(float(neutral_data.xpos[ankle_bid][2] - min(sole_z)))
     ankle_clearance = float(np.mean(clearances))
 
-    # Median ankle-target z at CONTACT ONSET (first few frames of each planted
-    # run), pooled over both feet, in TARGET space (position-only — no IK,
-    # cheap). Reuse `contacts_solved` (already computed above, line ~1296) —
-    # must be bit-identical to what the per-frame loop below treats as
-    # "planted".
+    # Per-contact-WINDOW target-space floor correction (phasic-v2 M2/T2.1,
+    # generalizing collisionFixPlan.md's Fix A/B from a single clip-wide
+    # estimate + hands-only to every contacting effector, windowed).
     #
-    # Onset-only, not whole-run: the raw morphology-scaled human target keeps
-    # DRIFTING DOWN through a plant (measured: left ankle target ranges -0.038
-    # at touchdown to -0.067 by run-end, as the human's own foot keeps
-    # flattening/settling in the source mocap) — but the actual per-frame loop
-    # FREEZES the tracked target near onset (the foot-hold anchor, `w_env >=
-    # foot_hold_latch`, ~half the contact-ramp into the run) and holds it, so
-    # the robot never actually tracks that later drift. Pooling the whole run
-    # measured 2.8cm too low (-0.0663) vs the real solved/frozen anchor
-    # (-0.0384); pooling just the onset window matches it almost exactly
-    # (onset-frame check: -0.039).
+    # WHY WINDOWED, not clip-wide (the mechanism this replaces): Stage 2.5
+    # (scripts/ground_canonical_human.py) already grounds the canonical human
+    # data so floor=0 BY CONSTRUCTION — but morphology scaling (rest-relative
+    # deltas landing on Alex's own achieved-rest pose `a_r`) doesn't
+    # automatically preserve that invariant, since `a_r` isn't itself
+    # floor-referenced. The old fix pooled ONE alex_floor_z estimate across
+    # the WHOLE clip (median over every contact window's onset) — exactly the
+    # single-clip-wide-floor pattern this whole redesign replaces elsewhere
+    # (see wiki/concepts/grounding.md "Get-up floor residual is
+    # BETWEEN-PHASE"): a lying-phase window and a standing-phase window can
+    # need different corrections, and pooling them just like the old
+    # Stage-3/4 hard-floor-collision bug (see wiki/concepts/globalopt.md)
+    # under/over-corrects one phase to accommodate the other. Scoping the
+    # SAME onset-median technique to just ONE window at a time removes that
+    # coupling for free — no new estimator, just narrower scope.
+    #
+    # Reuses `contacts_solved` (computed above, line ~1377) — must be
+    # bit-identical to what the per-frame loop below treats as "planted".
+    # Onset-only within each window (not whole-window), same rationale as the
+    # original: the actual per-frame loop FREEZES the tracked target near
+    # onset (foot-hold anchor) and holds it, so the robot never tracks a
+    # plant's later within-window drift; pooling only the first ONSET_WINDOW
+    # frames of a window matches what actually gets tracked.
+    #
+    # floor_target_z[eff] holds, per window, the median onset-frame target Z
+    # of eff's OWN tracked site (ankle for feet, palm site for hands) — same
+    # site, same space, no cross-type conversion. NOT floor height: for feet
+    # this sits `ankle_clearance` ABOVE the true floor (the ankle joint sits
+    # above the sole) by construction, since it's measured directly from the
+    # ankle target itself. Clamping a window's later frames against this
+    # window's OWN onset value (one-sided max, never push down) stops the
+    # "target keeps drifting down through a plant" pattern the original
+    # Fix A/B comments already documented, generalized to every effector.
+    #
+    # (A clearance-subtracted CROSS-TYPE conversion — ankle onset minus
+    # ankle_clearance to get a floor-HEIGHT value — is a different quantity,
+    # only needed below for the legacy floor-repulsion mocap plane, which
+    # places a physical floor surface, not an effector-site target.)
+    _window_effectors = list(FOOT_POS_ROLE.keys()) + list(CONTACT_POS.keys())
+
+    def _effector_raw_target_z(eff, src_i):
+        """Target Z for eff's tracked site BEFORE floor correction — ankle
+        position target for feet, palm-site target for hands. Same formula
+        the main per-frame loop below uses, so the onset estimate matches
+        what actually gets tracked."""
+        if eff in FOOT_POS_ROLE:
+            t = make_targets_for_frame(src_positions[src_i], role_to_idx,
+                                       first_src_pos, target_rest_positions,
+                                       root_scale, role_scales)
+            return float(t[FOOT_POS_ROLE[eff]][2])
+        cpos = CONTACT_POS[eff]
+        mk = cpos["marker"]
+        if mk not in role_to_idx:
+            return None
+        src_pelvis0 = first_src_pos[role_to_idx["pelvis"]]
+        src_pelvis = src_positions[src_i][role_to_idx["pelvis"]]
+        root_delta = root_scale * (src_pelvis - src_pelvis0)
+        rel0 = first_src_pos[role_to_idx[mk]] - src_pelvis0
+        rel = src_positions[src_i][role_to_idx[mk]] - src_pelvis
+        return float((palm_rest_pos[eff] + root_delta + palm_pos_scale[eff] * (rel - rel0))[2])
+
+    # PER-WINDOW for feet (FOOT_POS_ROLE): a get-up genuinely puts the ankle at
+    # different heights-above-floor in different postural phases (lying vs
+    # standing), so each window needs its OWN onset reference -- this is the
+    # exact between-phase problem the whole redesign targets. Once committed,
+    # foot-hold freezes the ankle anyway, so a per-window reference only
+    # affects the brief pre-latch settling -- bounded risk even if a window's
+    # onset sample is a little noisy.
     ONSET_WINDOW = 10   # frames; run-start proxy for the foot-hold-latch frame
-    planted_ankle_z = []
+    floor_target_z = {eff: np.full(len(frame_ids), np.nan) for eff in _window_effectors}
     for eff in FOOT_POS_ROLE:
         flag = contacts_solved[eff]
         k = 0
@@ -1690,31 +1986,56 @@ def main():
             j = k
             while j < len(flag) and flag[j]:
                 j += 1
-            for kk in range(k, min(k + ONSET_WINDOW, j)):
-                t = make_targets_for_frame(src_positions[frame_ids[kk]], role_to_idx,
-                                           first_src_pos, target_rest_positions,
-                                           root_scale, role_scales)
-                planted_ankle_z.append(float(t[FOOT_POS_ROLE[eff]][2]))
+            onset_zs = [_effector_raw_target_z(eff, frame_ids[kk])
+                       for kk in range(k, min(k + ONSET_WINDOW, j))]
+            onset_zs = [z for z in onset_zs if z is not None]
+            if onset_zs:
+                floor_target_z[eff][k:j] = float(np.median(onset_zs))
             k = j
 
-    if planted_ankle_z:
-        alex_floor_z = float(np.median(planted_ankle_z)) - ankle_clearance
-    else:
-        # No foot-contact frames in this clip (none in the corpus currently) —
-        # fall back to the human-frame transform.
-        human_pelvis0_z = float(first_src_pos[role_to_idx["pelvis"]][2])
-        alex_floor_z = float(target_rest_positions["pelvis"][2]) \
-            + root_scale * (floor_z - human_pelvis0_z)
-        print("  [warn] no planted-foot frames — floor_z falling back to pelvis-delta transform")
+    # Floor HEIGHT (sole-level, not ankle-space): pool ALL feet windows'
+    # values and convert back via -ankle_clearance, matching the original
+    # Fix A exactly. Feet are the calibration source (ankle_clearance is a
+    # known, fixed robot constant tying ankle-space to true floor height);
+    # hands have no equivalent constant relating palm-site targets to floor,
+    # so they borrow this foot-derived estimate below rather than deriving
+    # their own -- see planLog.md M2 for why a hand-own-data estimate (either
+    # per-window OR pooled-from-hand-onset) regressed corpus metrics on
+    # standup_01 (plPen% 0%->35.6%, coll% 9.0%->20.4%) even though the
+    # per-window VALUES individually looked reasonable: without a
+    # foot-hold-style freeze, the palm target keeps tracking the moving human
+    # target for its whole window, so an under-calibrated hand-own reference
+    # (no fixed clearance constant to anchor it) let it sink further than the
+    # foot-calibrated one does. Also used for the legacy Stage-3
+    # floor-REPULSION QP term's mocap floor-plane placement (`--floor-weight`,
+    # default OFF post-M2 — plan.md T2.2), which needs one physical plane and
+    # structurally can't be per-window anyway.
+    _foot_floor_vals = np.concatenate([floor_target_z[e][~np.isnan(floor_target_z[e])]
+                                       for e in FOOT_POS_ROLE if e in floor_target_z])
+    alex_floor_z = float(np.median(_foot_floor_vals)) - ankle_clearance if _foot_floor_vals.size else None
 
-    print(f"Floor estimate (target-space): ankle_clearance={ankle_clearance:.4f} "
-          f"alex_floor_z={alex_floor_z:.4f} (human floor_z={floor_z:.4f}) "
-          f"n_planted={len(planted_ankle_z)} median_ankle_target_z="
-          f"{float(np.median(planted_ankle_z)) if planted_ankle_z else float('nan'):.4f}")
+    # Hands (CONTACT_POS): clip-wide, foot-derived floor HEIGHT (clearance 0
+    # -- the palm/gripper site IS the support surface, same space as
+    # alex_floor_z already computed above) -- this is exactly the original
+    # Fix B, generalized only in sharing the same clamp code path as feet
+    # below, not in its aggregation scope.
+    if alex_floor_z is not None:
+        for eff in CONTACT_POS:
+            flag = contacts_solved[eff]
+            floor_target_z[eff][flag] = alex_floor_z
+
+    n_windowed = {e: int(np.sum(~np.isnan(v))) for e, v in floor_target_z.items()}
+    print(f"Floor correction (per-window feet / foot-derived clip-wide hands, phasic-v2 M2): "
+          f"ankle_clearance={ankle_clearance:.4f} alex_floor_z={alex_floor_z}  "
+          f"corrected-frame counts={n_windowed}")
 
     floor_kwargs = {}
     floor_phase_w = np.ones(len(frame_ids))
     if args.floor_weight > 0.0:
+        if alex_floor_z is None:
+            print("  [warn] --floor-weight set but no foot-contact windows in this clip — "
+                  "floor repulsion plane falling back to z=0.0")
+            alex_floor_z = 0.0
         data.mocap_pos[floor_mocap_id] = [0.0, 0.0, alex_floor_z]
         floor_kwargs = dict(
             floor_margin=args.floor_margin, floor_gain=args.floor_gain,
@@ -1760,8 +2081,23 @@ def main():
     # foot commits to the ground (w_env >= foot_hold_latch), cleared on release.
     foot_hold_anchor = {}
 
+    # hierarchical-v1 H2 (--hard-tier) per-frame diagnostics: how far the hard
+    # tier's own tasks (foot hold, floor) landed from where they were asked to
+    # be, adapted from plan.md's OSQP-slack-and-log sketch to this solver's
+    # actual damped-least-squares architecture (see solve_frame_position_ik's
+    # `diag_out` docstring). Empty/unused unless args.hard_tier.
+    hard_tier_frame_diag = {}
+    hard_tier_floor_pen_cm = []
+    hard_tier_hold_slip_cm = []
+
     # Frames where the knee target needed the shank-tilt feasibility projection.
     shank_clamp_count = {eff: 0 for eff in FOOT_KNEE_ROLE}
+
+    # Gate canary (phasic-v2 M2/T2.1): count/depth of any contacting effector's
+    # FINAL target Z landing below its own floor_target_z reference. Should
+    # always be 0 given the max() clamps in the loop below.
+    floor_violation_count = [0]
+    floor_violation_max_depth = [0.0]
 
     # Per-frame constraint cache for the floor-transition arm refinement pass
     # (refine_arm_floor_transitions, run after this loop) — each entry is
@@ -1791,6 +2127,76 @@ def main():
             target_rest_orientations,
         )
 
+        # Swing-foot toe-clearance (--swing-clear). A swing (airborne) foot tracks
+        # the human's world-delta orientation at full weight; humans plantarflex
+        # ~20-25 deg toe-down on a low get-up step, and on Alex's rigid ~20cm foot
+        # plate that pitch drives the toe corner up to ~18cm through the floor while
+        # the ankle itself sits above it (measured across the get-up clip class; the
+        # ankle is NOT saturated -- 30-78 deg of unused dorsiflexion headroom). Cap
+        # the toe-down pitch of the foot orientation TARGET on airborne frames so the
+        # IK spends that headroom to lift the toe rather than copy the human. Ramped
+        # by the SAME contact envelope (lift = swing-ness = 1 - w_env): full cap
+        # airborne, fades to 0 as the foot plants (where the flat-align term below
+        # takes over). Feet only. Runs before frame_cache/solve so the arm-refine
+        # pass and the saved target orientation both see the capped target.
+        swing_clear_sites = []
+        swing_depitch_active = False   # any foot de-pitched this frame (for continuity reg)
+        swing_depitch_lift = 0.0       # max de-pitch strength this frame (ramps continuity reg)
+        if args.swing_clear and contact_first:
+            for _eff, _cfg in CONTACT_EFFECTORS.items():
+                if _eff not in FOOT_POS_ROLE:
+                    continue
+                _swing = 1.0 - float(contact_env[_eff][ti])
+                if _swing <= 0.0:
+                    continue
+                # Proximity gate: only de-pitch a swing foot that is actually LOW
+                # (near the floor, i.e. digging or about to). A foot held HIGH with a
+                # steep toe-down pitch (e.g. ankle 15cm up, heel 27cm -- not digging)
+                # must NOT be flattened: doing so demands a large leg reconfiguration
+                # (drop the heel 20cm+) that flips the per-frame IK to a different
+                # branch (measured: a surviving velocity spike). Gate on where the foot
+                # ACTUALLY IS -- the PREVIOUS frame's achieved ankle height (data holds
+                # it here, pre-solve) -- NOT the ankle TARGET: the worst digs are a
+                # tracking SAG (target ankle high, achieved ankle 7-11cm lower, see
+                # collisionFixPlan.md), which a target-height gate would wrongly read as
+                # "high, skip". `_h` ~ the sole height above the floor (achieved ankle
+                # minus the ankle-above-sole clearance minus the floor). prox ramps
+                # 1 (foot on/below floor) -> 0 (foot >= swing_clear_height above it).
+                if alex_floor_z is not None:
+                    _ank_bid = role_to_body_id[FOOT_POS_ROLE[_eff]]
+                    _h = (float(data.xpos[_ank_bid][2]) - alex_floor_z) - ankle_clearance
+                    # Two-threshold ramp: FULL cap for the whole dig band (foot low,
+                    # incl. the descent into a plant), hard 0 above it (foot genuinely
+                    # high, e.g. frame 243). A single-threshold linear ramp left the
+                    # descent frames only partially capped, so the dig developed before
+                    # the cap reached full strength. `swing_clear_height` = the zero
+                    # height; full strength kicks in `swing_clear_band` below it.
+                    _h_zero = args.swing_clear_height
+                    _h_full = max(_h_zero - args.swing_clear_band, 0.0)
+                    _prox = float(np.clip((_h_zero - _h) / max(_h_zero - _h_full, 1e-6), 0.0, 1.0))
+                else:
+                    _prox = 1.0
+                _lift = _swing * _prox
+                if _lift <= 0.0:
+                    continue
+                swing_depitch_active = True
+                swing_depitch_lift = max(swing_depitch_lift, _lift)
+                # (1) de-pitch: cap the toe-down pitch of the foot orientation target,
+                # ramped by swing-ness AND floor proximity.
+                _orole = _cfg["ori_role"]
+                ori_targets[_orole] = cap_foot_pitch(
+                    ori_targets[_orole], np.radians(args.swing_max_pitch), _lift)
+                # (2) soft clearance (optional, default off -- weight 0): one-sided
+                # non-penetration rows on this foot's sole corners. Same proximity/
+                # swing ramp. Kept in the code but off by default; the gated pitch cap
+                # alone is the effective, stable mechanism (the soft term fought the
+                # plant machinery in testing -- see planLog).
+                if args.swing_clear_weight > 0.0 and alex_floor_z is not None:
+                    _cz = alex_floor_z + args.swing_clear_margin
+                    _w = args.swing_clear_weight * _lift
+                    for _sid in sole_corner_sids[_eff]:
+                        swing_clear_sites.append((_sid, _cz, _w))
+
         # Contact-first: build the foot-flat / fist-down axis-alignment
         # constraints active this frame, and suppress the matching human
         # world-delta orientation terms.
@@ -1817,6 +2223,18 @@ def main():
                     foot_hold_anchor.pop(eff, None)   # released: drop the frozen anchor
                     continue
                 bid = effector_body_id[eff]
+
+                # Foot floor clamp (phasic-v2 M2/T2.1, generalized Fix B — see
+                # floor_target_z computation above): correct the ankle position
+                # target UP to this window's floor-target Z if it maps below.
+                # Applied BEFORE foot-hold captures its anchor below, so a
+                # held plant's frozen anchor is already floor-correct instead
+                # of freezing a still-penetrating pose.
+                if eff in FOOT_POS_ROLE:
+                    pr0 = FOOT_POS_ROLE[eff]
+                    fz0 = floor_target_z[eff][ti]
+                    if not np.isnan(fz0):
+                        targets[pr0][2] = max(targets[pr0][2], fz0)
 
                 # Planted-foot position hold: freeze the foot position target (the
                 # ankle role) at the pose where the foot commits to the ground, and
@@ -1893,15 +2311,18 @@ def main():
                         rel0 = first_src_pos[role_to_idx[mk]] - src_pelvis0
                         rel = src_positions[src_i][role_to_idx[mk]] - src_pelvis
                         tgt = palm_rest_pos[eff] + root_delta + palm_pos_scale[eff] * (rel - rel0)
-                        # Floor clamp (Fix B, collisionFixPlan.md): the scaled
-                        # human hand-contact target can map below Alex's floor
-                        # (measured: 6.5-7.2cm on luigi_standProne_03's push
-                        # phase) — the palm pin then faithfully tracks the fist
-                        # underground. Palm site IS the support surface, so
-                        # clearance 0 is correct (no margin). Independent of
-                        # --floor-weight (see alex_floor_z computation above).
-                        if alex_floor_z is not None:
-                            tgt[2] = max(tgt[2], alex_floor_z)
+                        # Floor clamp (phasic-v2 M2/T2.1, generalized Fix B):
+                        # the scaled human hand-contact target can map below
+                        # Alex's floor (measured: 6.5-7.2cm on
+                        # luigi_standProne_03's push phase) — the palm pin
+                        # then faithfully tracks the fist underground. Palm
+                        # site IS the support surface, so clearance 0 is
+                        # correct (no margin). PER-WINDOW now (floor_target_z
+                        # computed above), not a clip-wide scalar. Independent
+                        # of --floor-weight.
+                        fz = floor_target_z[eff][ti]
+                        if not np.isnan(fz):
+                            tgt[2] = max(tgt[2], fz)
                         pos_site_constraints.append(
                             (effector_site_id[eff], tgt, CONTACT_POS_WEIGHT * w_env)
                         )
@@ -1934,10 +2355,51 @@ def main():
                         else 0.5 * (zl + zr)
                     targets[lpr][2] = (1.0 - wcp) * zl + wcp * z_common
                     targets[rpr][2] = (1.0 - wcp) * zr + wcp * z_common
+                    # Re-clamp EACH foot to its OWN floor_target_z after the
+                    # snap (phasic-v2 M2/T2.1): coplanar averaging can pull a
+                    # foot below its own per-window floor reference if the two
+                    # feet sit in different postural-phase windows (e.g. one
+                    # leg mid-transition while the other is settled) — the
+                    # exact invariant this milestone's gate requires ("no
+                    # contact target ever below floor") must hold AFTER every
+                    # target-construction step, not just the first clamp.
+                    for eff2, pr2 in (("left_foot", lpr), ("right_foot", rpr)):
+                        fz2 = floor_target_z[eff2][ti]
+                        if not np.isnan(fz2):
+                            targets[pr2][2] = max(targets[pr2][2], fz2)
+
+        # Gate check (phasic-v2 M2/T2.1, "no contact target ever below floor"):
+        # verify every contacting effector's FINAL target Z (after foot-hold,
+        # shank-clamp, coplanar-snap — everything that can touch it) is at or
+        # above its own floor reference. Should always hold given the max()
+        # clamps above; this is a canary against a future edit reordering
+        # those clamps, not a live correction path.
+        for eff2, fz_arr in floor_target_z.items():
+            fz2 = fz_arr[ti]
+            if np.isnan(fz2):
+                continue
+            pr2 = FOOT_POS_ROLE.get(eff2)
+            z_final = targets[pr2][2] if pr2 is not None else palm_targets.get(eff2, [None, None, None])[2]
+            if z_final is not None and z_final < fz2 - 1e-6:
+                floor_violation_count[0] += 1
+                floor_violation_max_depth[0] = max(floor_violation_max_depth[0], float(fz2 - z_final))
 
         frame_cache.append((targets, ori_targets, align_constraints, pos_site_constraints,
                            skip_pos_roles, skip_ori_body_ids, ori_weight_scale,
                            pos_weight_scale, hold_pos_roles))
+
+        # Self-collision guard for the swing-clear de-pitch: on de-pitch frames the
+        # continuity reg holds the hip/knee near the previous pose, which can roughly
+        # cancel the (soft, weight-20) self-collision repulsion on those DOFs -- e.g.
+        # the thigh jamming against the torso on a kneeling get-up (measured: RIGHT_
+        # THIGH<->TORSO, the dominant regression). Scale self-collision weight UP with
+        # the same de-pitch strength so repulsion always dominates the hold. No-op off
+        # de-pitch frames (swing_depitch_lift = 0).
+        frame_coll_kwargs = coll_kwargs
+        if swing_depitch_lift > 0.0 and args.swing_coll_boost > 0.0:
+            frame_coll_kwargs = dict(coll_kwargs)
+            frame_coll_kwargs["coll_weight"] = coll_kwargs["coll_weight"] * (
+                1.0 + args.swing_coll_boost * swing_depitch_lift)
 
         q = solve_frame_position_ik(
             model,
@@ -1953,15 +2415,23 @@ def main():
             ori_weight_scale=ori_weight_scale,
             pos_weight_scale=pos_weight_scale,
             hold_pos_roles=hold_pos_roles,
-            hierarchical=args.hierarchical,
+            hierarchical=(args.hierarchical or args.hard_tier),
             knee_bias=knee_bias,
             pos_site_constraints=pos_site_constraints,
             skip_pos_roles=skip_pos_roles,
             iters=args.ik_iters,
-            **coll_kwargs,
+            **frame_coll_kwargs,
             **floor_kwargs,
             floor_weight=(args.floor_weight * float(floor_phase_w[ti]) if floor_kwargs else 0.0),
+            floor_hard=args.floor_hard_flag,
+            swing_clear_sites=swing_clear_sites,
+            posture_reg=_swing_posture_reg(model.nv, leg_cont_dofs,
+                                           args.swing_continuity_reg * swing_depitch_lift),
+            diag_out=hard_tier_frame_diag,
         )
+        if args.hard_tier or args.floor_hard_flag:
+            hard_tier_floor_pen_cm.append(hard_tier_frame_diag.get("floor_pen_cm", 0.0))
+            hard_tier_hold_slip_cm.append(hard_tier_frame_diag.get("hold_slip_cm", 0.0))
 
         mujoco.mj_forward(model, data)
 
@@ -2072,6 +2542,29 @@ def main():
         else:
             print("  [floor-refine] no floor-onset transitions detected — nothing to refine")
 
+    # Floor-transition LEG refinement (Pass 3) — see refine_leg_floor_transitions
+    # docstring. Independent of --floor-weight/--floor-refine (geometric
+    # detection, not gated on the repulsion mechanism being on); runs after the
+    # arm pass so it sees any arm-refine correction already applied.
+    if args.leg_floor_refine:
+        qpos_pass2 = np.asarray(qpos_list)
+        qpos_refined2 = refine_leg_floor_transitions(
+            model, data, qpos_pass2, frame_cache,
+            role_to_body_id, ori_role_to_body_id,
+            alex_floor_z if alex_floor_z is not None else 0.0,
+            ankle_clearance,
+            coll_kwargs,
+            pen_tol=args.leg_floor_refine_pen_tol,
+            ramp=args.leg_floor_refine_ramp,
+            preroll=args.leg_floor_refine_preroll,
+            leg_posture_reg=args.leg_floor_refine_posture_reg,
+            lock_weight=args.leg_floor_refine_lock_weight,
+            root_pos_relief=args.leg_floor_refine_root_relief,
+            foot_flat_weight=args.leg_floor_refine_flat_weight,
+            iters=args.ik_iters,
+        )
+        qpos_list = list(qpos_refined2)
+
     metadata = {
         "format": "alex_contactfirst_v1",
         "canonical": str(args.canonical),
@@ -2104,6 +2597,10 @@ def main():
         "shank_clamp_frames": shank_clamp_count,
         "knee_bias_weight": args.knee_bias_weight,
         "knee_min_flex_deg": args.knee_min_flex_deg,
+        "hard_tier": args.hard_tier,
+        "floor_hard": args.floor_hard_flag,
+        "hard_tier_floor_pen_max_cm": float(max(hard_tier_floor_pen_cm) if hard_tier_floor_pen_cm else 0.0),
+        "hard_tier_hold_slip_max_cm": float(max(hard_tier_hold_slip_cm) if hard_tier_hold_slip_cm else 0.0),
         "notes": [
             "Contact-first QP IK on Alex V2.",
             "Foot contact -> foot up-axis forced to world +Z (flat); hand contact ->"
@@ -2124,6 +2621,22 @@ def main():
     if args.shank_clamp:
         cc = " ".join(f"{e}:{n}" for e, n in shank_clamp_count.items())
         print(f"Shank-tilt clamp engaged (frames): {cc}")
+    if floor_violation_count[0] > 0:
+        print(f"  [WARNING] floor-invariant gate (phasic-v2 M2): {floor_violation_count[0]} "
+              f"contacting-effector target(s) landed below their floor reference "
+              f"(max depth {floor_violation_max_depth[0]*100:.2f}cm) -- should be 0, investigate.")
+    else:
+        print("Floor-invariant gate (phasic-v2 M2): PASS -- 0 contacting-effector targets "
+              "below their floor reference.")
+
+    if args.hard_tier or args.floor_hard_flag:
+        fp = np.asarray(hard_tier_floor_pen_cm) if hard_tier_floor_pen_cm else np.zeros(1)
+        hs = np.asarray(hard_tier_hold_slip_cm) if hard_tier_hold_slip_cm else np.zeros(1)
+        n_floor_viol = int((fp > 0.1).sum())
+        n_hold_viol = int((hs > 0.5).sum())
+        print(f"Hard-tier (H2) diagnostics: floor_pen max={fp.max():.2f}cm "
+              f"({n_floor_viol} frames > 0.1cm tol)  |  hold_slip max={hs.max():.2f}cm "
+              f"({n_hold_viol} frames > 0.5cm tol)")
 
     np.savez(
         args.out,
