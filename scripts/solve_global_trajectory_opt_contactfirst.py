@@ -230,6 +230,35 @@ def _collision_stats(model, data, qpos, floor_gid=None, count_floor=False,
     return {"pct": n / len(arr) * 100, "max_pen_cm": float(arr.max()) * 100}
 
 
+def _floor_pen_by_frame(model, data, qpos, floor_gid, floor_active_frames=None):
+    """(T,) raw robot-vs-floor penetration depth (m, 0 = none/not touching), and
+    a parallel (T,) list of sets of penetrating body ids. Continuation-v1
+    (plan.md §3.1) homotopy schedule needs floor-ONLY penetration isolated from
+    self-collision (unlike `_collision_stats`' `count_floor=True`, which mixes
+    the two into one `max_pen_cm`) and RAW depth (`-ct.dist`, not
+    `COLL_MARGIN - dist` like the row-builder's push-to-clearance target) so a
+    frame only counts as violating when it is actually penetrating."""
+    T = qpos.shape[0]
+    pen = np.zeros(T)
+    bodies = [set() for _ in range(T)]
+    for t in range(T):
+        data.qpos[:] = qpos[t]
+        mujoco.mj_forward(model, data)
+        if floor_active_frames is not None and not floor_active_frames[t]:
+            continue
+        for c in range(data.ncon):
+            ct = data.contact[c]
+            if not (ct.geom1 == floor_gid or ct.geom2 == floor_gid):
+                continue
+            if ct.dist >= 0:
+                continue
+            d = -float(ct.dist)
+            pen[t] = max(pen[t], d)
+            other = ct.geom2 if ct.geom1 == floor_gid else ct.geom1
+            bodies[t].add(int(model.geom_bodyid[other]))
+    return pen, bodies
+
+
 def _tracking_stats(qpos, target_positions, role_to_body, role_names, model, data):
     errs = []
     for t in range(qpos.shape[0]):
@@ -693,8 +722,16 @@ def _blocks_to_sparse(H_blocks, N):
 
 def _build_tracking(qpos_warm, target_positions, role_names, role_to_body,
                     target_weights, model, data, lambda_track,
-                    downweight_roles, downweight_factor):
-    """Σ_t Σ_r w_r ||J_r δq_t - e_r||²  (position). Returns (H_blocks, g_dense)."""
+                    downweight_roles, downweight_factor, extra_downweight=None):
+    """Σ_t Σ_r w_r ||J_r δq_t - e_r||²  (position). Returns (H_blocks, g_dense).
+
+    `extra_downweight` (optional, default None = no-op): continuation-v1
+    (plan.md §3.4) per-frame relaxation on top of the existing contact
+    downweight above. Length-T list of dicts `{role: factor}` — role `role`'s
+    tracking weight at frame `t` is multiplied by `extra_downweight[t][role]`
+    (factor < 1 relaxes; typically only set for a violating limb's own roles in
+    a dilated window around a floor violation, never for trunk/root roles,
+    which Stage B cannot move anyway — see plan.md §3.4)."""
     T = qpos_warm.shape[0]
     N = T * N_ACT
     nv = model.nv
@@ -704,12 +741,15 @@ def _build_tracking(qpos_warm, target_positions, role_names, role_to_body,
         data.qpos[:] = qpos_warm[t]
         mujoco.mj_forward(model, data)
         skip = downweight_roles[t]
+        extra_t = extra_downweight[t] if extra_downweight is not None else None
         for ri, role in enumerate(role_names):
             if role not in role_to_body:
                 continue
             w = lambda_track * target_weights.get(role, 1.0)
             if role in skip:
                 w *= downweight_factor
+            if extra_t is not None and role in extra_t:
+                w *= extra_t[role]
             bid = role_to_body[role]
             e = target_positions[t, ri] - data.xpos[bid]
             jacp = np.zeros((3, nv))
@@ -784,7 +824,7 @@ def _build_contact(qpos_warm, tgt, wgt, planted, resolved, model, data,
 
 
 def _build_collision(qpos_warm, model, data, lambda_coll, floor_gid=None, count_floor=False,
-                     floor_active_frames=None):
+                     floor_active_frames=None, floor_pen_allow=0.0):
     """Self-collision rows (existing), plus robot-vs-floor rows when
     `count_floor=True` — same contact-point/Jacobian/margin machinery, just the
     floor plane (a mocap body, zero DOF) as one side of the pair instead of
@@ -802,16 +842,39 @@ def _build_collision(qpos_warm, model, data, lambda_coll, floor_gid=None, count_
 
     `floor_active_frames` (T,) bool, optional: phase gate (see
     `floor_phase_weight`) — frame t skips floor rows entirely when
-    `floor_active_frames[t] == False`, even with `count_floor=True`."""
+    `floor_active_frames[t] == False`, even with `count_floor=True`.
+
+    `floor_pen_allow` (metres, default 0.0 = no-op / identical to before this
+    param existed): continuation-v1 (plan.md §3.2) homotopy variable. Either a
+    plain float (uniform) or a `(T,)` array (PER-FRAME — required for the
+    actual continuation schedule, see `_run_continuation`: a single clip-wide
+    scalar sized to the worst frame's own penetration silently disables the
+    floor row for every OTHER, less-penetrating frame instead of asking each
+    frame to close part of its own gap — a bug caught in continuation-v1's
+    first pass, see planLog.md T4). Applied to FLOOR rows only (never
+    self-collision rows) — that frame's row's demanded correction is reduced
+    by this much (`pen - floor_pen_allow[t]` instead of `pen`), so an
+    intermediate continuation pass only asks the QP to close part of the gap
+    instead of the whole thing in one linearization (which is what made the
+    single-shot hard floor constraint go primal-infeasible / diverge — see
+    wiki/experiments/retired-approaches.md, `--floor-hard`).
+
+    Returns `(A, l, u, is_floor_row)` — `is_floor_row` a `(n_rows,)` bool array
+    (empty when `row == 0`), so a caller can apply a DIFFERENT slack penalty to
+    floor rows vs self-collision rows (continuation-v1 §3.3). `(None, None,
+    None, None)` when there are no rows at all, same as before this param
+    existed for the first three return values."""
     T = qpos_warm.shape[0]
     nv = model.nv
     sqw = float(np.sqrt(lambda_coll))
-    r, c, v, l, u = [], [], [], [], []
+    per_frame_allow = isinstance(floor_pen_allow, np.ndarray)
+    r, c, v, l, u, is_floor_row = [], [], [], [], [], []
     row = 0
     for t in range(T):
         data.qpos[:] = qpos_warm[t]
         mujoco.mj_forward(model, data)
         floor_active_t = count_floor and (floor_active_frames is None or bool(floor_active_frames[t]))
+        allow_t = float(floor_pen_allow[t]) if per_frame_allow else floor_pen_allow
         for cc in range(data.ncon):
             ct = data.contact[cc]
             is_floor = floor_gid is not None and (ct.geom1 == floor_gid or ct.geom2 == floor_gid)
@@ -822,6 +885,8 @@ def _build_collision(qpos_warm, model, data, lambda_coll, floor_gid=None, count_
             elif b1 == 0 or b2 == 0 or _within_k_hops(model, b1, b2, COLL_HOPS):
                 continue
             pen = COLL_MARGIN - float(ct.dist)
+            if is_floor and allow_t > 0.0:
+                pen -= allow_t
             if pen <= 0:
                 continue
             normal = ct.frame[:3].copy()
@@ -837,10 +902,11 @@ def _build_collision(qpos_warm, model, data, lambda_coll, floor_gid=None, count_
             for j in range(N_ACT):
                 if abs(jsep[j]) > 1e-12:
                     r.append(row); c.append(cs + j); v.append(sqw * jsep[j])
-            l.append(sqw * min(pen, 0.05)); u.append(1e6); row += 1
+            l.append(sqw * min(pen, 0.05)); u.append(1e6); is_floor_row.append(is_floor); row += 1
     if row == 0:
-        return None, None, None
-    return sp.csc_matrix((v, (r, c)), shape=(row, T * N_ACT)), np.array(l), np.array(u)
+        return None, None, None, None
+    return (sp.csc_matrix((v, (r, c)), shape=(row, T * N_ACT)), np.array(l), np.array(u),
+            np.array(is_floor_row, dtype=bool))
 
 
 def stage_b(qpos_warm, target_positions, role_names, role_to_body, target_weights,
@@ -849,7 +915,8 @@ def stage_b(qpos_warm, target_positions, role_names, role_to_body, target_weight
             lambda_track, lambda_smooth, lambda_coll,
             foot_flat_w, fist_w, downweight_factor, n_outer, trust,
             collision_penalty=1000.0, floor_z=None, floor_w=0.0,
-            floor_gid=None, count_floor=False, floor_active_frames=None):
+            floor_gid=None, count_floor=False, floor_active_frames=None,
+            floor_pen_allow=0.0, floor_slack_penalty=None, extra_downweight=None):
     """`floor_gid`: the injected floor plane's geom id, ALWAYS passed once
     `_load_model_with_floor` is used (needed to correctly recognize-and-exclude
     floor contacts from self-collision, regardless of `count_floor` — see
@@ -857,7 +924,15 @@ def stage_b(qpos_warm, target_positions, role_names, role_to_body, target_weight
     --floor-collision on/off toggle — whether floor contacts become hard
     QP rows + count toward penetration stats. `floor_active_frames` (T,) bool,
     optional: phase gate on top of `count_floor` (see `floor_phase_weight`) —
-    threaded into every `_build_collision`/`_collision_stats` call below."""
+    threaded into every `_build_collision`/`_collision_stats` call below.
+
+    Continuation-v1 (plan.md), all default to exact no-ops:
+    `floor_pen_allow` (m, default 0.0) — passed straight through to
+    `_build_collision` (see its docstring). `floor_slack_penalty` (default None
+    = use `collision_penalty`, i.e. identical to before these params existed) —
+    per-row slack penalty for FLOOR rows only; self-collision rows always use
+    `collision_penalty`. `extra_downweight` (default None) — passed straight
+    through to `_build_tracking` (see its docstring)."""
     T = qpos_warm.shape[0]
     N = T * N_ACT
     q_warm_act = qpos_warm[:, 7:].reshape(-1)
@@ -915,7 +990,8 @@ def stage_b(qpos_warm, target_positions, role_names, role_to_body, target_weight
         t0 = time.time()
         Ht, gt = _build_tracking(qpos_cur, target_positions, role_names, role_to_body,
                                  target_weights, model, data, lambda_track,
-                                 downweight_roles, downweight_factor)
+                                 downweight_roles, downweight_factor,
+                                 extra_downweight=extra_downweight)
         Hc, gc = _build_contact(qpos_cur, tgt, wgt, planted, resolved,
                                 model, data, foot_flat_w, fist_w, floor_z, floor_w)
         H_task = _blocks_to_sparse([Ht[t] + Hc[t] for t in range(T)], N)
@@ -927,9 +1003,10 @@ def stage_b(qpos_warm, target_positions, role_names, role_to_body, target_weight
         jl_lo = np.maximum(jl_lo_abs, delta - trust)
         jl_hi = np.minimum(jl_hi_abs, delta + trust)
 
-        A_coll, l_coll, u_coll = _build_collision(qpos_cur, model, data, lambda_coll,
-                                                  floor_gid=floor_gid, count_floor=count_floor,
-                                                  floor_active_frames=floor_active_frames)
+        A_coll, l_coll, u_coll, is_floor_row = _build_collision(
+            qpos_cur, model, data, lambda_coll,
+            floor_gid=floor_gid, count_floor=count_floor,
+            floor_active_frames=floor_active_frames, floor_pen_allow=floor_pen_allow)
         n_coll_rows = 0 if A_coll is None else A_coll.shape[0]
 
         slack_info = ""
@@ -939,8 +1016,15 @@ def stage_b(qpos_warm, target_positions, role_names, role_to_body, target_weight
         # OSQP primal-infeasible.
         m = n_coll_rows
         if m > 0:
-            # P: block-diag [ 2*(H_task+H_smooth) , 0 ; 0 , 2*rho*I_m ]
-            P_slack = sp.diags(np.full(m, 2.0 * collision_penalty), format="csc")
+            # P: block-diag [ 2*(H_task+H_smooth) , 0 ; 0 , 2*diag(rho)_m ]. rho
+            # is PER-ROW (continuation-v1, plan.md §3.3): floor rows use
+            # `floor_slack_penalty` (defaults to `collision_penalty`, i.e. a
+            # no-op when unset), self-collision rows always use
+            # `collision_penalty` — hardening the floor term across
+            # continuation passes must never also harden self-collision.
+            rho_floor = collision_penalty if floor_slack_penalty is None else floor_slack_penalty
+            rho = np.where(is_floor_row, rho_floor, collision_penalty)
+            P_slack = sp.diags(2.0 * rho, format="csc")
             P_aug = sp.block_diag([P, P_slack], format="csc")
             q_aug = np.concatenate([q_vec, np.zeros(m)])
             # joint-limit rows: [eye_N, 0_{N x m}]
@@ -1000,6 +1084,181 @@ def stage_b(qpos_warm, target_positions, role_names, role_to_body, target_weight
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+LEG_BODY_KEYS = ("HIP", "THIGH", "SHIN", "ANKLE", "FOOT")
+ARM_BODY_KEYS = ("SHOULDER", "ELBOW", "WRIST", "GRIPPER")
+
+
+def _limb_roles_for_body(model, body_id, role_to_body):
+    """Continuation-v1 (plan.md §3.4): map a penetrating body id to the
+    tracking ROLE names (as used in `role_names`/`role_to_body`, e.g.
+    "left_knee"/"right_ankle" — NOT `CONTACT_TRACK_ROLE`'s "left_foot"/
+    "right_foot", which are contact-effector names, a different vocabulary)
+    whose tracking weight may be relaxed to let that limb clear the floor.
+    Trunk/pelvis/torso/head bodies (and anything unrecognized) return []
+    deliberately — Stage B's root is frozen (decision variables are actuated
+    joints only, `qpos[:, 7:]`), so relaxing a trunk role's tracking cannot
+    move the trunk and would just lose fidelity for nothing."""
+    name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
+    side = "left" if name.startswith("LEFT_") else ("right" if name.startswith("RIGHT_") else None)
+    if side is None:
+        return []
+    if any(k in name for k in LEG_BODY_KEYS):
+        roles = [f"{side}_hip", f"{side}_knee", f"{side}_ankle"]
+    elif any(k in name for k in ARM_BODY_KEYS):
+        roles = [f"{side}_shoulder", f"{side}_elbow", f"{side}_wrist"]
+    else:
+        return []
+    return [r for r in roles if r in role_to_body]
+
+
+def _build_extra_downweight(T, pen_frame, bodies_frame, model, role_to_body,
+                           active_mask, pad, factor):
+    """Continuation-v1 (plan.md §3.4): per-frame `{role: factor}` dict for
+    `_build_tracking`'s `extra_downweight`. `active_mask` (T,) bool = frames
+    counted as violating THIS pass (already thresholded by the caller against
+    this pass's `eps_k`). Each contiguous violating run is dilated by `pad`
+    frames on both sides (the WINDOW); the roles relaxed across that whole
+    window are the union, over the run's own (undilated) frames, of
+    `_limb_roles_for_body` applied to every body in `bodies_frame[t]` — so the
+    padding widens where the relief applies without changing which limb it's
+    applied to. `factor` (<1) is applied via `min` if a role is touched by
+    more than one overlapping run (never relax LESS than the strongest
+    request)."""
+    extra = [dict() for _ in range(T)]
+    t = 0
+    while t < T:
+        if not active_mask[t]:
+            t += 1
+            continue
+        s = t
+        while t < T and active_mask[t]:
+            t += 1
+        e = t  # exclusive
+        roles = set()
+        for tt in range(s, e):
+            for bid in bodies_frame[tt]:
+                roles.update(_limb_roles_for_body(model, bid, role_to_body))
+        if not roles:
+            continue
+        lo = max(0, s - pad)
+        hi = min(T, e + pad)
+        for tt in range(lo, hi):
+            for role in roles:
+                extra[tt][role] = min(extra[tt].get(role, 1.0), factor)
+    return extra
+
+
+def _run_continuation(qpos0, args, model, data, q_lo, q_hi,
+                      target_positions, role_names, role_to_body, target_weights,
+                      tgt, wgt, planted, resolved, downweight_roles,
+                      floor_z, floor_gid, floor_active_frames):
+    """Continuation-v1 (plan.md §3.5). `qpos0` = pass-0 best, i.e. the plain
+    `stage_b` result (continuation params at their no-op defaults). Runs up to
+    `args.continuation` EXTRA passes, each re-calling `stage_b` with a
+    shrinking `floor_pen_allow` (§3.2), a hardening per-row floor slack
+    penalty (§3.3), and tracking relaxed only in violating frame-windows ×
+    limbs (§3.4), warm-started from the previous pass's best iterate.
+
+    Cross-pass keep-best is LEXICOGRAPHIC — (velocity spikes, self-pen beyond
+    the existing 2cm floor-active gate, max isolated floor pen, slip+floor-err,
+    tracking mean) — and seeded with pass 0, so this function can never return
+    something worse than `qpos0` on that ordering: a pass that fixes floor
+    penetration by introducing a spike or blowing out self-collision is never
+    kept over `qpos0`.
+
+    Returns `(best_qpos, pen_per_pass)` — `pen_per_pass` (cm, len <= K+1, pass
+    0 first) is saved as the NPZ's `cont_pen_per_pass` diagnostic."""
+    K = args.continuation
+
+    def cross_score(q):
+        pen, _ = _floor_pen_by_frame(model, data, q, floor_gid, floor_active_frames)
+        d = _delta_stats(q)
+        cs_self = _collision_stats(model, data, q, floor_gid=floor_gid, count_floor=False)
+        ss = _contact_slip_stats(model, data, q, tgt, wgt, planted, resolved)
+        ferr = _foot_floor_err_cm(model, data, q, planted, resolved, floor_z)
+        tr = _tracking_stats(q, target_positions, role_to_body, role_names, model, data)
+        selfpen_over = max(0.0, cs_self["max_pen_cm"] - 2.0)
+        return (d["n_spikes_05"], selfpen_over, pen.max() * 100.0,
+                ss["plant_slip_max_cm"] + ferr, tr["mean"]), pen
+
+    best_score, pen0 = cross_score(qpos0)
+    best_qpos = qpos0
+    pen_per_pass = [float(pen0.max() * 100.0)]
+    P0 = float(pen0.max())
+    # PER-FRAME schedule base — pen0 (T,), each frame's OWN pass-0 penetration,
+    # fixed once here. eps_k below is pen0 * (1 - k/K) elementwise: a frame that
+    # started at 2cm shrinks its own allowance toward 0 on the same K-step
+    # schedule as the frame that started at 24cm. A single clip-wide scalar
+    # sized to the WORST frame (an earlier version of this function used
+    # `P0 * (1-k/K)` as one float) silently disables the floor row for every
+    # OTHER, less-penetrating frame instead of asking each frame to close part
+    # of its own gap — caught by actually running it (planLog.md T4): pass 1
+    # did zero measurable work because ~all rows below the scalar threshold
+    # were skipped outright by `_build_collision`'s `pen <= 0` gate.
+    pen0_by_frame = pen0.copy()
+    print(f"  Continuation: pass 0 (plain Stage B) floor_pen_max={P0*100:.2f}cm "
+          f"spikes={best_score[0]} selfpen_over={best_score[1]:.2f}cm "
+          f"slip+ferr={best_score[3]:.2f}cm")
+
+    if P0 <= 0.005:
+        print("  Continuation: pass-0 floor pen already <=0.5cm — skipping (nothing to do)")
+        return best_qpos, np.array(pen_per_pass)
+
+    qpos_prev = qpos0
+    P_prev = P0
+    for k in range(1, K + 1):
+        eps_k = pen0_by_frame * (1.0 - k / K)          # (T,) per-frame allowance
+        rho_k = args.collision_penalty * (args.cont_floor_penalty_max / args.collision_penalty) ** (k / K)
+        relax_k = max(args.cont_track_min, 0.5 ** k)
+
+        pen_f, bodies_f = _floor_pen_by_frame(model, data, qpos_prev, floor_gid, floor_active_frames)
+        active = pen_f > np.maximum(eps_k, 0.005)      # per-frame compare
+        extra_downweight = None
+        if active.any():
+            extra_downweight = _build_extra_downweight(
+                qpos_prev.shape[0], pen_f, bodies_f, model, role_to_body,
+                active, args.cont_window_pad, relax_k)
+
+        n_outer_k = max(2, args.n_outer)
+        qpos_k = stage_b(qpos_prev, target_positions, role_names, role_to_body, target_weights,
+                         tgt, wgt, planted, resolved, downweight_roles,
+                         model, data, q_lo, q_hi,
+                         args.lambda_track, args.lambda_smooth, args.lambda_coll,
+                         args.foot_flat_weight, args.fist_weight,
+                         args.contact_downweight, n_outer_k, args.trust,
+                         collision_penalty=args.collision_penalty,
+                         floor_z=floor_z, floor_w=args.floor_weight,
+                         floor_gid=floor_gid, count_floor=True,
+                         floor_active_frames=floor_active_frames,
+                         floor_pen_allow=eps_k, floor_slack_penalty=rho_k,
+                         extra_downweight=extra_downweight)
+        score_k, pen_k = cross_score(qpos_k)
+        Pk = float(pen_k.max())
+        pen_per_pass.append(Pk * 100.0)
+        keep = score_k < best_score
+        print(f"  Continuation: pass {k}/{K} eps(max/mean over violating frames)="
+              f"{eps_k.max()*100:.2f}/{eps_k[active].mean()*100 if active.any() else 0.0:.2f}cm "
+              f"rho={rho_k:.0f} relax={relax_k:.2f} floor_pen_max={Pk*100:.2f}cm "
+              f"spikes={score_k[0]} selfpen_over={score_k[1]:.2f}cm slip+ferr={score_k[3]:.2f}cm"
+              + (" *best" if keep else ""))
+        if keep:
+            best_score = score_k
+            best_qpos = qpos_k
+
+        improved_abs = P_prev - Pk
+        improved_frac = improved_abs / P_prev if P_prev > 1e-9 else 0.0
+        if improved_frac < args.cont_stall_frac and improved_abs < 0.002:
+            print(f"  Continuation: stalled at pass {k} (improved {improved_abs*100:.2f}cm, "
+                  f"{improved_frac*100:.1f}%) — stopping, best-so-far kept")
+            break
+        qpos_prev = qpos_k
+        P_prev = Pk
+
+    print(f"  Continuation done: best floor_pen_max={best_score[2]:.2f}cm "
+          f"(pass-0 was {P0*100:.2f}cm)")
+    return best_qpos, np.array(pen_per_pass)
+
 
 def _stats_row(label, d, c, tr, cs):
     print(f"  {label:22s} spikes={d['n_spikes_05']:3d} max_dq={d['max']:.3f} "
@@ -1110,6 +1369,39 @@ def main():
                          "(measured on luigi_standSupine_08: RIGHT_HIP_X_LINK 14.4cm, the SCA "
                          "loop could never resolve it since it wasn't real). No-op for "
                          "single-phase clips (root Z barely varies -> all-1s weight).")
+    ap.add_argument("--continuation", type=int, default=0,
+                    help="Continuation-v1 (plan.md, EXPERIMENTAL, gate FAILED to clear the ship "
+                         "bar -- see wiki/experiments/continuation-v1-gate.md, kept in code as "
+                         "opt-in only): run up to this many EXTRA Stage-B passes after the "
+                         "normal pass-0 solve, each warm-started from the previous pass's best "
+                         "iterate, with the allowed floor penetration (`floor_pen_allow`) "
+                         "shrinking PER-FRAME from that frame's own pass-0 value toward 0 and "
+                         "the floor slack penalty hardening 1000->--cont-floor-penalty-max, "
+                         "while tracking is relaxed ONLY in the frame-windows x limbs still "
+                         "violating (trunk/root never relaxed -- Stage B's root is frozen, it "
+                         "cannot fix a trunk-floor violation). Cross-pass keep-best is seeded "
+                         "with pass 0 (spikes gate first, lexicographic) so continuation can "
+                         "never ship worse than the plain solve. Default 0 = OFF, byte-for-byte "
+                         "unchanged from before this flag existed. Requires --floor-collision "
+                         "on (a warning is printed and continuation skipped otherwise -- there "
+                         "are no floor rows for it to act on). GATE FINDING: only helps when the "
+                         "base Stage-B solve already converges under --floor-collision on (1/3 "
+                         "gate clips); on clips that have never run with floor-collision on "
+                         "before, Stage B's own SCA loop can oscillate rather than converge even "
+                         "at high --n-outer, and no continuation schedule fixes a non-convergent "
+                         "base solve -- that is a separate, pre-existing issue.")
+    ap.add_argument("--cont-track-min", type=float, default=0.05,
+                    help="Continuation: floor of the per-pass tracking-relax factor (pass k "
+                         "relaxes a violating limb's tracking weight by max(this, 0.5**k)).")
+    ap.add_argument("--cont-window-pad", type=int, default=12,
+                    help="Continuation: frames to dilate each violating run by (both sides) "
+                         "before assigning limb-scoped tracking relaxation.")
+    ap.add_argument("--cont-floor-penalty-max", type=float, default=1e5,
+                    help="Continuation: floor-row slack penalty at the final pass (geometric "
+                         "ramp from --collision-penalty at pass 1 to this at pass K).")
+    ap.add_argument("--cont-stall-frac", type=float, default=0.10,
+                    help="Continuation: stop early if a pass improves max floor pen by less "
+                         "than both this fraction AND 0.2cm absolute vs the previous pass.")
     args = ap.parse_args()
 
     z = np.load(args.ik_npz, allow_pickle=True)
@@ -1289,6 +1581,9 @@ def main():
     s_a = all_stats(qpos_a)
 
     qpos_b = None
+    s_b0 = None
+    cont_pen_per_pass = None
+    count_floor = False
     if args.n_outer > 0:
         count_floor = args.floor_collision == "on" and floor_z is not None
         if count_floor:
@@ -1308,13 +1603,36 @@ def main():
                          floor_z=floor_z, floor_w=args.floor_weight,
                          floor_gid=floor_gid, count_floor=count_floor,
                          floor_active_frames=floor_active_frames)
-        s_b = all_stats(qpos_b, count_floor=count_floor, floor_active_frames=floor_active_frames)
+        s_b0 = all_stats(qpos_b, count_floor=count_floor, floor_active_frames=floor_active_frames)
+
+        # Continuation-v1 (plan.md), EXPERIMENTAL, default off (--continuation 0):
+        # extra Stage-B passes shrinking the allowed floor penetration toward 0
+        # and relaxing tracking only in violating frame-windows x limbs. Cannot
+        # ship worse than the plain pass-0 result above (cross-pass keep-best is
+        # seeded with it). Requires --floor-collision on since it operates on
+        # the floor QP rows built only when count_floor=True.
+        if args.continuation > 0:
+            if not count_floor:
+                print("  [warn] --continuation requires --floor-collision on — skipping "
+                      "(no floor rows for it to act on)")
+            else:
+                print(f"Continuation: up to {args.continuation} extra Stage-B passes...")
+                qpos_b, cont_pen_per_pass = _run_continuation(
+                    qpos_b, args, model, data, q_lo, q_hi,
+                    target_positions, role_names, role_to_body, target_weights,
+                    tgt, wgt, planted, resolved, downweight_roles,
+                    floor_z, floor_gid, floor_active_frames)
+
+    s_b = all_stats(qpos_b, count_floor=count_floor, floor_active_frames=floor_active_frames) \
+        if (qpos_b is not None and cont_pen_per_pass is not None) else s_b0
 
     print("\n" + "=" * 120)
     _stats_row("per-frame IK (warm)", *s_ik)
     _stats_row("Stage A (smoothing)", *s_a)
-    if qpos_b is not None:
-        _stats_row("Stage B (contact QP)", *s_b)
+    if s_b0 is not None:
+        _stats_row("Stage B (contact QP)", *s_b0)
+    if cont_pen_per_pass is not None:
+        _stats_row("Stage B+continuation", *s_b)
     print("=" * 120)
 
     save = {k: z[k] for k in z.files}
@@ -1326,11 +1644,14 @@ def main():
     })
     if qpos_b is not None:
         save["qpos_stage_b"] = qpos_b
+    if cont_pen_per_pass is not None:
+        save["cont_pen_per_pass"] = cont_pen_per_pass
     args.out.parent.mkdir(parents=True, exist_ok=True)
     np.savez(str(args.out), **save)
     print(f"\nSaved: {args.out}")
     print("Keys: qpos(best), qpos_per_frame, qpos_stage_a"
           + (", qpos_stage_b" if qpos_b is not None else "")
+          + (", cont_pen_per_pass" if cont_pen_per_pass is not None else "")
           + " (+ carried contact arrays for the renderer)")
 
 

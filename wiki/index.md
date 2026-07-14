@@ -23,6 +23,7 @@ Math ground truth = `METHOD.md` (repo root). Current state = `SESSION_HANDOFF.md
 - [era-ablations](experiments/era-ablations.md) — pre_shankclamp / shankclamp / onset_hyst / foothold_fix era dirs + collision weight sweep
 - [fullmesh-vs-primitive](experiments/fullmesh-vs-primitive.md) — fullmesh adoption, hard-QP infeasibility, penetration-vs-slip trade
 - [retired-approaches](experiments/retired-approaches.md) — hierarchical solve, hard equality, upright root, legacy worlddelta family
+- [continuation-v1-gate](experiments/continuation-v1-gate.md) — Stage-4 homotopy passes, gated 1/3 clips (branch `p0-grounding`), exposed a separate pre-existing SCA-oscillation issue under `--floor-collision on`
 
 ## Results
 - [metrics](results/metrics.md) — measured numbers per clip family, honest full distribution (incl. slip outliers)

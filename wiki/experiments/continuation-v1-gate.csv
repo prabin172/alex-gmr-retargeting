@@ -1,0 +1,4 @@
+clip,pass0_floor_pen_cm,shipped_floor_pen_cm,pass0_selfpen_over_cm,shipped_selfpen_over_cm,spikes,continuation_engaged
+standup_natural_01,13.77,13.77,n/a,n/a,0,no (base solve doesn't converge under floor-collision-on)
+standup_side_05,24.44,24.44,n/a,n/a,1,no (base solve doesn't converge under floor-collision-on)
+luigi_standSupine_08,3.56,2.68,0.2,0.01,0,yes

@@ -60,6 +60,26 @@ The 6.3 cm standup_side_04 slip was **stale** — it predates the Stage-3 coplan
 - **Only `λ_smooth` / `GROUND_SMOOTH` scale with rate** (×16 = fps², first-difference penalty in both `_banded_smoother` and `_build_smoothness_hessian`). Collision penalty ρ, trust region, λ_track are position/per-frame terms ⇒ **dt-invariant** (confirmed empirically: standup slip/coll insensitive to λ AND ρ sweeps). Contact pins (foot/hand) are also dt-invariant *for correctness*, but were bumped ×4 (40/8→160/32) to **rebalance** against the ×16 smoothing (see keep-best section above / [[metrics]]).
 - **`n_outer=6` at 120 Hz, but the original reasoning was WRONG.** The old note said the 4× larger QP "needs more SCA passes" because get-up coll regressed to ~33% at n=3. That regression was actually the **parity bug** (last-iterate return), now fixed by keep-best-iterate. With keep-best the shipped penetration is parity-immune; `n_outer=6` still gives the loop more chances to *find* a clean iterate but is no longer load-bearing for correctness. Kept at 6.
 
+## Continuation-v1 (2026-07-14, `--continuation N`, EXPERIMENTAL, default off) — gate did NOT clear ship bar
+Attempt to close the residual floor penetration Stage B's single pass leaves on hard get-up
+clips, by running extra passes: floor rows' allowed penetration shrinks PER-FRAME from that
+frame's own pass-0 value toward 0 (`eps_k(t) = pen0(t)·(1−k/K)`), the floor-row slack penalty
+hardens 1000→1e5, and tracking relaxes only in violating frame-windows × limbs (never
+trunk/root — Stage B's decision vars are actuated joints only). Cross-pass keep-best
+(lexicographic: spikes, self-collision, floor pen, slip+floor-err, tracking) seeded with pass 0,
+so it can never ship worse than the plain solve.
+
+**Gated on 3 clips, cleared on only 1** (`luigi_standSupine_08`: floor pen 3.56→2.68cm, self-pen
+headroom 0.20→0.01cm, 0 spikes — genuine, safe improvement). **The other 2
+(`standup_natural_01`, `standup_side_05`) showed zero effect for a reason unrelated to
+continuation**: their base Stage-B solve, under `--floor-collision on` (never validated on them
+before — see this file's `FLOOR_COLLISION` comment in `retargetingPipeline.sh`), never converges
+below its own warm start even at `n_outer=20` (control experiment) — the pre-existing SCA
+oscillation this page's own keep-best section already documents, just never exercised on these
+two clips until continuation's testing forced floor-collision on for them. A homotopy schedule
+can't rescue a base solve that oscillates instead of converging. **Not wired into pipeline
+defaults.** Full trail: `wiki/experiments/continuation-v1-gate.md`, `planLog.md` (repo root).
+
 ## Why Stage B is on now (history)
 Originally shelved: loose contact labels → non-stationary plants → inconsistent median anchors → infeasible/regressing. Onset hysteresis + foot-hold ×10 in [[contact-first-ik]] made plants near-stationary (0.1–0.3 cm), so median anchoring + all-soft + trust region is well-posed. Stage A alone re-adds ~8 cm plant drift.
 
