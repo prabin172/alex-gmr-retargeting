@@ -21,4 +21,36 @@ Per-plant-window analysis (diagnostic in `scratchpad`, not committed) overturned
 - **Principled general fix (unbuilt)**: register constant-contact on the **highest-root-z (terminal/standing) plant window** rather than a percentile of pooled samples — robust across get-ups with no per-clip number. See [[metrics]]. Still unbuilt as of 2026-07-10; `luigi_standSupine_08` still ships with the default p50 (not the p70 this page recommends for get-ups).
 - **Related, built (2026-07-10)**: the hard floor-COLLISION term (Stage 3/4, see [[globalopt]]) hit the same between-phase problem — a single clip-wide `floor_z` misread the lying phase's legitimately-low pelvis/hip as violation. Fixed with `floor_phase_weight()` (both solver scripts): a smoothstep of pelvis/root height between the clip's low reference and its planted-foot/standing height, gating hard floor-collision on/off per frame instead of clip-wide. This is a DIFFERENT mechanism from the grounding-percentile fix above — it fixes the Stage 3/4 collision term's phase-blindness, not Stage 4.5's registration percentile, which remains the unbuilt item. `luigi_standSupine_08` now runs with `--floor-phase-aware` in both stages; see `wiki/log.md` 2026-07-10 and `SESSION_HANDOFF.md`.
 
+### `hybrid` mode (2026-07-14, branch `p0-grounding`, uncommitted) — partial fix, does NOT close the gap
+New mode in `post_process_ground_contactfirst.py`: `constant-contact` base shift + a per-frame
+NON-NEGATIVE lift solved as a banded OSQP QP (`_solve_lift_qp`, min `||x-need||² + smooth·||D²x||²`
+s.t. `0 <= x <= cap`). `need` = whole-body penetration depth after the base shift; `cap` per frame
+= a still-planted foot's own penetration + `--lift-float-tol` (5mm default) — never let a plant
+float. This is the mechanism `grounding.md` had flagged as the "principled unbuilt fix" for the
+between-phase sink and the swing/tucked-foot clipping.
+
+Tested on the two known trouble clips (this branch's fresh Stage-4 outputs, `gmr` conda env):
+whole-body lowest-Z after grounding, constant-contact → hybrid:
+- `luigi_standSupine_08`: −16.3cm → **−4.7cm**.
+- `standup_side_05` (28cm swing-foot case): −25.9cm → **−21.2cm**, barely moved.
+
+Real improvement, but neither fully closes to ~0. Isolated the cause on both (not a smoothness-
+tuning issue — swept `--lift-smooth` 1e4→10 on luigi, residual only moved −4.69→−4.58cm): the
+**still-plant cap** is what binds. At the worst frame, a *different* body part than the one
+penetrating deepest is a still-planted foot with only a few mm of its own penetration, so its tiny
+cap limits the frame's *whole* lift, even though some other part of the body (lying torso/hip on
+luigi, a free swing foot on standup_side_05) needs far more. luigi frame 375: cap≈5.2cm (from a
+still foot) vs whole-body need≈9.8cm → 4.6cm residual. standup_side_05 frame 595: cap=5mm (still
+foot already flush with floor) vs need≈26cm → 21cm residual.
+
+**Conclusion**: this is the same "between-phase" conflict as the old single-shift design (two body
+parts disagreeing on floor height), just moved from whole-clip to per-frame granularity — a single
+scalar lift per frame still can't satisfy two body parts that disagree *within the same frame*. The
+cap is doing its job (never floats a plant) but is structurally incompatible with also fully
+lifting a different, deeply-penetrating part in that same frame. Closing these two cases needs
+something finer-grained than a scalar lift — e.g. per-limb correction, which is the same structural
+limit M5's `refine_limbs_contactfirst.py` (phasic-v2 branch) already hit on whole-body-lying clips.
+`hybrid` is safe to ship as a strict improvement over `constant-contact` (never worse, substantially
+better on average) but should not be presented as solving the between-phase/swing-clip gap.
+
 > The Mimic-ready `contact_labels (T,11)` export (11 bodies, 2 cm threshold) lives in `scripts/legacy/post_process_grounding_contacts.py` — built for the RETIRED pipeline, not yet wired into the contact-first path. See [[open-questions]].
