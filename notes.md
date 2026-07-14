@@ -1,89 +1,57 @@
-# Two-pass contact-aware IK plan
+# Scoping the "hard clips" problem — decomposition (2026-07-15)
 
-## Goal
-Make the solver keep the body near the full-body target while also enforcing contact discipline and avoiding floor penetration, without letting the wrist absorb the correction and flick.
+Replaces the earlier raw note (a reward-augmented-QP sketch and the worry "then I'm doing real
+mimic, not retargeting — I'm having a really hard problem scoping this"). The scoping struggle
+was real because the note described three different problems as one. Decomposed, with the
+evidence this week's experiments produced:
 
-## Core idea
-Do a two-pass solve per frame:
+## 1. "Contact z constrained, slip x,y constrained, track as much as possible" — ALREADY BUILT
 
-1. Whole-body pass
-   - Solve the full body from the current target pose.
-   - This gives a near-target posture and keeps the body coherent.
-   - Use a strong but not overly aggressive floor/contact term here.
-   - The goal is to get the root/pelvis/legs/torso near the intended pose.
+Stage 4's contact QP does exactly this: on-floor rows on Z, XY pins on planted frames, tracking
+down-weighted for contacting effectors. Zero-slip was confirmed already-met during
+hierarchical-v1 H2 (hard-tier A/B: slip bit-identical — Stage 4's soft QP delivers it without
+new machinery). Nothing to build here.
 
-2. Contact refinement pass
-   - Starting from the result of pass 1, refine only the limbs that are actually involved in contact or near contact.
-   - For each relevant limb, solve from the shoulder/hip chain outward.
-   - Keep the wrist and hand as soft targets, not the main correction handle.
-   - Enforce palm/foot contact discipline and floor-safe placement.
+## 2. "Null space of the contact-consistent solution space" — TESTED, DEAD
 
-This keeps the wrist from becoming the slack variable that causes the flicks.
+This was hierarchical-v1's premise (HQP-NLP proposal, reduced in design review, narrow version
+gated): zero measurable end-to-end benefit. Continuation-v1 (2026-07-14) sharpened the lesson:
+constraint machinery of ANY sophistication only helps when the solver already sits in a basin
+containing a feasible solution. On the whole-body get-up clips it doesn't — every
+objective/constraint enrichment tried on the wrong basin (floor-hard, hard-tier, continuation,
+root-z probe) returned zero. The missing ingredient is not a better constraint set.
 
-## Why this could help
-The current issue looks like a priority problem:
-- the floor correction is being resolved partly through the wrist/hand chain,
-- which creates fast, visible joint spikes.
+## 3. "Rewards: torso up, joints off extremes, stand up without slipping, tracking demoted" —
+## THIS IS MIMIC WITHOUT PHYSICS. DON'T.
 
-With a two-pass strategy:
-- the first pass solves the whole body near the target,
-- the second pass uses the limb chain to satisfy contact constraints and safe placement,
-- so the arm/hand can adapt more smoothly through shoulder/elbow rather than snapping through wrist.
+The original note caught it itself: "then I'm doing real mimic, not retargeting." Sharpened: a
+reward-shaped kinematic QP inherits all of mimic's problems (reward design per phase, per
+motion) while keeping none of its advantage (the simulator enforcing feasibility for free). The
+downstream RL tracker already IS this machine, WITH physics. A kinematic imitation of it is the
+weakest point on the spectrum. Settled design philosophy agrees: retargeting = kinematic
+reference; downstream RL handles physics.
 
-## Proposed implementation shape
-### Pass 1: whole-body solve
-Reuse the existing frame-level IK solve as the first pass.
+## The actual scope (three-way split, each piece evidenced)
 
-- Keep current body targets and orientation targets.
-- Keep the floor repulsion term active.
-- Keep contact targets soft-to-medium weight.
-- Do not let the wrist be the primary actuator for floor correction.
+- **Feasible clips** (most of the corpus): retargeting proper, pipeline as-is, tracking primary.
+- **Infeasible clips** (whole-body get-ups): the STRATEGY must come from outside the QP —
+  Luigi-style manual edit, recapture with robot limits in mind, or eventually physics-based
+  synthesis. Not from reward terms in a kinematic solver. Evidence: Luigi's manual standSupine
+  edit supplied the strategy our tracking cost can never discover (it deviates structurally from
+  the human), and nothing less did.
+- **Polish** (validated 2026-07-14): Stage A/4 runs on ANY strategy source, ours or external —
+  "polish Luigi" took his 25.7 rad/s keyframed motion to 4.5 rad/s, floor pen 3.0→2.8cm, self-
+  collision 0, at 3.3→4.4cm slip cost (`scripts/ihmc_json_to_stage4_npz.py` +
+  `scripts/eval_ihmc_json.py`, wiki/log.md 2026-07-14). This piece makes the split composable
+  instead of either/or.
 
-### Pass 2: per-limb refinement
-After pass 1, run a refinement loop for each contact-relevant limb:
+One-sentence scope statement: **faithful when feasible, polished when given a feasible strategy,
+honest about which clips need one.**
 
-- left_arm: shoulder -> elbow -> wrist -> palm site
-- right_arm: shoulder -> elbow -> wrist -> palm site
-- left_leg: hip -> knee -> ankle -> foot site
-- right_leg: hip -> knee -> ankle -> foot site
+## Salvageable small items from the original note (regularizers, not rewards)
 
-For each limb:
-- solve only the joints in that chain,
-- use the current whole-body pose as the initialization,
-- apply a target for the distal site or body,
-- use a small regularization term to keep motion smooth,
-- clamp the palm/foot site to a floor-safe height if needed.
-
-The limb refinement should be lower priority than the whole-body solve, so it only fixes local contact issues instead of destroying the global posture.
-
-## Contact discipline rules
-For the refinement pass:
-- if a hand is in contact, prioritize palm placement and palm normal over wrist motion,
-- if a foot is in contact, prioritize foot-flat/foot-site placement over ankle drift,
-- if a palm or foot would go below the floor, project it to a small safe clearance instead of letting the wrist/ankle snap through.
-
-## Practical implementation plan
-1. Create a branch such as `contact-aware-two-pass-ik`.
-2. Keep the current solver as the baseline.
-3. Add a second refinement pass in the per-frame IK loop.
-4. Start with only the arms first, because the flick issue is clearly wrist-driven.
-5. Compare:
-   - floor penetration,
-   - wrist velocity spike,
-   - palm/contact target error,
-   - tracking error.
-6. If the arm pass works, extend the same pattern to the feet.
-
-## Suggested first test
-Use the current problematic clip and compare three variants:
-- baseline current solver,
-- whole-body only with stronger floor term,
-- whole-body + arm refinement pass.
-
-The first target metric should be: floor penetration stays near zero while wrist max velocity drops significantly.
-
-## Notes for later
-If the refinement pass still causes drift, we can make it even more conservative:
-- only run it when contact is active or floor penetration is detected,
-- use smaller step sizes,
-- use a strong previous-frame regularizer so the refinement remains smooth.
+- *Joints away from extremes*: a mild limit-distance regularization is a standard IK term —
+  cheap in Stage 3/4 if NECK_Y's 48–63% limit-pinning ever matters downstream. Not built.
+- *Torso up*: that's the torso orientation weight (already the identified lever for the
+  front-tilt finding). A single global weight = still retargeting; per-phase scheduling of it =
+  reward engineering, out of scope per §3.
