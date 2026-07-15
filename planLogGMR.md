@@ -379,3 +379,88 @@ controls AND floor-contact clips), on two independent metrics (floor penetration
 velocity), with the core smoothing mechanism transferring at Alex-comparable magnitude (4.3-7.7x
 vs Luigi's validated 5.7x) and zero core-solver-logic changes required for either Stage A or
 grounding. No cherry-picking was needed to make this case. Proceeding to T10 (results narrative).
+
+## E4 — Stage B contact-anchoring QP on G1 (MVP, post-week-1, Prabin: "go ahead with E4")
+
+**Scope decided (feet only, self-collision OFF)**: `stage_b`, `_compute_anchors`,
+`_load_model_with_floor`, `_get_joint_limits` all imported from
+`solve_global_trajectory_opt_contactfirst.py` COMPLETELY UNCHANGED — verified by inspection none
+of them read module-level Alex globals inside their bodies, only via arguments. The ONE genuinely
+Alex-specific piece is `_resolve_contact_geom` (reads a hardcoded `CONTACT_GEOM` dict of Alex body
+names) — forked as `_resolve_g1_feet` in the new `scripts/g1/stage_b_g1.py` (~20 lines, same
+`resolved` dict shape, G1 body names `left_ankle_roll_link`/`right_ankle_roll_link`, no hands this
+pass). Self-collision deliberately OFF (`lambda_coll=0.0`) — this week's own caveat (G1's
+mocap-model collision pairs read as noise, 18.2% self-collision on a clean walk clip, M1) meant
+mixing that into a hard-constraint QP risked contaminating the one new mechanism this pass was
+meant to isolate and measure. Floor-collision QP rows also OFF (`count_floor=False`) — grounding
+(T8) already owns clip-level floor placement; this pass tests contact anchoring ALONE, on top of
+the already-polished (Stage A + grounded) motion, using it as both warm start and self-tracking
+target (mirrors the validated "polish Luigi" recipe).
+
+**Discovery: G1's mocap XML already ships sole-corner markers.** `left_ankle_roll_link`/
+`right_ankle_roll_link` each carry 4 small unnamed sphere geoms (radius 5mm) at toe/heel ×
+left/right offsets — structurally identical in purpose to Alex's NAMED `alex_*_sole_corner_*`
+sites, just as unnamed geoms. Used for the contact-zone height signal (`_foot_sole_geom_ids`,
+matched by `geom_bodyid`+`geom_type==SPHERE`, no XML edits). NOT wired into `_build_contact`'s
+on-floor/flat/coplanar shared-Z refinement this pass (that machinery needs a SITE list,
+`info["sole_sites"]`, which stays `[]` here) — a real, deliberate limitation, not a bug: this
+pass only gets position+orientation contact anchoring, not the coplanar snap Alex's pipeline also
+has. Documented as a clear extension point, not attempted (time-boxed).
+
+**Contact-detection bug found + fixed via debug sweep (not guessed)**: first version gated on
+height AND a body-origin speed threshold (mirroring Alex's `--still-speed` convention exactly).
+Debug sweep (`_screen`-style scratch script) found ZERO frames satisfied both gates simultaneously
+on `walk1_subject1` even at generous thresholds — root cause isolated: conditioned on
+near-ground frames, the SOLE-CENTROID speed was, if anything, HIGHER (median 0.62 m/s) than the
+clip's unconditional median (0.31 m/s) — a heel-to-toe rolling contact moves the 4-corner
+centroid even while the true contact patch is quasi-stationary, a geometric artifact of
+collapsing 4 corners to one point for the SPEED check specifically (not for the height check,
+which uses the min corner, unaffected). Fix: dropped the speed gate from the detector entirely —
+`detect_g1_foot_contacts` now supplies ONLY a coarse height-based "contact zone" flag
+(`< 5cm`, calibrated: height-only at 5cm gives ~48% of `walk1_subject1`'s frames, a plausible
+stance-fraction ballpark), and the ALREADY-IMPORTED, UNCHANGED `_compute_anchors` does its own
+speed-based stillness sub-segmentation internally (body-origin speed, `--plant-speed 0.05`,
+Alex's exact convention) — the right layering: my code detects "in the ballpark", the existing,
+validated code decides "is it actually still enough to anchor hard."
+
+**Result, all 5 clips, `--n-outer 6 --lambda-coll 0.0`** (stage_b's own self-reported
+warm→best, NOT independently cross-validated — see caveat below):
+
+| clip | contact zone % (L/R) | planted frames (L/R) | slip: warm→best |
+|---|---|---|---|
+| walk1_subject1 (control) | 47.6% / 47.8% | 100 / 160 | **1.2→0.9cm (25% reduction)** |
+| dance1_subject1 (control) | ~low | few | 0.1→0.1cm (no change) |
+| fallAndGetUp2_subject2 | ~low | very few | 0.1→0.1cm (no change) |
+| fallAndGetUp1_subject1 | ~near 0 | ~0 | 0.0→0.0cm, `|dQ|max=0.0000` (QP found nothing to do) |
+| ground1_subject1 | ~near 0 | ~0 | 0.0→0.0cm, `|dQ|max=0.0000` (QP found nothing to do) |
+
+**Cross-check via `eval_motion.py`** (independent, already-trusted metrics — floor pen/vel/spikes,
+NOT slip, since GMR-pkl sources carry no contact flags for eval_motion's own stance columns):
+**zero regressions on any clip, any metric.** One real, independently-measured bonus win:
+`dance1_subject1` floorPen 3.2→**2.8cm**, pen% 0.6%→**0.2%** (a side effect of the small joint
+adjustments Stage B made while chasing its self-tracking target). All other clips: eval_motion.py
+numbers byte-identical polished vs polished+StageB.
+
+**Honest verdict — narrow, not a clean win, worth a checkpoint before continuing**: contact
+anchoring gives a real, measurable improvement on CLEAN LOCOMOTION (walk1_subject1's 25% slip
+reduction) — consistent with the mechanism working as designed. But it has **essentially zero
+effect on the 3 floor-contact clips — the paper's actual target class** — because a
+height-based "near the ground" gate finds almost no sustained stationary-foot behavior in
+fall/crawl motions (unlike walking, these motions' feet are rarely both near-ground AND still at
+the same time; `fallAndGetUp1_subject1`/`ground1_subject1` detected essentially zero plants,
+`|dQ|max` stayed exactly 0). This is a real, well-measured, honest finding — not a bug I need to
+chase further before reporting it — but it means this pass's feet-only, gait-style contact
+detector is the WRONG lever for the motion class this whole project cares about. Extending it
+(hands/knees/torso as support surfaces for prone/supine contact, a genuinely different detection
+scheme for non-gait motions) is a real scope decision, not a natural continuation — flagged to
+Prabin rather than unilaterally expanded further.
+
+**Caveat on the one positive number**: `walk1_subject1`'s slip improvement is currently only
+visible through `stage_b`'s OWN self-reported metric (computed internally by `_contact_slip_stats`
+using MY detected flags) — not independently cross-validated by `eval_motion.py`, since G1 sources
+carry no contact flags for its stance/slip columns. Building that independent cross-check (feed
+`eval_motion.py` the SAME detected flags used here) would be a natural next step before trusting
+this number for anything paper-facing.
+
+**Files**: `scripts/g1/stage_b_g1.py` (new). Outputs: `outputs/gmr_baseline/pkl/*_stageB.pkl`
+(all 5 clips), debug logs in scratchpad (not repo).
