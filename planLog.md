@@ -207,3 +207,151 @@ byte-identical in T2–T4 above. Since continuation did not clear the ship bar, 
 wiring was correspondingly NOT added (no `CONTINUATION` env knob) — nothing in
 `retargetingPipeline.sh` changed this session, so a full-corpus re-run to prove no-op would be
 re-proving something no code touches. Skipped on that basis rather than run redundantly.
+
+---
+
+# Feasibility-First-v1
+
+Execution trail for the current `plan.md` (feasibility-first-v1, replaces continuation-v1 above).
+Env for every python call: `source /home/ptimilsina/miniforge3/etc/profile.d/conda.sh && conda activate gmr`.
+
+## T1 — Stage-3 baseline (2026-07-15)
+
+Ran Stage 3 standalone on the two gate clips from their existing Stage-2.5 outputs
+(`outputs/canonical_human/fbx_fresh/*_canonical_grounded.npz`), mirroring the pipeline's exact
+Stage-3 flags (`STRIDE=1 IK_ITERS=40`, `--contact-min-run 12 --contact-ramp 16 --contact-preroll 8`,
+`--coplanar-feet-mode mean`, `--floor-weight 10 --floor-margin 0 --floor-gain 5`, no hard-tier/
+swing-clear/leg-floor-refine flags, empty per-clip `solve_extra` for both — confirmed from
+`retargetingPipeline.sh`'s `CLIPS[]` entries). Saved to `outputs/ff_dev/<clip>_cf_base.npz`.
+
+Depths measured with `_ff_measure_frame` (the new §3.2 module function) directly against these
+NPZs (floor mocap positioned at z=0.0, the Stage-2.5 invariant -- NOT re-estimated, matching how
+Stage 3 itself treats `floor_z` when persisted contacts are present):
+
+| clip | floor_pen max (cm) | floor_pen p50/p95 (cm) | frames >2cm | self_pen max (cm) | frames >1.5cm |
+|---|---|---|---|---|---|
+| standup_natural_01 | 22.24 | 20.17 / 21.80 | 100.0% | 1.19 | 0.0% |
+| standup_side_05 | 25.03 | 13.97 / 24.31 | 100.0% | 3.68 | 9.0% |
+
+Both clips show DEEP, NEAR-UNIVERSAL floor penetration at Stage 3 already (not a shallow
+floor-vs-mesh artifact -- `_detect_floor_sensitive_frames`'s docstring documents a sub-cm
+universal artifact this is NOT: p50 alone is 14-20cm). Consistent with the between-phase
+diagnosis (wiki/concepts/grounding.md): during the clip's lying/crouch phase, large chunks of
+the body (torso/thighs) sit genuinely below the robot's floor=0 reference by construction -- this
+is exactly the target failure mode feasibility-first is meant to address. Stage 3's own printed
+summary ("Floor-penetration summary: ... 100.0%/74.8% of frames") undercounts by only checking
+ct.dist<0 (any contact) not depth -- matches directionally, confirms via a second measurement
+path. `standup_natural_01` also shows a floor-invariant-gate WARNING (14 contacting-effector
+targets landed below their floor reference, max depth 0.62cm) -- a small, separate, pre-existing
+target-construction residual (not this session's concern, tracked by the existing gate check).
+
+**Accept**: baseline depths logged for both gate clips (table above) -- T1 done.
+
+## T3 — STOPPED: the retry wrapper's weight-boost mechanism triggers a pre-existing solver instability
+
+Implemented §3.1 (phase boundaries), §3.2 (`_ff_measure_frame`/`_ff_limb_roles_for_body`), §3.3
+(the retry wrapper), §3.5 (CLI + NPZ keys) in `solve_fbx_canonical_alex_contactfirst.py`. No-op
+certified first: `--feasibility-first` OFF is BYTE-IDENTICAL to T1's baseline
+(`cmp outputs/ff_dev/standup_natural_01_cf_base.npz outputs/ff_dev/standup_natural_01_noop_check.npz`
+-- IDENTICAL). T2 passes.
+
+**T3's own acceptance ("retries happened, floor_pen_cm.max() improves vs T1 baseline") FAILED --
+but not from a bug in the wrapper's bookkeeping. Root cause isolated by direct A/B, independent
+of any of my new code:**
+
+`--feasibility-first` on `standup_natural_01` (first 30 frames) diverges catastrophically:
+`mean_err` climbs monotonically frame-to-frame (0.10 -> 2.42 by frame 29), hand-contact
+"distance" blows past 270cm, `floor_pen max=306.55cm` (3+ METRES). Isolated which of the retry
+wrapper's THREE mechanisms (relax tracking / boost floor+coll weight / restart noise) causes it:
+
+1. Disabled noise entirely (`--ff-restart-from 100`) -- STILL diverges identically (floor_pen
+   max=305.55cm). Not the noise.
+2. Reduced to `--ff-max-attempts 1` (a single retry, boost=2x, no noise) -- STILL diverges
+   (floor_pen max=309.82cm after just ONE mild retry). Not an accumulation-of-attempts effect.
+3. **Removed the retry wrapper entirely** -- ran PLAIN Stage 3 (no `--feasibility-first` at all)
+   with `--floor-weight 20` (exactly 2x the shipped default of 10, matching what one retry's
+   `boost=2.0` would produce) on the same clip/frames: **diverges identically** -- `mean_err`
+   climbs every single frame (0.40 -> 4.28 over 15 frames), hand-contact distance grows
+   unbounded (53cm -> 473cm). Tried `--floor-weight 15` (a MILD 1.5x) -- **same runaway pattern**
+   (mean_err 0.39 -> 3.44 over 15 frames).
+
+**Conclusion: this is a PRE-EXISTING instability in Stage 3's soft floor-repulsion term
+(`--floor-weight`), triggered by ANY increase above the shipped default of 10 on
+`standup_natural_01`, with NOTHING from feasibility-first-v1 involved.** The shipped default
+(10) sits at or near a stability edge for this clip; the retry wrapper's core mechanism (§3.3's
+`boost = 2.0 ** a`, meant to push a violating frame toward feasibility) instead walks straight
+into this edge on attempt 1 and the warm-started per-frame chain compounds it every subsequent
+frame (once one frame's kept qpos is bad, every later frame inherits a bad warm start and gets
+worse). This is NOT the previously-documented `--floor-hard`/hard-tier 44-metre blowup
+(`wiki/experiments/retired-approaches.md`) -- that was a hierarchical/task-priority conflict;
+this is the plain single-level DLS solve with an ordinary soft floor-repulsion weight, diverging
+on its own with no hierarchical/hard-tier flags anywhere in these runs.
+
+**Per plan.md ground rule 6 (two failed attempts -> stop, log, don't redesign): STOPPING here.**
+The core §3.3 mechanism ("boost floor/collision weight to force feasibility") is unsound as
+designed for THIS solver -- boosting is not a safe lever at all on at least this clip, at any
+tested multiplier from 1.5x to 64x. Flagged to Prabin for a decision before continuing (see
+chat): whether to (a) drop the weight-boost half of the retry entirely and rely only on
+tracking-relaxation + restart-noise (untested whether that alone is enough without the boost),
+(b) first characterize/fix the underlying floor_weight instability as its OWN separate
+investigation (a bigger, more fundamental finding than this plan anticipated -- the shipped
+default of 10 being this close to an edge on a get-up clip is itself concerning for the shipped
+pipeline, independent of feasibility-first), or (c) abandon this plan's per-frame weight-boost
+approach and reconsider the mechanism.
+
+**Code state**: the retry wrapper (§3.1/§3.2/§3.3/§3.5) is fully implemented and no-op-certified
+when off (`--feasibility-first` default False). Left in place, NOT further exercised pending
+direction -- do not run it with attempts > 0 on more clips until the floor_weight instability
+question above is resolved, since every observed run so far diverges.
+
+## T3 continued — redesign attempt 1 (drop boost) still diverges; root cause is deeper than the boost
+
+Per Prabin's direction: dropped the `boost = 2.0 ** a` weight-boost entirely (floor_weight/
+coll_weight now IDENTICAL to attempt 0 on every retry -- only tracking relaxation + phase-boundary
+noise vary). No-op re-verified (BYTE-IDENTICAL with the flag off). Re-tested on
+standup_natural_01, first 30 frames:
+
+- With noise enabled (default `--ff-restart-from 3`): STILL diverges (floor_pen max=238.67cm,
+  mean_err climbing).
+- Noise disabled (`--ff-restart-from 100`, i.e. PURE tracking-relaxation retries, zero boost,
+  zero noise): STILL diverges (floor_pen max=302.14cm, mean_err 0.33->2.36 over 30 frames).
+
+**So the boost was never the sole cause -- pure tracking relaxation alone is enough to diverge.**
+Diagnosed why: the keep-best score `(hard, pf+ps, terr)` is lexicographic, and two different
+qpos solutions almost NEVER tie exactly on the `pf+ps` (pen) term -- so in practice the score
+comparison is decided by `pf+ps` alone, and `terr` (tracking error) is essentially never reached
+as a tie-break. A retry that shaves a hair off floor/self penetration wins over attempt 0 even if
+its tracking error is enormous (a nonsensical pose), because the tuple comparison stops at the
+2nd element long before reaching the 3rd. That bad pose then becomes NEXT FRAME's warm start,
+and the same thing happens again -- compounding into the observed runaway.
+
+**Fix attempt 2: a tracking-error sanity cap.** Added `_ff_terr_cap = max(terr0 * 3.0, terr0 +
+0.5)` (terr0 = attempt 0's own tracking error for this frame) and disqualified any retry whose
+tracking error exceeds it (skipped from best-q consideration entirely, not just deprioritized).
+No-op re-verified. **STILL diverges** (floor_pen max=246.69cm over the same 30 frames) -- though
+notably the error now PLATEAUS around frame 15-29 (~2.02) rather than continuing to grow
+unboundedly, a partial improvement but not a fix.
+
+**Why the cap didn't work, reasoned through (not yet re-tested)**: the cap is RELATIVE to THIS
+frame's own attempt-0 tracking error (`terr0`). But attempt 0 itself warm-starts from the
+PREVIOUS frame's kept q -- if that previous frame's kept q was already corrupted (from an earlier
+retry that passed a now-too-permissive relative cap), attempt 0's OWN terr0 is already elevated,
+and `terr0 * 3.0` is proportionally even MORE permissive, not less. The cap is relative to a
+reference that can itself be already compromised, so it doesn't prevent the compounding chain --
+it only slows it.
+
+**Proposed fix 3 (not yet implemented)**: switch the disqualification criterion from task-space
+tracking error (`terr`, which is a downstream, amplifiable proxy) to JOINT-SPACE displacement
+from the INCOMING warm start (`ff_q_warm_in`, i.e. `np.abs(q_try[7:] - ff_q_warm_in[7:]).max()`).
+This is scale-invariant and, critically, bounds each frame's step relative to what it STARTED
+from rather than a same-frame reference that can already be corrupted -- if every frame's kept q
+is guaranteed to move at most X radians from ITS OWN incoming warm start, the worst case across T
+frames is bounded linear drift, not compounding/exponential blowup. Threshold candidate: 0.5
+rad/frame, reusing this codebase's OWN existing convention for a velocity spike
+(`SPIKE_RAD_PER_S = 60` in `solve_global_trajectory_opt_contactfirst.py` = 0.5 rad/frame @120Hz)
+rather than inventing a new number.
+
+**STOPPING here per plan.md ground rule 6 (two failed attempts -> stop, log, ask) rather than
+implementing fix 3 silently** -- this is the second fix attempt to fail, and while fix 3 has a
+principled argument behind it (relative-to-corrupted-reference vs relative-to-incoming-warm-start
+is a real, reasoned distinction, not a guess), it has NOT been tested yet. Flagged to Prabin.

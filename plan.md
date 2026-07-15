@@ -1,6 +1,16 @@
 # Plan: Feasibility-First-v1 — plan feasibility globally per frame, then optimize similarity (Stage 3, branch `p0-grounding`)
 
-**Status: ACTIVE. Written 2026-07-15 for a lower-capability model to execute exactly.**
+**Status: PAUSED 2026-07-15 (Prabin's call, not a gate result) — mid-T3, do not resume without
+new direction.** T1/T2 done (baseline logged, `--feasibility-first` off verified byte-identical).
+T3's retry wrapper is implemented but DIVERGES on `standup_natural_01` in every configuration
+tried so far — full diagnosis + two failed fix attempts in `planLog.md`'s "Feasibility-First-v1"
+section (search "STOPPING here"). Root cause is NOT the weight-boost mechanism (already removed,
+still diverges) — it's the keep-best score never reaching its tracking-error tiebreak because
+floor-pen values almost never tie exactly between two solved poses, so a retry that marginally
+improves pen but sends the pose somewhere nonsensical still wins and compounds frame-to-frame.
+A THIRD fix (joint-space displacement cap from the incoming warm start, not task-space tracking
+error — reasoned but UNTESTED) is proposed in planLog.md. Start there, not from this file's task
+list, if resuming.
 Author of record: Prabin (decisions), plan drafted by Claude. Prabin commits himself — the
 executor NEVER runs `git add/commit/push`.
 

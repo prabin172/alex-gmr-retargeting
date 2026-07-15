@@ -588,6 +588,68 @@ def _within_k_hops(model: mujoco.MjModel, b1: int, b2: int, k: int) -> bool:
     return False
 
 
+FF_LEG_BODY_KEYS = ("HIP", "THIGH", "SHIN", "ANKLE", "FOOT")
+FF_ARM_BODY_KEYS = ("SHOULDER", "ELBOW", "WRIST", "GRIPPER")
+
+
+def _ff_limb_roles_for_body(model, body_id):
+    """Feasibility-first (plan.md §3.4): map a violating body id to the Stage-3
+    POSITION role names (`ROLE_TO_ALEX_BODY` keys, e.g. "left_knee") whose
+    tracking may be relaxed to let that limb resolve a floor/self-collision
+    violation. Mirrors continuation-v1's `_limb_roles_for_body` in
+    solve_global_trajectory_opt_contactfirst.py (same body-name-prefix logic),
+    but for Stage 3's role vocabulary. Trunk/pelvis/torso/head bodies (and
+    anything unrecognized) return [] deliberately -- unlike Stage 4's frozen
+    root, Stage 3's root IS a free DOF, so a trunk violation can still resolve
+    via root motion + the constraint-weight boost alone; relaxing a
+    nonexistent "trunk role" would do nothing useful.
+
+    Position-only: ORI_TO_ALEX_BODY has no per-joint orientation roles for
+    limb segments (hip/knee/ankle/shoulder/elbow/wrist orientation is
+    deliberately untracked, see this file's module docstring) — only
+    pelvis/torso/head/feet/hands carry an orientation target, so there is
+    nothing for a limb-joint relaxation to touch on the orientation side."""
+    name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
+    side = "left" if name.startswith("LEFT_") else ("right" if name.startswith("RIGHT_") else None)
+    if side is None:
+        return []
+    if any(k in name for k in FF_LEG_BODY_KEYS):
+        return [f"{side}_hip", f"{side}_knee", f"{side}_ankle"]
+    if any(k in name for k in FF_ARM_BODY_KEYS):
+        return [f"{side}_shoulder", f"{side}_elbow", f"{side}_wrist"]
+    return []
+
+
+def _ff_measure_frame(model, data, floor_gid, coll_hops):
+    """Feasibility-first (plan.md §3.2): read `data.ncon` for the CURRENT
+    solved pose (caller must have just returned from `solve_frame_position_ik`,
+    which leaves `data` at its own last `mj_forward` -- no extra forward call
+    needed) and return `(floor_pen_m, self_pen_m, violating_body_ids)`.
+
+    Deliberately RAW depth (`-ct.dist`), not the `COLL_MARGIN`-relative demand
+    the constraint ROWS use elsewhere in this file -- this is a feasibility
+    PROBE (did the frame actually end up penetrating), not a row target."""
+    floor_pen = 0.0
+    self_pen = 0.0
+    bodies = set()
+    for c_idx in range(data.ncon):
+        ct = data.contact[c_idx]
+        is_floor = floor_gid is not None and (ct.geom1 == floor_gid or ct.geom2 == floor_gid)
+        if is_floor:
+            if ct.dist < 0:
+                floor_pen = max(floor_pen, -float(ct.dist))
+                other = ct.geom2 if ct.geom1 == floor_gid else ct.geom1
+                bodies.add(int(model.geom_bodyid[other]))
+            continue
+        b1 = int(model.geom_bodyid[ct.geom1]); b2 = int(model.geom_bodyid[ct.geom2])
+        if b1 == 0 or b2 == 0 or _within_k_hops(model, b1, b2, coll_hops):
+            continue
+        if ct.dist < 0:
+            self_pen = max(self_pen, -float(ct.dist))
+            bodies.add(b1); bodies.add(b2)
+    return floor_pen, self_pen, bodies
+
+
 def self_collision_rows(
     model: mujoco.MjModel,
     data: mujoco.MjData,
@@ -1652,6 +1714,36 @@ def main():
                          "Final frame + summary always printed. Use >1 to cut log volume.")
     ap.add_argument("--no-contact-first", action="store_true",
                     help="Disable contact-gated foot-flat / fist-down overrides (baseline behaviour)")
+    ap.add_argument("--feasibility-first", dest="feasibility_first", action="store_true",
+                    default=False,
+                    help="Feasibility-first-v1 (plan.md, EXPERIMENTAL): per-frame retry wrapper "
+                         "around solve_frame_position_ik. A frame whose solved pose penetrates the "
+                         "floor beyond --ff-floor-tol or self-collides beyond --ff-self-tol is "
+                         "RE-SOLVED up to --ff-max-attempts times, each attempt relaxing tracking "
+                         "on the violating limb's roles ONLY (factor 0.5**attempt); at a phase "
+                         "boundary (contact-state change) and attempt >= --ff-restart-from, ALSO "
+                         "perturbs the warm start with seeded noise so the retry can cross a "
+                         "strategy basin tracking relaxation alone cannot. Floor/collision weight "
+                         "are NEVER boosted above their attempt-0 values -- planLog.md T3 found "
+                         "that boosting --floor-weight even 1.5x above its shipped default (10) "
+                         "triggers a pre-existing Stage-3 DLS instability (monotonic per-frame "
+                         "divergence), independent of this wrapper and confirmed by re-running "
+                         "PLAIN Stage 3 at higher --floor-weight with no retry code involved at "
+                         "all. Keep-best across attempts (lexicographic: infeasibility depth, then "
+                         "total pen depth, then tracking error) -- attempt 0 is ALWAYS today's "
+                         "exact call, so a feasible frame takes that identical path and this flag "
+                         "OFF (default) is byte-for-byte unchanged from before it existed. See "
+                         "wiki/experiments/feasibility-first-v1-gate.md once gated.")
+    ap.add_argument("--ff-floor-tol", type=float, default=0.010,
+                    help="Feasibility-first: max floor penetration (m) before a frame retries.")
+    ap.add_argument("--ff-self-tol", type=float, default=0.015,
+                    help="Feasibility-first: max self-collision penetration (m) before a frame retries.")
+    ap.add_argument("--ff-max-attempts", type=int, default=6,
+                    help="Feasibility-first: extra solve attempts per violating frame (beyond attempt 0).")
+    ap.add_argument("--ff-restart-from", type=int, default=3,
+                    help="Feasibility-first: attempt index (1-based among retries) at which a "
+                         "phase-boundary frame starts perturbing the warm start with noise, on top "
+                         "of the tracking relaxation every attempt already gets.")
     args = ap.parse_args()
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -1776,6 +1868,23 @@ def main():
     contact_env = {eff: ramp_envelope(contacts_solved[eff], args.contact_ramp, args.contact_preroll)
                    for eff in CONTACT_EFFECTORS}
 
+    # Feasibility-first (plan.md §3.1): a phase boundary is any solved frame
+    # whose contact-state vector (across all effectors) differs from the
+    # previous frame's, plus frame 0. Computed unconditionally (cheap, pure
+    # numpy) so it's available regardless of --feasibility-first; only
+    # consumed by the retry wrapper below.
+    _eff_order_ff = list(CONTACT_EFFECTORS.keys())
+    _contact_state = np.stack([contacts_solved[e] for e in _eff_order_ff], axis=1)  # (T, n_eff)
+    ff_phase_boundary = np.zeros(len(frame_ids), dtype=bool)
+    ff_phase_boundary[0] = True
+    if len(frame_ids) > 1:
+        ff_phase_boundary[1:] = np.any(_contact_state[1:] != _contact_state[:-1], axis=1)
+    if args.feasibility_first:
+        print(f"Feasibility-first: ENABLED  floor_tol={args.ff_floor_tol*100:.1f}cm "
+              f"self_tol={args.ff_self_tol*100:.1f}cm max_attempts={args.ff_max_attempts} "
+              f"restart_from={args.ff_restart_from}  phase_boundaries={int(ff_phase_boundary.sum())}"
+              f"/{len(frame_ids)}")
+
     first_src_pos = src_positions[frame_ids[0]]
     first_src_ori = orientation_mats[frame_ids[0]]
 
@@ -1808,6 +1917,9 @@ def main():
     n_floor_pen_list = []
     contact_flags_list = []
     contact_align_err_deg_list = []
+    ff_attempts_list = []
+    ff_floor_pen_cm_list = []
+    ff_self_pen_cm_list = []
 
     q = np.zeros(model.nq)
     q[3] = 1.0  # root quaternion w
@@ -2401,6 +2513,17 @@ def main():
             frame_coll_kwargs["coll_weight"] = coll_kwargs["coll_weight"] * (
                 1.0 + args.swing_coll_boost * swing_depitch_lift)
 
+        # Feasibility-first-v1 (plan.md §3.3): capture the INCOMING warm start
+        # (this frame's `q` before attempt 0 overwrites it) so a retry, if
+        # needed, regularizes toward the previous frame's KEPT pose, never
+        # toward this frame's own failed attempt (the refine_arm_floor_
+        # transitions lesson — see that function's q_ref docstring).
+        ff_q_warm_in = q.copy()
+
+        # Attempt 0: EXACTLY today's call — same arguments/values, same
+        # order — so a feasible frame (or --feasibility-first off entirely)
+        # takes this identical path; the flag only changes anything below,
+        # once attempt 0 is MEASURED infeasible.
         q = solve_frame_position_ik(
             model,
             data,
@@ -2432,6 +2555,108 @@ def main():
         if args.hard_tier or args.floor_hard_flag:
             hard_tier_floor_pen_cm.append(hard_tier_frame_diag.get("floor_pen_cm", 0.0))
             hard_tier_hold_slip_cm.append(hard_tier_frame_diag.get("hold_slip_cm", 0.0))
+
+        if args.feasibility_first:
+            pen_f0, pen_s0, viol_bodies0 = _ff_measure_frame(model, data, floor_gid, args.coll_hops)
+
+            def _ff_track_err():
+                return sum(float(np.linalg.norm(targets[r] - data.xpos[bid]))
+                           for r, bid in role_to_body_id.items())
+
+            def _ff_score(pf, ps, terr):
+                hard = max(0.0, pf - args.ff_floor_tol) + max(0.0, ps - args.ff_self_tol)
+                return (hard, pf + ps, terr)
+
+            terr0 = _ff_track_err()
+            best_score = _ff_score(pen_f0, pen_s0, terr0)
+            best_q = q.copy()
+            ff_pen_floor_final, ff_pen_self_final = pen_f0, pen_s0
+            ff_attempts_used = 0
+            # Continuity sanity cap (planLog.md T3, 2nd finding): a floating-point
+            # pen improvement almost never TIES between two different qpos
+            # solutions, so the lexicographic (hard, pen, terr) score above
+            # reaches `terr` only in that near-impossible tie -- in practice a
+            # retry that shaves a hair off pen while tracking error explodes
+            # (a nonsensical pose) still wins on the `pen` term alone, and that
+            # bad pose then warm-starts every subsequent frame, compounding into
+            # a metres-scale runaway (measured: diverges even with the weight
+            # boost removed AND noise disabled -- pure tracking relaxation was
+            # enough). Fix: a retry whose tracking error grows beyond this cap
+            # relative to attempt 0 is DISQUALIFIED outright (never considered
+            # for best_q), regardless of any pen improvement it shows.
+            _ff_terr_cap = max(terr0 * 3.0, terr0 + 0.5)
+
+            if best_score[0] > 0.0:   # attempt 0 measured infeasible -> retry
+                viol_roles = set()
+                for _bid_v in viol_bodies0:
+                    viol_roles.update(_ff_limb_roles_for_body(model, _bid_v))
+                rng_base = hash((str(args.canonical), int(ti))) % (2**32 - 10000)
+                # NO weight boost (planLog.md T3: boosting --floor-weight/coll_weight
+                # ABOVE their attempt-0 values triggers a pre-existing Stage-3 DLS
+                # instability -- verified independent of this wrapper by re-running
+                # plain Stage 3 with --floor-weight 15/20 on standup_natural_01,
+                # which diverges identically with none of this code involved. Floor/
+                # collision weight are therefore kept IDENTICAL to attempt 0 on every
+                # retry; only tracking relaxation (relax) and, at a phase boundary,
+                # a perturbed warm start are varied.
+                for a in range(1, args.ff_max_attempts + 1):
+                    relax = 0.5 ** a
+                    pws_try = dict(pos_weight_scale)
+                    for r in viol_roles:
+                        pws_try[r] = pws_try.get(r, 1.0) * relax
+                    q_init_try = ff_q_warm_in.copy()
+                    if ff_phase_boundary[ti] and a >= args.ff_restart_from:
+                        rng = np.random.default_rng((rng_base + a) % (2**32))
+                        sigma = 0.05 * (a - args.ff_restart_from + 1)
+                        q_init_try[7:] = q_init_try[7:] + rng.normal(0.0, sigma, size=29)
+                    q_try = solve_frame_position_ik(
+                        model,
+                        data,
+                        role_to_body_id,
+                        targets,
+                        q_init_try,
+                        ori_role_to_body_id=ori_role_to_body_id,
+                        ori_targets=ori_targets,
+                        ori_scale=args.ori_scale,
+                        align_constraints=align_constraints,
+                        skip_ori_body_ids=skip_ori_body_ids,
+                        ori_weight_scale=ori_weight_scale,
+                        pos_weight_scale=pws_try,
+                        hold_pos_roles=hold_pos_roles,
+                        hierarchical=(args.hierarchical or args.hard_tier),
+                        knee_bias=knee_bias,
+                        pos_site_constraints=pos_site_constraints,
+                        skip_pos_roles=skip_pos_roles,
+                        iters=args.ik_iters,
+                        **frame_coll_kwargs,
+                        **floor_kwargs,
+                        floor_weight=(args.floor_weight * float(floor_phase_w[ti]) if floor_kwargs else 0.0),
+                        floor_hard=args.floor_hard_flag,
+                        swing_clear_sites=swing_clear_sites,
+                        posture_reg=_swing_posture_reg(model.nv, leg_cont_dofs,
+                                                       args.swing_continuity_reg * swing_depitch_lift),
+                        q_ref=ff_q_warm_in,
+                        diag_out=None,
+                    )
+                    pf_try, ps_try, _ = _ff_measure_frame(model, data, floor_gid, args.coll_hops)
+                    terr_try = _ff_track_err()
+                    ff_attempts_used = a
+                    if terr_try > _ff_terr_cap:
+                        continue   # disqualified: nonsensical pose, never becomes best_q
+                    score_try = _ff_score(pf_try, ps_try, terr_try)
+                    if score_try < best_score:
+                        best_score = score_try
+                        best_q = q_try.copy()
+                        ff_pen_floor_final, ff_pen_self_final = pf_try, ps_try
+                    if best_score[0] <= 0.0:
+                        break
+                q = best_q
+                data.qpos[:] = q
+                mujoco.mj_forward(model, data)
+
+            ff_attempts_list.append(ff_attempts_used)
+            ff_floor_pen_cm_list.append(ff_pen_floor_final * 100.0)
+            ff_self_pen_cm_list.append(ff_pen_self_final * 100.0)
 
         mujoco.mj_forward(model, data)
 
@@ -2638,8 +2863,20 @@ def main():
               f"({n_floor_viol} frames > 0.1cm tol)  |  hold_slip max={hs.max():.2f}cm "
               f"({n_hold_viol} frames > 0.5cm tol)")
 
-    np.savez(
-        args.out,
+    if args.feasibility_first:
+        ff_attempts_arr = np.asarray(ff_attempts_list, dtype=np.int64)
+        ff_floor_arr = np.asarray(ff_floor_pen_cm_list, dtype=np.float64)
+        ff_self_arr = np.asarray(ff_self_pen_cm_list, dtype=np.float64)
+        n_retried = int((ff_attempts_arr > 0).sum())
+        n_still_infeasible = int(((ff_floor_arr > args.ff_floor_tol * 100.0) |
+                                  (ff_self_arr > args.ff_self_tol * 100.0)).sum())
+        print(f"Feasibility-first diagnostics: {n_retried}/{len(ff_attempts_arr)} frames retried "
+              f"(max attempts used={int(ff_attempts_arr.max()) if len(ff_attempts_arr) else 0})  |  "
+              f"floor_pen max={ff_floor_arr.max():.2f}cm  self_pen max={ff_self_arr.max():.2f}cm  |  "
+              f"{n_still_infeasible} frame(s) STILL infeasible after all attempts "
+              f"(the per-frame infeasibility certificate, see plan.md T5)")
+
+    save_kwargs = dict(
         qpos=np.asarray(qpos_list),
         fps=np.float64(fps),
         self_collision_counts=n_coll_arr,
@@ -2659,6 +2896,12 @@ def main():
         errors_json=np.asarray(json.dumps(err_list, indent=2), dtype=object),
         metadata_json=np.asarray(json.dumps(metadata, indent=2), dtype=object),
     )
+    if args.feasibility_first:
+        save_kwargs["ff_attempts"] = np.asarray(ff_attempts_list, dtype=np.int64)
+        save_kwargs["ff_floor_pen_cm"] = np.asarray(ff_floor_pen_cm_list, dtype=np.float64)
+        save_kwargs["ff_self_pen_cm"] = np.asarray(ff_self_pen_cm_list, dtype=np.float64)
+
+    np.savez(args.out, **save_kwargs)
 
     print()
     print("Wrote:", args.out)
