@@ -13,7 +13,7 @@ Our niche — hardware-ready, kinematic-centric, contact-first retargeting of fl
 
 ## Closest competitors (cite as named baselines)
 - **OmniRetarget** — interaction mesh, contact-first kinematic, loco-manipulation; no kneel/prone transitions. Open source ⇒ baseline.
-- **GMR** — clip-level target-side kinematic optimizer + BeyondMimic eval; EXPLICITLY excludes floor motions. Open source ⇒ baseline + motivation quote.
+- **GMR** — clip-level target-side kinematic optimizer + BeyondMimic eval; EXPLICITLY excludes floor motions. Open source ⇒ baseline + motivation quote. **Empirically confirmed 2026-07-14** (not just quoted): fresh upstream clone, run on its own LAFAN1 benchmark's floor-contact clips (unmodified) — 12.9-15.9cm max floor penetration affecting 39-91% of frames, vs 1.0-7.1cm/0.3-1.9% on locomotion controls. Zero velocity spikes throughout (its per-frame IK is smooth even while failing on floor contact — the floor-contact gap is orthogonal to jitter, not correlated with it). Full numbers: [[gmr-baseline-week1]].
 - **Jeong rig-unification / CoRe** — explicit target-side editing + contact-aware refinement, foot-only, upright. Closest philosophy cluster (Choi/Jeong/Kim group).
 - **SPARK / KDMR / DynaRetarget** — whole-trajectory kinodynamic (torque/GRF); killed the old "offline global-opt is novel" claim; we position as the kinematic+quasi-static alternative.
 - **IKMR / AdaMorph / diffusion retargeters** — learning-based sequence retargeting, not kinematic-centric, no floor geometry.

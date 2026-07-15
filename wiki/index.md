@@ -24,6 +24,7 @@ Math ground truth = `METHOD.md` (repo root). Current state = `SESSION_HANDOFF.md
 - [fullmesh-vs-primitive](experiments/fullmesh-vs-primitive.md) — fullmesh adoption, hard-QP infeasibility, penetration-vs-slip trade
 - [retired-approaches](experiments/retired-approaches.md) — hierarchical solve, hard equality, upright root, legacy worlddelta family
 - [continuation-v1-gate](experiments/continuation-v1-gate.md) — Stage-4 homotopy passes, gated 1/3 clips (branch `p0-grounding`), exposed a separate pre-existing SCA-oscillation issue under `--floor-collision on`
+- [gmr-baseline-week1](experiments/gmr-baseline-week1.md) — Option A kill-test on Unitree G1 (branch `gmr-baseline`): GMR out-of-box vs polished (Stage A + grounding), zero core-logic changes, clears cleanly on all 5 clips
 
 ## Results
 - [metrics](results/metrics.md) — measured numbers per clip family, honest full distribution (incl. slip outliers)
