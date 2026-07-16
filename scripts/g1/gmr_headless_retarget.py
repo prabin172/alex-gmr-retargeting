@@ -43,6 +43,10 @@ def main():
     ap.add_argument("--video_path", type=str, default=None)
     ap.add_argument("--video_width", type=int, default=640)
     ap.add_argument("--video_height", type=int, default=480)
+    ap.add_argument("--save_human_targets", type=str, default=None,
+                    help="S1-T1: also save retargeter.scaled_human_data per frame (GMR's own "
+                         "scaled-human FK targets, body_name -> (pos, quat)) to this NPZ, for "
+                         "the faithfulness guard (S1-T3).")
     args = ap.parse_args()
 
     save_dir = os.path.dirname(args.save_path)
@@ -52,6 +56,10 @@ def main():
         vdir = os.path.dirname(args.video_path)
         if vdir:
             os.makedirs(vdir, exist_ok=True)
+    if args.save_human_targets:
+        htdir = os.path.dirname(args.save_human_targets)
+        if htdir:
+            os.makedirs(htdir, exist_ok=True)
 
     lafan1_data_frames, actual_human_height = load_bvh_file(args.bvh_file, format=args.format)
 
@@ -79,9 +87,22 @@ def main():
         cam.elevation = -10
         cam.azimuth = 90
 
+    human_target_pos = None  # body_name -> list of (3,) arrays, filled frame-by-frame below
+    human_target_quat = None
+
     for smplx_data in tqdm(lafan1_data_frames, desc="Retargeting"):
         qpos = retargeter.retarget(smplx_data)
         qpos_list.append(qpos)
+        if args.save_human_targets:
+            shd = retargeter.scaled_human_data
+            if human_target_pos is None:
+                human_target_pos = {b: [] for b in shd}
+                human_target_quat = {b: [] for b in shd}
+            for b, (pos, rot) in shd.items():
+                human_target_pos[b].append(np.asarray(pos, dtype=np.float64).copy())
+                rot = np.asarray(rot, dtype=np.float64)
+                # store whatever shape GMR gives us (verified at save time below)
+                human_target_quat[b].append(rot.copy())
         if args.video_path:
             data.qpos[:] = qpos
             mujoco.mj_forward(model, data)
@@ -104,6 +125,16 @@ def main():
     with open(args.save_path, "wb") as f:
         pickle.dump(motion_data, f)
     print(f"Saved {len(qpos_list)} frames to {args.save_path}")
+
+    if args.save_human_targets:
+        save_dict = {}
+        for b in human_target_pos:
+            save_dict[f"pos__{b}"] = np.stack(human_target_pos[b], axis=0)
+            save_dict[f"rot__{b}"] = np.stack(human_target_quat[b], axis=0)
+        save_dict["body_names"] = np.array(list(human_target_pos.keys()))
+        np.savez_compressed(args.save_human_targets, **save_dict)
+        print(f"Saved human targets ({len(human_target_pos)} bodies) to "
+              f"{args.save_human_targets}")
 
     if args.video_path:
         import imageio

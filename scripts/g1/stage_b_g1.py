@@ -58,8 +58,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(REPO_ROOT / "scripts"))  # NOT repo root -- see planLogGMR.md T1
 from load_gmr_pkl import load_gmr_pkl  # noqa: E402
 from polish_gmr_pkl import save_gmr_pkl  # noqa: E402
+from post_process_ground_contactfirst import _build_mesh_cache, _geom_lowest_z  # noqa: E402
 from solve_global_trajectory_opt_contactfirst import (  # noqa: E402
-    N_ACT, _compute_anchors, _get_joint_limits, _load_model_with_floor, stage_b)
+    N_ACT, _compute_anchors, _contact_intervals, _get_joint_limits,
+    _load_model_with_floor, stage_b)
 
 G1_MODEL_DEFAULT = Path("/home/ptimilsina/projects/GMR/assets/unitree_g1/g1_mocap_29dof.xml")
 
@@ -76,6 +78,32 @@ G1_CONTACT_GEOM = {
 G1_TRACK_ROLES = ["pelvis", "left_foot", "right_foot"]
 G1_ROLE_BODY = {"pelvis": "pelvis", "left_foot": "left_ankle_roll_link",
                 "right_foot": "right_ankle_roll_link"}
+
+# W2-T4: full multi-surface role map -- extends the feet-only E4 map with the
+# support bodies human_contacts_lafan1.py (W2-T3) labels: hands, knees, elbows,
+# pelvis, torso. Body names verified by inspection (scripts/g1/stage_b_g1.py's
+# own module docstring lists the E4 feet; the rest discovered the same way,
+# planLogGMR.md W2-T4): left/right_rubber_hand (distal hand link -- the G1
+# mocap model's no-hands 29-DoF variant's hand-side support surface),
+# left/right_knee_link, left/right_elbow_link, pelvis, torso_link.
+ROLE_TO_G1_BODY = {
+    "left_foot": "left_ankle_roll_link", "right_foot": "right_ankle_roll_link",
+    "left_hand": "left_rubber_hand", "right_hand": "right_rubber_hand",
+    "left_knee": "left_knee_link", "right_knee": "right_knee_link",
+    "left_elbow": "left_elbow_link", "right_elbow": "right_elbow_link",
+    "pelvis": "pelvis", "torso": "torso_link",
+}
+
+
+def support_z(model, data, mesh_cache, body_id):
+    """Mesh-exact lowest-Z of a SINGLE body's own geoms at the current pose --
+    same orientation-aware per-geom-type logic as `_robot_lowest_z` (mesh
+    vertices where meshes exist, analytic sphere/capsule/box/cylinder
+    otherwise), restricted to one body instead of the whole robot. Used to
+    compute how far a role's CURRENT support point sits from the floor, so
+    E4b's anchors can pull it there rather than just holding it in place."""
+    return min(_geom_lowest_z(g, model, data, mesh_cache)
+               for g in range(model.ngeom) if int(model.geom_bodyid[g]) == body_id)
 
 
 def _resolve_g1_feet(model, eff_names):
@@ -138,6 +166,142 @@ def detect_g1_foot_contacts(qpos, model, data, fps, height_thresh=0.05):
     return eff_names, flags
 
 
+# ---------------------------------------------------------------------------
+# W2-T5: multi-surface Stage B, human-side zones + pull-to-floor anchors
+# ---------------------------------------------------------------------------
+
+HUMAN_CONTACTS_DEFAULT_DIR = REPO_ROOT / "outputs" / "gmr_baseline" / "human_contacts"
+
+# All 10 roles human_contacts_lafan1.py labels, 1:1 with ROLE_TO_G1_BODY's keys.
+# TRUNK_ROLES gated behind --anchor-trunk (retired hierarchical-v1 lesson,
+# wiki/experiments/retired-approaches.md: pinning trunk-adjacent bodies starved
+# tracking) -- feet/hands/knees/elbows are distal, not trunk-adjacent, on by
+# default.
+TRUNK_ROLES = {"pelvis", "torso"}
+DEFAULT_ROLES = [r for r in ROLE_TO_G1_BODY if r not in TRUNK_ROLES]
+
+
+def _load_human_zones(npz_path: Path, roles):
+    d = np.load(npz_path)
+    zones = {}
+    for r in roles:
+        key = f"zone_{r}"
+        assert key in d, f"{npz_path}: missing {key} (re-run human_contacts_lafan1.py)"
+        zones[r] = d[key].astype(bool)
+    return zones
+
+
+def _pull_to_floor(tgt, planted, resolved, qpos_warm, model, data, mesh_cache):
+    """Post-process `_compute_anchors`' output (UNCHANGED, imported) in glue code:
+    for each planted run, replace the anchor's Z with the run's own median
+    (origin_z - support_z) -- i.e. pin the body ORIGIN at the height that would
+    put its OWN support point (mesh-exact lowest point of that body's geoms) at
+    the floor (z=0), instead of holding it wherever the corrupted warm-start
+    motion happened to leave it. X,Y untouched (anchoring semantics unchanged
+    per the plan). Orientation isn't separately constrained here -- assumes a
+    planted/stationary run's orientation stays roughly constant (that's what
+    "planted" already establishes via _compute_anchors' own speed gate), so the
+    origin-to-support offset measured over the run is a stable correction."""
+    for eff, info in resolved.items():
+        bid = info["body_id"]
+        for k, j in _contact_intervals(planted[eff]):  # inclusive [k, j]
+            offsets = []
+            for t in range(k, j + 1):
+                data.qpos[:] = qpos_warm[t]
+                mujoco.mj_forward(model, data)
+                origin_z = float(data.xpos[bid][2])
+                sz = support_z(model, data, mesh_cache, bid)
+                offsets.append(origin_z - sz)
+            tgt[eff][k:j + 1, 2] = float(np.median(offsets))
+    return tgt
+
+
+def run_multisurface(args):
+    qpos, fps = load_gmr_pkl(args.in_path)
+    model, data, floor_gid, _ = _load_model_with_floor(args.model)
+    mesh_cache = _build_mesh_cache(model)
+
+    roles = list(DEFAULT_ROLES)
+    if args.anchor_trunk:
+        roles += sorted(TRUNK_ROLES)
+    print(f"Anchored roles ({len(roles)}): {roles}")
+
+    zones = _load_human_zones(args.human_contacts, roles)
+    T = qpos.shape[0]
+    flags = np.zeros((T, len(roles)), dtype=bool)
+    for i, r in enumerate(roles):
+        z = zones[r]
+        assert z.shape[0] == T, (
+            f"{r}: human zone length {z.shape[0]} != robot pkl frames {T} -- "
+            f"BVH/retarget frame-count mismatch, cannot index-align")
+        flags[:, i] = z
+
+    resolved = {}
+    for r in roles:
+        body_name = ROLE_TO_G1_BODY[r]
+        bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+        assert bid >= 0, f"G1 body {body_name!r} not found"
+        if r in ("left_foot", "right_foot"):
+            g = G1_CONTACT_GEOM[r]
+            resolved[r] = dict(body_id=bid, site_id=-1, kind="foot",
+                              axis_local=g["axis_local"], world_dir=g["world_dir"],
+                              sole_sites=[])
+        else:
+            # kind="support" (anything != "hand"/"foot"): body-origin position
+            # pin (no site needed), fist_w=0.0 below zeroes its rotation term --
+            # position-only pull-to-floor anchoring, no orientation constraint.
+            resolved[r] = dict(body_id=bid, site_id=-1, kind="support",
+                              axis_local=np.array([0.0, 0.0, 1.0]),
+                              world_dir=np.array([0.0, 0.0, 1.0]), sole_sites=[])
+
+    tgt, wgt, planted = _compute_anchors(
+        model, data, qpos, roles, flags, resolved, fps,
+        args.plant_speed, args.foot_weight, args.support_weight,
+        args.move_ratio, args.plant_min_run)
+
+    for r in roles:
+        col = flags[:, roles.index(r)]
+        n = int((~np.isnan(tgt[r][:, 0])).sum())
+        npl = int(planted[r].sum())
+        print(f"  {r:<12} zone {int(col.sum())}/{T} ({col.mean()*100:5.1f}%), "
+              f"contact {n}/{T}, planted {npl} ({npl/max(n,1)*100:.0f}% of contact)")
+
+    tgt = _pull_to_floor(tgt, planted, resolved, qpos, model, data, mesh_cache)
+
+    role_to_body = {r: mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, b)
+                    for r, b in G1_ROLE_BODY.items()}
+    target_positions = np.zeros((T, len(G1_TRACK_ROLES), 3))
+    for t in range(T):
+        data.qpos[:] = qpos[t]
+        mujoco.mj_forward(model, data)
+        for ri, role in enumerate(G1_TRACK_ROLES):
+            target_positions[t, ri] = data.xpos[role_to_body[role]]
+    target_weights = {r: 1.0 for r in G1_TRACK_ROLES}
+
+    downweight_roles = [set() for _ in range(T)]
+    for r in resolved:
+        col = flags[:, roles.index(r)]
+        for t in np.where(col)[0]:
+            downweight_roles[t].add(r)
+
+    q_lo, q_hi = _get_joint_limits(model)
+    assert qpos.shape[1] - 7 == N_ACT, f"expected {N_ACT} actuated joints, got {qpos.shape[1]-7}"
+
+    qpos_out = stage_b(
+        qpos, target_positions, G1_TRACK_ROLES, role_to_body, target_weights,
+        tgt, wgt, planted, resolved, downweight_roles,
+        model, data, q_lo, q_hi,
+        lambda_track=args.lambda_track, lambda_smooth=args.lambda_smooth, lambda_coll=0.0,
+        foot_flat_w=args.foot_flat_weight, fist_w=0.0,
+        downweight_factor=args.contact_downweight, n_outer=args.n_outer, trust=args.trust,
+        collision_penalty=1000.0, floor_z=None, floor_w=0.0,
+        floor_gid=floor_gid, count_floor=False)
+
+    args.out_path.parent.mkdir(parents=True, exist_ok=True)
+    save_gmr_pkl(args.out_path, qpos_out, fps)
+    print(f"Wrote {args.out_path} ({qpos_out.shape[0]} frames)")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -166,7 +330,35 @@ def main():
     ap.add_argument("--lambda-smooth", type=float, default=20.0, help="30Hz-scaled, per T7.")
     ap.add_argument("--n-outer", type=int, default=6, help="Pipeline default (retargetingPipeline.sh).")
     ap.add_argument("--trust", type=float, default=0.15, help="Alex CLI default.")
+    ap.add_argument("--multi-surface", action="store_true",
+                    help="W2-T5: E4b -- human-side multi-surface contact zones "
+                         "(feet/hands/knees/elbows, +pelvis/torso with --anchor-trunk) "
+                         "and pull-to-floor anchors, instead of E4's feet-only "
+                         "robot-side detection. Requires --human-contacts.")
+    ap.add_argument("--human-contacts", type=Path, default=None,
+                    help="NPZ from human_contacts_lafan1.py (W2-T3) for this clip. "
+                         f"Default dir: {HUMAN_CONTACTS_DEFAULT_DIR}")
+    ap.add_argument("--anchor-trunk", action="store_true",
+                    help="Also anchor pelvis/torso (off by default -- retired "
+                         "hierarchical-v1 found pinning trunk-adjacent bodies starves "
+                         "tracking; run once with/without and compare, per the plan).")
+    ap.add_argument("--support-weight", type=float, default=40.0,
+                    help="Anchor weight for non-foot support roles (hands/knees/"
+                         "elbows/pelvis/torso) -- same magnitude as --foot-weight by "
+                         "default, both are hard-ish position pins.")
     args = ap.parse_args()
+
+    if args.multi_surface:
+        if args.human_contacts is None:
+            args.human_contacts = HUMAN_CONTACTS_DEFAULT_DIR / f"{args.in_path.stem}.npz"
+            # in_path may be e.g. "<clip>_polished_constant" -- strip known suffixes
+            for suf in ("_polished_constant", "_polished_perframe", "_stageA", "_gmrfix"):
+                if args.in_path.stem.endswith(suf):
+                    args.human_contacts = (HUMAN_CONTACTS_DEFAULT_DIR /
+                                           f"{args.in_path.stem[:-len(suf)]}.npz")
+                    break
+        run_multisurface(args)
+        return
 
     qpos, fps = load_gmr_pkl(args.in_path)
     model, data, floor_gid, _ = _load_model_with_floor(args.model)

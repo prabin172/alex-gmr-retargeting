@@ -69,6 +69,32 @@ def ground_qpos(qpos: np.ndarray, model_path: Path, mode: str, percentile: float
         return np.load(out_npz)["qpos"]
 
 
+def gmr_heightfix(qpos: np.ndarray, model_path: Path) -> tuple[np.ndarray, float]:
+    """Replicate GMR's own paper-described (but shipped-code-disabled) height fix --
+    GMR/scripts/bvh_to_robot_dataset.py:127-138, HEIGHT_ADJUST=True/PERFRAME_ADJUST=False
+    path (their clip-global, non-per-frame default). Their method FKs every frame with a
+    torch KinematicsModel and takes `torch.min(body_pos[..., 2])` -- BODY-ORIGIN xpos,
+    NOT mesh vertices -- then subtracts that single scalar from root z (+ground_offset=0.0)
+    for the whole clip. Faithfully reproduced here with plain mujoco FK (equivalent to
+    their torch FK, mesh-blindness included -- that mesh-blindness is exactly what W2-T1's
+    floating metric is meant to expose). Does NOT touch our own grounding/Stage-A machinery.
+    """
+    import mujoco
+
+    model = mujoco.MjModel.from_xml_path(str(model_path))
+    data = mujoco.MjData(model)
+    T = qpos.shape[0]
+    global_min = np.inf
+    for t in range(T):
+        data.qpos[:] = qpos[t]
+        mujoco.mj_forward(model, data)
+        body_z = data.xpos[1:, 2]  # exclude body 0 (world)
+        global_min = min(global_min, float(body_z.min()))
+    out = qpos.copy()
+    out[:, 2] = out[:, 2] - global_min  # ground_offset = 0.0, per their code
+    return out, global_min
+
+
 def save_gmr_pkl(path: Path, qpos: np.ndarray, fps: float):
     """Inverse of load_gmr_pkl: qpos (T,36) wxyz -> pkl dict, root_rot wxyz -> xyzw."""
     root_pos = qpos[:, 0:3]
@@ -105,7 +131,15 @@ def main():
     ap.add_argument("--ground-mode", choices=["constant", "perframe"], default="constant")
     ap.add_argument("--ground-percentile", type=float, default=1.0)
     ap.add_argument("--ground-smooth-shift", type=float, default=0.0)
+    ap.add_argument("--heightfix", action="store_true",
+                    help="Replicate GMR's own paper-described height fix (W2-T1) -- a "
+                         "fair-baseline addendum, NOT part of our polish chain. Mutually "
+                         "exclusive with --stage-a/--ground in one invocation.")
     args = ap.parse_args()
+
+    if args.heightfix and (args.stage_a or args.ground):
+        ap.error("--heightfix replicates GMR's OWN fix as a separate baseline column -- "
+                 "run it alone, not combined with --stage-a/--ground in one invocation.")
 
     qpos, fps = load_gmr_pkl(args.in_path)
 
@@ -136,10 +170,15 @@ def main():
         qpos = ground_qpos(qpos, args.model, args.ground_mode, args.ground_percentile,
                            args.ground_smooth_shift)
 
+    if args.heightfix:
+        qpos, global_min = gmr_heightfix(qpos, args.model)
+        print(f"heightfix: clip-global min body-origin z = {global_min:.4f} m, subtracted")
+
     args.out_path.parent.mkdir(parents=True, exist_ok=True)
     save_gmr_pkl(args.out_path, qpos, fps)
     tag = "+".join(t for t, on in
-                   [("stageA", args.stage_a), ("ground", args.ground)] if on) or "identity"
+                   [("stageA", args.stage_a), ("ground", args.ground),
+                    ("gmrfix", args.heightfix)] if on) or "identity"
     print(f"Wrote {args.out_path} ({tag}, {qpos.shape[0]} frames)")
 
 
