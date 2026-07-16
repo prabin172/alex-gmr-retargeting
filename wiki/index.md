@@ -25,8 +25,6 @@ Math ground truth = `METHOD.md` (repo root). Current state = `SESSION_HANDOFF.md
 - [retired-approaches](experiments/retired-approaches.md) — hierarchical solve, hard equality, upright root, legacy worlddelta family
 - [continuation-v1-gate](experiments/continuation-v1-gate.md) — Stage-4 homotopy passes, gated 1/3 clips (branch `p0-grounding`), exposed a separate pre-existing SCA-oscillation issue under `--floor-collision on`
 - [gmr-baseline-week1](experiments/gmr-baseline-week1.md) — Option A kill-test on Unitree G1 (branch `gmr-baseline`): GMR out-of-box vs polished (Stage A + grounding), zero core-logic changes, clears cleanly on all 5 clips
-- [gmr-baseline-week2](experiments/gmr-baseline-week2.md) — fair-baseline addendum (GMR's own height fix), E4b multi-surface pull-to-floor anchoring (CHECKPOINT, negative), self-collision vetting (passed), contact-aware grounding (negative, `constant` mode stays shipped)
-- [gmr-baseline-sprint-s1](experiments/gmr-baseline-sprint-s1.md) — full 77-clip kinematic sweep (2×2's top row), DONE; corrected class split (34 floor/43 locomotion) via multi-surface contact detection, not hip-height alone
 
 ## Results
 - [metrics](results/metrics.md) — measured numbers per clip family, honest full distribution (incl. slip outliers)
