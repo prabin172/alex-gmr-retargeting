@@ -104,20 +104,23 @@ def main():
                              geom_ids, sole_sids, q_lo, q_hi, mj_joint_names,
                              args.limit_tol_deg))
 
-    hdr = ["name", "T", "fps", "floorPen", "pen%", "coll%", "collPk", "JLvi", "worst_joint",
-           "vMax", "vP95", "spikes", "rootV", "plPen", "plFloat", "plSlip"]
+    hdr = ["name", "T", "fps", "floorPen", "pen%", "floatMax", "float%", "coll%", "collPk",
+           "JLvi", "worst_joint", "vMax", "vP95", "spikes", "rootV", "plPen", "plFloat", "plSlip"]
     print()
-    print(f"{hdr[0]:<26}{hdr[1]:>6}{hdr[2]:>5}{hdr[3]:>9}{hdr[4]:>7}{hdr[5]:>7}{hdr[6]:>7}"
-          f"{hdr[7]:>5}{hdr[8]:>18}{hdr[9]:>7}{hdr[10]:>7}{hdr[11]:>7}{hdr[12]:>7}"
-          f"{hdr[13]:>7}{hdr[14]:>8}{hdr[15]:>7}")
+    print(f"{hdr[0]:<26}{hdr[1]:>6}{hdr[2]:>5}{hdr[3]:>9}{hdr[4]:>7}{hdr[5]:>9}{hdr[6]:>7}"
+          f"{hdr[7]:>7}{hdr[8]:>7}{hdr[9]:>5}{hdr[10]:>18}{hdr[11]:>7}{hdr[12]:>7}{hdr[13]:>7}"
+          f"{hdr[14]:>7}{hdr[15]:>7}{hdr[16]:>8}{hdr[17]:>7}")
     for r in rows:
         print(f"{r['name']:<26}{r['T']:>6}{r['fps']:>5.0f}{r['floor_pen_max_cm']:>8.1f}c"
-              f"{r['floor_pen_pct']:>6.1f}%{r['coll_pct']:>6.1f}%{r['coll_peak_cm']:>6.1f}c"
+              f"{r['floor_pen_pct']:>6.1f}%{r['float_max_cm']:>8.1f}c{r['float_pct']:>6.1f}%"
+              f"{r['coll_pct']:>6.1f}%{r['coll_peak_cm']:>6.1f}c"
               f"{r['jl_viol']:>5}{r['worst_joint']:>18}{r['vel_max_rad_s']:>7.1f}"
               f"{r['vel_p95_rad_s']:>7.1f}{r['n_spikes']:>7}{r['root_v_max']:>7.2f}"
               f"{r['plant_pen_max_cm']:>6.1f}c{r['plant_float_med_cm']:>7.1f}c"
               f"{r['plant_slip_max_cm']:>6.1f}c")
     print("\nfloorPen = mesh-exact whole-body max below z=0 (cm); pen% = frames >0.5cm."
+          "\nfloatMax/float% = whole-body LOWEST point's max height above z=0 / frames >0.5cm above"
+          " -- no floor contact at all (W2-T1, GMR-baseline.md SS7.2 item 1)."
           "\ncoll% / collPk = self-collision incidence / peak depth (fullmesh)."
           + ("" if has_contacts else
              "  [G1: model's self-collision pairs not vetted this week -- treat as informational, not a hard number.]")

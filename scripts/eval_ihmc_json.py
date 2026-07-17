@@ -106,6 +106,7 @@ def evaluate(name, qpos, fps, contacts, model, data, mesh_cache, geom_ids,
             sole_z[f][t] = pts[:, 2].min()
             sole_xy[f][t] = pts[:, :2].mean(axis=0)
     pen = np.maximum(0.0, -lowest)
+    floating = np.maximum(0.0, lowest)  # whole-body lowest point ABOVE z=0 -- no floor contact at all
 
     # --- self-collision (plain model has no floor geom; worldbody excluded by bodyid==0)
     cs = _collision_stats(model, data, qpos, floor_gid=None, count_floor=False)
@@ -142,6 +143,8 @@ def evaluate(name, qpos, fps, contacts, model, data, mesh_cache, geom_ids,
         "name": name, "T": T, "fps": fps,
         "floor_pen_max_cm": pen.max() * 100,
         "floor_pen_pct": (pen > 0.005).mean() * 100,
+        "float_max_cm": floating.max() * 100,
+        "float_pct": (floating > 0.005).mean() * 100,
         "lowest_z_med_cm": float(np.median(lowest)) * 100,
         "coll_pct": cs["pct"], "coll_peak_cm": cs["max_pen_cm"],
         "jl_viol": hard_viol,
