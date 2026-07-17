@@ -25,6 +25,9 @@ Math ground truth = `METHOD.md` (repo root). Current state = `SESSION_HANDOFF.md
 - [retired-approaches](experiments/retired-approaches.md) — hierarchical solve, hard equality, upright root, legacy worlddelta family
 - [continuation-v1-gate](experiments/continuation-v1-gate.md) — Stage-4 homotopy passes, gated 1/3 clips (branch `p0-grounding`), exposed a separate pre-existing SCA-oscillation issue under `--floor-collision on`
 - [gmr-baseline-week1](experiments/gmr-baseline-week1.md) — Option A kill-test on Unitree G1 (branch `gmr-baseline`): GMR out-of-box vs polished (Stage A + grounding), zero core-logic changes, clears cleanly on all 5 clips
+- [gmr-baseline-week2](experiments/gmr-baseline-week2.md) — fair-baseline addendum (GMR's own height fix), E4b multi-surface pull-to-floor anchoring (CHECKPOINT, negative), self-collision vetting (passed), contact-aware grounding (negative, `constant` mode stays shipped)
+- [gmr-baseline-sprint-s1](experiments/gmr-baseline-sprint-s1.md) — full 77-clip kinematic sweep (2×2's top row), DONE; corrected class split (34 floor/43 locomotion) via multi-surface contact detection, not hip-height alone
+- [gmr-baseline-sprint-s2](experiments/gmr-baseline-sprint-s2.md) — OURS contact-first solver ported to G1 (2×2's bottom row). 77-clip corpus (S3) held-frame win **INVALIDATED by the z-shift oracle kill-test**: a per-clip constant downward shift of GMR-polished beats OURS on held-frame frac3 AND max floorPen (GMR's held float is near-constant within a clip). Honest bar = simultaneous contact + no-pen, which nothing currently meets; OURS's own pen% is 62-81% at raw solve (reach limit + warm-start-basin, `knee_bias` fix exists, mixed result, not shipped).
 
 ## Results
 - [metrics](results/metrics.md) — measured numbers per clip family, honest full distribution (incl. slip outliers)
