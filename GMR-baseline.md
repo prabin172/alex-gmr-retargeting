@@ -1,3 +1,16 @@
+> **UPDATE (2026-07-17)**: §7.5's E7 ("OURS on G1, through and through") is superseded.
+> Sprint S3 found E7's held-frame win was gameable by a constant Z-shift on
+> `gmr_polished` (the un-gameable joint metric — held contact AND whole-body pen,
+> simultaneously — is what matters, and nothing passed it). Sprint S4 tried to fix
+> OURS-DLS's floor penetration directly; didn't clear the gate. Sprint S5 pivoted:
+> GMR's own `mink`-based tracking (found, on inspection, to be architecturally why GMR
+> looks smooth and OURS-DLS didn't — real QP joint limits, orientation-first weighting)
+> is now the base, with a minimal contact layer on top (`gmr_contact_retarget.py`) —
+> this is closer to this section's own "Fallback-A hybrid" idea than to E7 as executed.
+> Full trail: `planLogGMR.md ## S3/S4/S5-*`, plan: `GMR-S5-plan.md`, results:
+> `GMR-baseline-results.md`'s "Sprint S5" section. The 2x2 framing in §7.4 still holds
+> structurally; the OURS row's actual mechanism has changed.
+
 # GMR-baseline — de-Alexing the paper (2026-07-15)
 
 **Why this doc:** Prabin's worry, verbatim in spirit: *"this IHMC-specific work is very one-robot

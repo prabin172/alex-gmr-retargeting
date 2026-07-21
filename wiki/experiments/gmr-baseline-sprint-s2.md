@@ -198,7 +198,7 @@ penetration mechanism is fixed** — which was already the top open item (knee_b
 local over-reach correction). The kill-test also defines the bar any future claim must clear:
 beat the per-clip-oracle-shifted baseline, not vanilla GMR.
 
-## Open
+## Open (superseded — see below)
 
 - fallAndGetUp1's knee_bias regression — not root-caused, needed before a ship decision.
 - Held-classifier false positive (a few isolated frames classified "held" despite large error) —
@@ -206,3 +206,12 @@ beat the per-clip-oracle-shifted baseline, not vanilla GMR.
 - Local/adaptive over-reach correction (for the genuinely-unreachable-pose remainder) — untried.
 - Whether to re-run the S3 corpus eval with `knee_bias` ON once the fallAndGetUp1 regression is
   root-caused, to see if the aggregate floorPen gap narrows at corpus scale too.
+
+## SUPERSEDED (2026-07-17): the "Open" items above were never actioned under this framing
+
+Sprint S4 tried to fix OURS-DLS's penetration directly (the natural next step from this
+page's own "Open" list) — root-caused the warm-start-basin mechanism further, shipped a
+tuned `--swing-clear` mechanism, still didn't clear the joint-metric gate. After
+visually comparing GMR's own output against OURS-DLS, Prabin pivoted (S5): GMR's own
+tracking is the base now, OURS-DLS retired to an ablation role. See
+[gmr-baseline-sprint-s4-s5](gmr-baseline-sprint-s4-s5.md).

@@ -70,11 +70,62 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))  # NOT repo root -- see planLogGM
 from contact_labels import debounce_flags, ramp_envelope  # noqa: E402
 from g1_model_setup import load_g1_model_with_vetted_collision_and_floor  # noqa: E402
 from post_process_ground_contactfirst import _build_mesh_cache, _geom_lowest_z  # noqa: E402
+import solve_fbx_canonical_alex_contactfirst as alex_solver  # noqa: E402
 from solve_fbx_canonical_alex_contactfirst import (  # noqa: E402
     body_xmat, cap_foot_pitch, clamp_hinge_joint_limits,
     estimate_source_scale, load_canonical, make_initial_alignment_targets,
     make_orientation_targets_for_frame, make_targets_for_frame,
     measure_alex_pelvis_to_head, solve_frame_position_ik, _swing_posture_reg)
+
+# S5-B2: orientation-first reweighting preset, opt-in via --gmr-style-weights.
+# `solve_frame_position_ik` (in alex_solver, SHARED with the Alex pipeline) reads
+# TARGET_WEIGHTS/ORI_WEIGHTS as module globals at call time, not as parameters -- so
+# this driver mutates `alex_solver`'s own dict IN PLACE when the flag is passed
+# (never touches the file on disk, never affects a separate Alex process; each solve
+# here runs as its own process). Starting point per GMR-S5-plan.md B2: orientation up
+# (pelvis/torso/feet/hands), distal POSITION down toward ~0 (GMR position-weights
+# knee/elbow/hip/shoulder at 0 in both its IK tables -- orientation carries those
+# joints entirely), pelvis position kept high (GMR table2 pos=100) and ankle kept
+# near current (GMR position-weights feet 50 in both tables -- the one body class
+# GMR always position-anchors). Does NOT add new orientation roles (thigh/shank/
+# upper-arm/forearm) -- that's B2b, GMR-S5-plan.md's larger, skippable follow-up;
+# this preset only rebalances the 15 position / 7 orientation roles we already track.
+GMR_STYLE_TARGET_WEIGHTS = {
+    "pelvis": 4.0, "torso": 0.3, "head": 0.3,
+    "left_hip": 0.2, "right_hip": 0.2,
+    "left_shoulder": 0.3, "right_shoulder": 0.3,
+    "left_knee": 0.2, "right_knee": 0.2,
+    "left_ankle": 1.0, "right_ankle": 1.0,
+    "left_elbow": 0.2, "right_elbow": 0.2,
+    "left_wrist": 0.3, "right_wrist": 0.3,
+}
+GMR_STYLE_ORI_WEIGHTS = {
+    "pelvis": 3.0, "torso": 3.0, "head": 1.0,
+    "left_foot": 2.0, "right_foot": 2.0,
+    "left_hand": 2.0, "right_hand": 2.0,
+}
+# S5-B2 attempt 2 (softer): attempt 1's aggressive knee/elbow position cut (0.2)
+# removed the ONLY signal constraining the knee bend-plane (we have no thigh/shank
+# orientation role -- that's B2b, not done) without replacing it, so redundancy went
+# UP not down: floorPen worsened 18.07->22.95cm, coll_peak_cm nearly tripled to
+# 5.88cm, knee flexion got WORSE not better (mean 60.7/59.9 -> 64.3/65.1 deg). This
+# preset keeps knee/elbow/hip/shoulder position weight much closer to the original
+# (only a mild cut, not a near-zero one) while still raising orientation on the
+# roles we DO have -- tests whether a gentler shift helps without B2b's new roles.
+GMR_STYLE_TARGET_WEIGHTS_V2 = {
+    "pelvis": 4.0, "torso": 1.2, "head": 1.2,
+    "left_hip": 0.6, "right_hip": 0.6,
+    "left_shoulder": 0.6, "right_shoulder": 0.6,
+    "left_knee": 0.7, "right_knee": 0.7,
+    "left_ankle": 1.5, "right_ankle": 1.5,
+    "left_elbow": 0.7, "right_elbow": 0.7,
+    "left_wrist": 1.0, "right_wrist": 1.0,
+}
+GMR_STYLE_ORI_WEIGHTS_V2 = {
+    "pelvis": 1.5, "torso": 1.5, "head": 0.6,
+    "left_foot": 1.2, "right_foot": 1.2,
+    "left_hand": 1.2, "right_hand": 1.2,
+}
 from stage_b_g1 import support_z  # noqa: E402
 
 # GMR's OWN per-body-GROUP scale factors (planLogGMR.md S2-T6, Prabin's request
@@ -550,7 +601,42 @@ def main():
                          "back to near-baseline (78.8/81.5 vs baseline 78.6/81.5, cr=0.2 gets "
                          "92.2/95.4) -- the leg branch-flips instead of tracking cleanly. Was 0.9 "
                          "(Alex's shipped value, unvalidated for G1) before this tuning pass.")
+    ap.add_argument("--active-set-limits", action="store_true",
+                    help="S5-B3: zero a limited joint's dq component BEFORE integrating "
+                         "when it's already at that limit and the step would push further "
+                         "past it, instead of relying solely on the post-hoc "
+                         "clamp_hinge_joint_limits call after integration. Targets the "
+                         "documented warm-start knee-limit basin (S2-T9-T12, S5-B0.2) at "
+                         "its source. Opt-in, default off.")
+    ap.add_argument("--early-exit-tol", type=float, default=None,
+                    help="S5-B3: stop the per-frame IK iteration loop once task-error "
+                         "improvement between iterations drops below this (GMR's own "
+                         "convergence criterion, motion_retarget.py). None (default) = "
+                         "always run the full --ik-iters budget, unchanged behavior. Try "
+                         "1e-3 to match GMR's own value.")
+    ap.add_argument("--gmr-style-weights", type=int, default=0, choices=[0, 1, 2],
+                    help="S5-B2: overwrite TARGET_WEIGHTS/ORI_WEIGHTS (in the shared "
+                         "alex_solver module, opt-in, this process only -- see the "
+                         "GMR_STYLE_* dicts above this file's main()) with an "
+                         "orientation-first preset modeled on GMR's own ik_match_table "
+                         "weighting philosophy. 0=off (default). 1=first attempt "
+                         "(aggressive distal position cut) -- WORSE on every metric "
+                         "(floorPen 18.07->22.95cm, coll_peak 1.86->5.88cm, knee mean "
+                         "60.7/59.9->64.3/65.1deg) because it removes the knee/elbow "
+                         "position anchor with no orientation role to replace it "
+                         "(that's B2b, not implemented). 2=softer preset, milder cut. "
+                         "Diagnostic/ablation flag for the S5-B phase (GMR-S5-plan.md).")
     args = ap.parse_args()
+
+    if args.gmr_style_weights:
+        tw = GMR_STYLE_TARGET_WEIGHTS if args.gmr_style_weights == 1 else GMR_STYLE_TARGET_WEIGHTS_V2
+        ow = GMR_STYLE_ORI_WEIGHTS if args.gmr_style_weights == 1 else GMR_STYLE_ORI_WEIGHTS_V2
+        alex_solver.TARGET_WEIGHTS.clear()
+        alex_solver.TARGET_WEIGHTS.update(tw)
+        alex_solver.ORI_WEIGHTS.clear()
+        alex_solver.ORI_WEIGHTS.update(ow)
+        print(f"[gmr-style-weights={args.gmr_style_weights}] TARGET_WEIGHTS/ORI_WEIGHTS "
+              "overwritten with the S5-B2 preset (this process only).")
 
     (roles, role_to_idx, src_positions, fps, orientation_roles, ori_to_idx, orientation_mats,
      persisted_contacts, persisted_eff_names) = load_canonical(args.canonical)
@@ -850,6 +936,7 @@ def main():
             ori_role_to_body_id=ori_role_to_body_id, ori_targets=ori_targets, ori_scale=1.0,
             hold_pos_roles=hold_pos_roles, knee_bias=frame_knee_bias,
             iters=args.ik_iters, floor_weight=args.floor_weight, posture_reg=frame_posture_reg,
+            active_set_limits=args.active_set_limits, early_exit_tol=args.early_exit_tol,
             **coll_kwargs)
         clamp_hinge_joint_limits(model, q)  # mutates q in-place, no return value
         mujoco.mj_forward(model, data)

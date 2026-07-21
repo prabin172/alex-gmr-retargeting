@@ -857,7 +857,40 @@ def solve_frame_position_ik(
     floor_hard=False,
     swing_clear_sites=None,
     diag_out=None,
+    active_set_limits=False,
+    early_exit_tol=None,
 ):
+    """`active_set_limits` (S5-B3, opt-in, default False = unchanged behavior): when a
+    limited hinge/slide joint is AT its limit and the computed step `dq` would push it
+    further past that limit, zero that DOF's component of `dq` BEFORE integrating,
+    instead of relying solely on `clamp_hinge_joint_limits` AFTER integration.
+    **Found (S5-B3, walk1_subject1) to be a NUMERICAL NO-OP vs the baseline**
+    (byte-identical whole_clip_metrics/knee stats to `active_set_limits=False`), despite
+    triggering thousands of times per clip (confirmed by direct instrumentation, not
+    just inferred). Root cause: `clamp_hinge_joint_limits` already runs EVERY iteration
+    (not just once at the end), so a limited DOF snaps to the exact same boundary value
+    every iteration whether its `dq` component is zeroed first or left to overshoot and
+    get clamped back -- and since `dq` is a single linear solve (not sequential),
+    zeroing one component post-hoc doesn't let the OTHER DOFs' values redistribute to
+    compensate (their columns were already solved independently). A real fix would
+    need to remove the limited DOF's column from `A` and re-solve (true reduced-QP),
+    not just mask `dq` after the fact -- out of scope for this pass, left here
+    documented+working but not a mechanism that does anything as currently written.
+
+    `early_exit_tol` (S5-B3, opt-in, default None = unchanged behavior: always run the
+    full `iters` budget): GMR's own convergence criterion (`motion_retarget.py`), stop
+    iterating once the task-error improvement between iterations drops below this
+    tolerance, instead of always burning the full budget regardless of convergence.
+    **Found (S5-B3, walk1_subject1, tol=1e-3 = GMR's own value) to be a real speed win
+    (75s -> 21s per clip) but a real QUALITY REGRESSION**: pen_pct 70.9->82.3%,
+    coll_pct 3.19->7.73%, coll_peak_cm 1.86->3.36cm (floorPen improved 18.07->16.60cm,
+    the one metric that got better). Our TARGET_WEIGHTS/ORI_WEIGHTS are O(0.2-4), far
+    smaller than GMR's own O(5-100) -- GMR's tolerance is calibrated to ITS weight
+    scale, and 1e-3 is comparatively loose in ours, so the solve exits before
+    self-collision/floor terms (both in rows2, competing for the same iteration budget)
+    have actually converged. A correctly-scaled tolerance for THIS solver would need
+    its own calibration pass, not a direct port of GMR's number -- not attempted this
+    pass (time-box)."""
     """`floor_hard` (hierarchical-v1 H2): route floor_collision_rows into the
     level-1 (hard) tier instead of level-2 (soft) -- only meaningful when
     `hierarchical=True` (rows1 is otherwise concatenated with rows2 into a
@@ -895,6 +928,19 @@ def solve_frame_position_ik(
 
     hold = hold_pos_roles or set()
 
+    limit_dof_pairs = []
+    if active_set_limits:
+        for j in range(model.njnt):
+            if not bool(model.jnt_limited[j]):
+                continue
+            if int(model.jnt_type[j]) == mujoco.mjtJoint.mjJNT_FREE:
+                continue
+            qadr = int(model.jnt_qposadr[j])
+            dadr = int(model.jnt_dofadr[j])
+            lo, hi = model.jnt_range[j]
+            limit_dof_pairs.append((qadr, dadr, float(lo), float(hi)))
+
+    prev_task_err = None
     for _ in range(iters):
         rows1 = []; rhs1 = []   # level 1: contact tasks (high priority)
         rows2 = []; rhs2 = []   # level 2: body tracking + regularisers
@@ -1081,6 +1127,13 @@ def solve_frame_position_ik(
                 rows2.append(sqw * jacp[2:3, :])
                 rhs2.append(np.array([sqw * (_clear_z - cur_z)]))
 
+        if early_exit_tol is not None:
+            cur_task_err = float(np.sqrt(sum(float(np.sum(r ** 2)) for r in rhs1)
+                                         + sum(float(np.sum(r ** 2)) for r in rhs2)))
+            if prev_task_err is not None and (prev_task_err - cur_task_err) < early_exit_tol:
+                break
+            prev_task_err = cur_task_err
+
         I_nv = np.eye(nv)
 
         def _dsolve(H, g):
@@ -1113,6 +1166,15 @@ def solve_frame_position_ik(
             dq = dq * (max_step_norm / n)
 
         dq *= step_scale
+
+        if limit_dof_pairs:
+            eps = 1e-6
+            for qadr, dadr, lo, hi in limit_dof_pairs:
+                cur = float(data.qpos[qadr])
+                if cur <= lo + eps and dq[dadr] < 0.0:
+                    dq[dadr] = 0.0
+                elif cur >= hi - eps and dq[dadr] > 0.0:
+                    dq[dadr] = 0.0
 
         mujoco.mj_integratePos(model, data.qpos, dq, 1.0)
 

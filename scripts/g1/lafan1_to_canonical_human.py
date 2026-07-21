@@ -36,10 +36,23 @@ Orientation frames (7 roles: pelvis/torso/head/left_foot/right_foot/left_hand/
 right_hand): reuses `frame_from_yz`/`frame_from_xy`/`detect_facing_yaw_deg`/
 `apply_yaw_to_positions` UNCHANGED from `build_canonical_orientation_frames_fresh.py`
 (pure geometry functions, no Alex globals) for pelvis/torso/head/feet exactly as Stage 2
-does. Hands: LAFAN1 has no thumb bone, so `build_canonical_orientation_frames_fresh.py`'s
-own hard `required` check (which needs *_hand_thumb) can't be satisfied -- KNOWN
-SIMPLIFICATION: hand secondary axis substituted with pelvis-lateral (the SAME fallback
-feet already use structurally), not thumb-wrist. Logged explicitly, not synthesized data.
+does.
+
+Hands (S5-B1 fix, planLogGMR.md ## S5-B0.1/B1): ORIGINALLY used `frame_from_xy(wrist -
+elbow, pelvis_y)` -- primary axis (forearm direction) was real motion, but the secondary
+axis (pelvis_y, a near-rigid reference) fixed the frame's ROLL about that axis to a
+geometric artifact, structurally unable to represent forearm twist/pronation-supination.
+Diagnostic (`## S5-B0.1`) confirmed this against GMR's own hand target: residual after
+removing the best single clip-constant offset was 43.5/49.9 deg mean (91.9/76.0 p90) --
+not a fixed-frame-convention mismatch, a genuinely missing DOF. FIX: use the RAW BVH bone
+orientation directly (`load_bvh_file`'s own `f["LeftHand"][1]` / `f["RightHand"][1]`,
+already world-frame wxyz FK'd quaternions -- the exact same signal GMR's own IK targets
+`LeftHand`/`RightHand` with, per `bvh_lafan1_to_g1.json`). LAFAN1 is a single clean mocap
+rig (not a vendor-varying FBX bind-pose rig), so CLAUDE.md's "semantic frames, not raw
+FBX rotations" rule (written for the Alex/FBX pipeline's vendor bind-pose problem) does
+not apply here -- GMR's own SOTA pipeline already validates raw BVH bone rotation as
+reliable for this exact task. Feet/pelvis/torso/head UNCHANGED (still landmark-derived
+semantic frames -- this fix is hands-only, where the missing-twist problem lives).
 
 Usage:
     conda run -n gmr python scripts/g1/lafan1_to_canonical_human.py \\
@@ -57,8 +70,10 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))  # NOT repo root -- see planLogGMR.md T1
+from scipy.spatial.transform import Rotation as _Rot  # noqa: E402
+
 from build_canonical_orientation_frames_fresh import (  # noqa: E402
-    apply_yaw_to_positions, detect_facing_yaw_deg, frame_from_xy, frame_from_yz)
+    apply_yaw_to_positions, detect_facing_yaw_deg, frame_from_xy, frame_from_yz, yaw_matrix)
 from general_motion_retargeting.utils.lafan1 import load_bvh_file  # noqa: E402
 
 ORIENTATION_ROLES = ["pelvis", "torso", "head", "left_foot", "right_foot",
@@ -82,13 +97,26 @@ def build_canonical(bvh_path: Path, motion_fps: float = 30.0) -> dict:
     roles = list(ROLE_TO_LAFAN1_BONE.keys())
     role_to_idx = {r: i for i, r in enumerate(roles)}
     positions = np.zeros((T, len(roles), 3), dtype=np.float64)
+    hand_quat_wxyz = {"left_hand": np.zeros((T, 4)), "right_hand": np.zeros((T, 4))}
     for t, f in enumerate(frames):
         for r, bone in ROLE_TO_LAFAN1_BONE.items():
             positions[t, role_to_idx[r]] = f[bone][0]
+        hand_quat_wxyz["left_hand"][t] = f["LeftHand"][1]
+        hand_quat_wxyz["right_hand"][t] = f["RightHand"][1]
+
+    # S5-B1: raw BVH hand rotation (world-frame FK quat, wxyz -- see load_bvh_file) as
+    # the source of hand orientation (see the module docstring for why). Convert to
+    # matrices BEFORE the yaw correction below, then rotate them the same way positions
+    # are rotated (world-frame Z rotation -> left-multiply the frame matrix).
+    hand_mats_raw = {r: _Rot.from_quat(q[:, [1, 2, 3, 0]]).as_matrix()  # wxyz -> xyzw
+                     for r, q in hand_quat_wxyz.items()}
 
     yaw_deg = detect_facing_yaw_deg(positions, role_to_idx)
     if yaw_deg != 0.0:
         positions = apply_yaw_to_positions(positions, role_to_idx, yaw_deg)
+        yawR = yaw_matrix(yaw_deg)
+        for r in hand_mats_raw:
+            hand_mats_raw[r] = np.einsum("ij,tjk->tik", yawR, hand_mats_raw[r])
 
     mats = np.zeros((T, len(ORIENTATION_ROLES), 3, 3), dtype=np.float64)
     for t in range(T):
@@ -109,23 +137,14 @@ def build_canonical(bvh_path: Path, motion_fps: float = 30.0) -> dict:
         mats[t, ORIENTATION_ROLES.index("right_foot")] = frame_from_xy(
             p["right_toe"] - p["right_ankle"], pelvis_y)
 
-        # Hands: BUG FOUND + FIXED (found investigating G1 Stage-3's shoulder-roll
-        # pinning, planLogGMR.md S2-T3) -- left/right_hand_middle == left/right_wrist
-        # (same LAFAN1 bone, per this file's own documented simplification above),
-        # so `hand_middle - wrist` is EXACTLY ZERO every frame (confirmed:
-        # max|hand-wrist| over a whole clip = 0.0), which sends frame_from_xy's
-        # x_hint degenerate -> its fallback silently defaults the hand's PRIMARY
-        # axis to world +X, ALWAYS, completely ignoring real arm motion. That
-        # constant-primary-axis frame then gets world-delta-transferred onto G1
-        # every frame, forcing the shoulder to roll to chase a signal that's
-        # actually just riding pelvis_y (the only thing that was still varying).
-        # Fix: forearm direction (wrist-elbow, the bone LAFAN1 actually has) as
-        # the primary axis -- a real, non-degenerate, motion-following signal,
-        # not a synthesized marker.
-        mats[t, ORIENTATION_ROLES.index("left_hand")] = frame_from_xy(
-            p["left_wrist"] - p["left_elbow"], pelvis_y)
-        mats[t, ORIENTATION_ROLES.index("right_hand")] = frame_from_xy(
-            p["right_wrist"] - p["right_elbow"], pelvis_y)
+        # Hands: raw BVH bone rotation (S5-B1 fix, see module docstring + planLogGMR.md
+        # ## S5-B0.1/B1) -- NOT frame_from_xy anymore. The earlier forearm-direction /
+        # pelvis_y construction (S2-T3/T4 fix) solved a degenerate-primary-axis bug but
+        # still couldn't represent forearm twist (pelvis_y as secondary axis pins roll
+        # to a geometric artifact, not real wrist rotation). hand_mats_raw was computed
+        # + yaw-corrected before this loop; just place it here.
+        mats[t, ORIENTATION_ROLES.index("left_hand")] = hand_mats_raw["left_hand"][t]
+        mats[t, ORIENTATION_ROLES.index("right_hand")] = hand_mats_raw["right_hand"][t]
 
     meta = {
         "format": "canonical_human_lafan1_v1",
@@ -137,7 +156,8 @@ def build_canonical(bvh_path: Path, motion_fps: float = 30.0) -> dict:
         "known_simplifications": [
             "left/right_hand_middle == left/right_wrist (same LAFAN1 bone, no hand-centroid marker)",
             "left/right_toe_end, left/right_hand_thumb omitted (not load-bearing in Stage 3)",
-            "hand orientation secondary axis = pelvis_y, not thumb-wrist (no thumb bone in LAFAN1)",
+            "hand orientation = raw BVH bone rotation (S5-B1), NOT a landmark-derived "
+            "semantic frame like every other role -- deliberate, see module docstring",
         ],
     }
 

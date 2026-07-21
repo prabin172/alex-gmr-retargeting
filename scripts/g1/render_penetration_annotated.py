@@ -44,7 +44,8 @@ def _font(size):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--qpos", type=Path, required=True, help="npz with a 'qpos' array")
+    ap.add_argument("--qpos", type=Path, help="npz with a 'qpos' array")
+    ap.add_argument("--pkl", type=Path, help="GMR pkl (alternative to --qpos)")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--fps", type=float, default=None, help="default: npz's own 'fps' or 30")
     ap.add_argument("--start", type=int, default=0)
@@ -57,10 +58,16 @@ def main():
     ap.add_argument("--pen-threshold-cm", type=float, default=0.5,
                     help="Flash red when penetration exceeds this (cm).")
     args = ap.parse_args()
+    assert (args.qpos is None) != (args.pkl is None), "pass exactly one of --qpos / --pkl"
 
-    z = np.load(args.qpos, allow_pickle=True)
-    qpos = z["qpos"]
-    fps = args.fps if args.fps is not None else float(z["fps"]) if "fps" in z else 30.0
+    if args.pkl is not None:
+        from load_gmr_pkl import load_gmr_pkl
+        qpos, fps = load_gmr_pkl(args.pkl)
+        fps = args.fps if args.fps is not None else fps
+    else:
+        z = np.load(args.qpos, allow_pickle=True)
+        qpos = z["qpos"]
+        fps = args.fps if args.fps is not None else float(z["fps"]) if "fps" in z else 30.0
 
     start = args.start
     end = qpos.shape[0] if args.frames is None else min(qpos.shape[0], start + args.frames)

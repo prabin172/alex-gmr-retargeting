@@ -2606,3 +2606,2496 @@ not a finished result, but the strongest, most uniform, least risky one found th
 Not yet: extended to the full 43-clip locomotion set, or combined with `--floor-leg-refine` for
 the fall/get-up class (S4-T3's own tuning levers -- pen_tol/ramp/root_pos_relief -- are still
 untouched; same kind of gain may be available there too, not tested this pass).
+
+## S5-D0 | Pivot decision: GMR's mink tracking as base, contact layer on top (S4-T5/T6 dropped)
+
+**Trigger**: Prabin compared the three annotated renders (repo root:
+`walk1_subject1_{raw,swingclear_tuned,gmr_heightfix}_annotated.mp4`). Verdict: GMR's own
+output (heightfix, zero smoothing from us) is visually excellent — no flicker, no snapping,
+natural hand orientation (15.9% frames pen>0.5cm, max 1.66cm). OURS flickers/snaps, palm
+rotated into the thigh, deep penetration even tuned (56.6% pen, max 8.76cm).
+
+**Root-cause reading of GMR's actual method** (`motion_retarget.py`, `bvh_lafan1_to_g1.json`):
+(1) mink velocity-space QP with joint limits as HARD constraints inside the solve (vs our
+post-hoc clamp — the documented branch-flip/flicker source); (2) orientation-FIRST weighting:
+table1 is rot-only (cost 10–100 on ~13 bodies incl. thigh/shank/upper-arm/forearm, pos cost 0
+except feet), table2 adds position lightly — vs our position-first 15 points with weak ori on
+only 7 roles. Position-only limb targets leave hand roll about the forearm axis and knee
+bend-plane under-constrained: that IS the palm-toward-body and knee-weirdness mechanism.
+(3) GMR has ZERO contact handling — one constant per-clip ground z-offset
+(`set_ground_offset`), literally the S3 z-shift-oracle mechanism. That is the paper opening.
+
+**Decision (Prabin, 2026-07-17)**: Phase B first — time-boxed (~2 days) test of whether OUR
+DLS solver reaches GMR quality with orientation-first reweighting + real limit handling
+(diagnostic + possible solver-agnostic ablation). Then Phase A REGARDLESS of B's outcome:
+contact layer (held-foot snap: locked XY at plant onset, z = sole-on-floor, ramped task costs)
+built inside GMR's own mink solve, locomotion first, with a fidelity non-regression guard vs
+GMR's own scaled-human targets (`--save_human_targets` dump). Headline metric stays S4-T5's
+joint_ok_pct (held ≤3cm AND pen <5mm) which constant-shift baselines cannot game. Full plan:
+`GMR-S5-plan.md` (Sonnet-executable). `GMR-S4-plan.md` marked superseded; S4-T5/T6 dropped.
+
+## S5-B0.1 | Hand-frame diagnostic — target construction is broken, not just under-weighted
+
+**Method**: compared OURS canonical `left_hand`/`right_hand` orientation frames
+(`lafan1_to_canonical_human.py`) vs GMR's own `scaled_human_data` hand targets
+(`gmr_headless_retarget.py --save_human_targets`, walk1_subject1, both already existed on
+disk from an earlier run). Computed per-frame relative rotation, fit a single best-fit
+constant offset (mean quaternion over the clip), subtracted it, looked at the residual.
+
+**Result — NOT a fixed calibration offset**: residual after removing the clip's own
+best-fit constant is huge and time-varying. Left hand: mean 43.5°, p50 35.6°, p90 91.9°,
+max 173.3°. Right hand: mean 49.9°, p50 45.9°, p90 76.0°, max 179.3°. A correct target
+that differs from GMR's only by a fixed convention/frame offset would residual near 0°
+everywhere; this doesn't.
+
+**Root cause found by reading the code** (`lafan1_to_canonical_human.py` lines 122-128):
+our hand frame's PRIMARY axis is the forearm direction (`wrist - elbow`, correct, real
+motion signal — this was S2-T4's fix). But the SECONDARY axis is **`pelvis_y`**
+(`left_hip - right_hip`) via `frame_from_xy`, which orthogonalizes pelvis_y against the
+forearm axis and uses THAT as the y-axis. `frame_from_xy`'s y-axis directly fixes the
+frame's roll about the primary (forearm) axis. Since pelvis_y is a near-rigid,
+slowly-varying reference (not derived from any wrist/hand landmark), **our hand target
+structurally cannot represent forearm twist (pronation/supination) at all** — its roll
+about the forearm axis is a geometric artifact of projecting pelvis_y, not a measurement
+of real wrist rotation. This is exactly consistent with "palm always rotated toward
+body": the twist DOF is not noise, it's simply absent from the target.
+
+GMR, by contrast, uses the **raw BVH bone rotation** for `LeftHand`/`RightHand` directly
+(`bvh_lafan1_to_g1.json`: `left_wrist_yaw_link` <- `LeftHand`, pos_weight 0, rot_weight
+10, with a fixed `rot_offset` calibration quaternion) — full 3-DOF orientation straight
+from mocap, including twist. This is why GMR's palm orientation looks physically correct
+and ours doesn't, independent of solver orientation weight (0.40 in TARGET_WEIGHTS would
+not fix a target with no twist information to weight).
+
+**Note on CLAUDE.md's "semantic frames from landmark positions, not raw FBX rotations"
+rule**: written for the Alex/FBX pipeline, where vendor rigs have inconsistent bind
+poses. LAFAN1 BVH is a single clean mocap rig — GMR's own SOTA pipeline already reads its
+raw per-bone rotations directly and it works. Using LAFAN1's raw `LeftHand`/`RightHand`
+bone rotation for the G1 hand target (this comparison track only, not touching Alex) is
+not the footgun the rule was written to prevent. **B1 will implement this fix.**
+
+## S5-B0.2 | Knee-bend diagnostic — systematically over-flexed, not a single glitch
+
+**Method**: knee joint angle (0=straight, + = flexed, limits [-5, 165] deg) stats on
+walk1_subject1, all 7840 frames, three variants (existing artifacts, no new solves):
+OURS s3_raw (`ours_g1_corpus/walk1_subject1_ours.npz`), OURS swing-clear tuned
+(`s4_dev/tune/walk1_subject1_mp8_cr0.2.npz`), GMR heightfix (`pkl/walk1_subject1_gmrfix.pkl`).
+
+| variant | mean L/R | p50 L/R | p90 L/R | % frames near -5° limit L/R |
+|---|---|---|---|---|
+| OURS s3_raw | 60.6 / 59.9 | 71.8 / 71.0 | 92.9 / 92.0 | 15.2 / 15.0 |
+| OURS swing-clear tuned | 66.3 / 65.8 | 74.3 / 74.2 | 88.8 / 89.5 | 7.5 / 7.9 |
+| GMR heightfix | 29.3 / 27.4 | 23.7 / 20.4 | 59.3 / 56.6 | 0.0 / 0.0 |
+
+**Answer to "is the knee bend forced?": yes, systematically.** OURS's mean knee flexion
+is roughly double GMR's (60-66° vs 27-29°), median nearly triple (71-74° vs 20-24°) —
+this is not one bad pose, it's baked into the whole gait cycle. Never near the FLEXED
+limit (165°, hi%=0 everywhere) — so it's not a hard joint-limit pin on the flexed side.
+It IS pinned near the STRAIGHT limit (-5°) for 15% of frames at s3_raw (the documented
+S2 warm-start-basin bug — swing-clear tuning roughly halves this to 7.5-7.9% as a side
+effect, consistent with S4-T4's finding that `cr` reduces branch-flip, but doesn't fix
+the mean over-flexion at all — swing-clear tuned mean is actually slightly WORSE, 66.3
+vs 60.6, likely from posture_reg's hip/knee continuity term nudging bend up to stay
+smooth through the straight-limit-pinned frames).
+
+**Consistent with B0.1's root cause, not a separate bug**: OURS tracks knee as a bare
+position point (hip/knee/ankle, 3 independent XYZ targets) with NO shank/thigh
+orientation constraint on the bend PLANE — GMR position-weights the knee at 0 in both
+tables and instead orientation-tracks the thigh (`left_hip_yaw_link`, rot 10) and shank
+segment directly, pinning the bend plane. A position-only 3-point IK is free to choose
+*any* knee angle that reaches the same three points along a curved vs straighter path
+(classic elbow/knee IK redundancy) — the DLS solve apparently settles toward extra
+flexion as a side effect of jointly satisfying hip+ankle+other competing targets, not
+because anything explicitly asks for it. No fix attempted here (diagnostic only, per
+plan); B2b (add thigh/shank orientation roles) is the mechanism expected to fix this if
+Phase B proceeds that far.
+
+## S5-B0.3 | Motion smoothness/jerk metric — quantifies the "flicker" verdict
+
+New `scripts/g1/motion_smoothness.py`: joint jerk (3rd finite diff of 29 joint angles,
+rad/s^3) + FK'd body-position jerk (3rd finite diff of left/right ankle+wrist world
+position, m/s^3), mean/p95/max. Computed on existing artifacts, no new solves.
+
+| clip | variant | joint_jerk mean | joint_jerk p95 | body_jerk mean | body_jerk p95 |
+|---|---|---|---|---|---|
+| walk1_subject1 | OURS s3_raw | 8192 | 35112 | 531.5 | 2172.8 |
+| walk1_subject1 | OURS swing-clear tuned | 5301 | 20236 | 365.9 | 1641.1 |
+| walk1_subject1 | GMR raw / heightfix (identical — const Z shift doesn't touch joints) | **2352** | **6074** | **95.4** | **340.0** |
+| run2_subject1 | OURS s3_raw | 11045 | 29084 | 601.4 | 2252.3 |
+| run2_subject1 | OURS swing-clear tuned | 11509 | 36160 | 636.2 | 2421.5 |
+| run2_subject1 | GMR raw / heightfix | **8226** | **18454** | **324.4** | **935.4** |
+
+**Verdict**: GMR is consistently smoother, but the GAP IS MOTION-DEPENDENT — walking
+(slow, more redundant/underdetermined IK) shows a large gap (OURS 2.3-3.5x GMR's mean
+joint jerk, 5.8x p95); running (fast, less redundancy slack, high natural jerk even for
+GMR) shows a much smaller gap (OURS only 1.3-1.4x mean). This matches the branch-flip
+theory directly: slow motions give the position-only DLS solve more freedom to flip
+between near-equally-good IK solutions frame to frame (visible flicker); fast motions are
+more kinematically constrained regardless of solver, so there's less redundancy to flip
+within. Swing-clear tuning helps walk1 (both jerk numbers drop 30-42%) but not run2
+(flat to slightly worse) — consistent with S4-T4's own finding that run2 was one of
+swing-clear's two non-improving clips. This is the smoothness column that will feed
+B-GATE and A2.
+
+## S5-B1 | Hand target fix implemented — raw BVH bone rotation, validated exact match to GMR
+
+**Change**: `lafan1_to_canonical_human.py` hand orientation (`left_hand`/`right_hand`
+roles) now uses the raw BVH bone rotation (`load_bvh_file`'s own per-frame
+`f["LeftHand"][1]`/`f["RightHand"][1]`, world-frame FK quaternion, wxyz) instead of
+`frame_from_xy(wrist-elbow, pelvis_y)`. Left-multiplied by the same yaw-facing-correction
+matrix already applied to positions, so it composes correctly with the rest of the
+pipeline (feet/pelvis/torso/head unchanged, still landmark-derived semantic frames).
+
+**Correction to B0.1's own methodology, found while validating this fix**: the ~43-50°
+mean residual B0.1 measured was NOT purely the pelvis_y-roll bug — it was partly an
+artifact of comparing OUR yaw-facing-corrected canonical (walk1 needed a 90° facing
+correction) against GMR's own `scaled_human_data` dump, which has NO such correction
+(GMR doesn't normalize clip facing direction; that is entirely our pipeline's own
+convention). Isolated this by comparing pre-yaw-correction raw BVH quat directly against
+GMR's target: **residual = exactly 0.00 deg at every one of 7840 frames**, with the
+constant relative offset matching GMR's own documented `rot_offset` calibration
+(`bvh_lafan1_to_g1.json`: `[0.70710678, 0.70710678, 0, 0]`, a 90 deg rotation about X) to
+the printed precision. This proves the fix is not just plausible but exactly correct —
+our new hand target IS GMR's own target, modulo the yaw-facing convention difference
+that was already known to apply to every other role. (Downstream G1 IK target
+construction uses world-delta-from-rest per CLAUDE.md, so the yaw-frame difference
+doesn't matter there — both rest-frame and current-frame hand orientation are yaw-shifted
+consistently.)
+
+**Regenerated dev-clip canonicals** (`outputs/gmr_baseline/sprint/canonical_human_s5/`,
+`lafan1_to_canonical_human.py` -> `ground_canonical_human.py --plant-min-run 2`, same
+recipe as S2-T1/T2): walk1_subject1, walk3_subject1, run2_subject1,
+fallAndGetUp1_subject1, ground1_subject1. Grounding numbers closely match the original
+S2-T2 build (walk1: floor p50=0.0039m, both builds -- confirms the grounding step itself
+is unaffected by the hand-orientation change, as expected).
+
+**Re-solved walk1_subject1** with the fixed canonical, otherwise-default flags
+(`outputs/gmr_baseline/sprint/s5_dev/ours_b1/walk1_subject1_ours_b1.npz`). Whole-clip
+metrics vs the old s3_raw build (same solver, old hand target):
+
+| | floorPen_cm | pen_pct | coll_pct | coll_peak_cm |
+|---|---|---|---|---|
+| s3_raw (old hand target) | 17.35 | 70.92 | 2.09 | 2.14 |
+| B1 (fixed hand target) | 18.07 | 70.89 | 3.19 | 1.86 |
+
+Floor metrics essentially flat (expected -- hand fix shouldn't move feet/floor numbers).
+Aggregate self-collision % moved slightly worse (total across ALL body pairs, not
+hand-specific) but peak improved. Direct hand-to-thigh proximity (body-origin distance,
+`left/right_rubber_hand`+`wrist_yaw_link` vs `hip_yaw/hip_pitch/knee_link`, both sides):
+mean 16.3->17.3cm, p10 6.5->7.8cm, **frac<10cm 43.5%->32.8%** (fewer close-approach
+frames, net improvement) though the single worst-frame min got closer (1.4->0.8cm, one
+outlier). **Verdict: the specific visual symptom (palm structurally locked toward body)
+is fixed and validated exactly against GMR's own target; net hand-thigh proximity
+improves; aggregate whole-body self-collision is a mixed bag (not the target of this
+fix) and floor metrics are unaffected as expected.** Knee over-flexion (B0.2) is
+untouched by this fix -- separate mechanism, expected to need B2b (thigh/shank
+orientation roles) if attempted.
+
+## S5-B2 | Orientation-first reweighting preset — mixed/negative, B2b (new ori roles) needed for a real win
+
+New `--gmr-style-weights {0,1,2}` on `solve_lafan1_canonical_g1_contactfirst.py`
+(monkey-patches `alex_solver.TARGET_WEIGHTS`/`ORI_WEIGHTS` in-process, opt-in, never
+touches the shared Alex file on disk or other processes). Tested on walk1_subject1
+(B1's fixed-hand canonical as the base).
+
+**Attempt 1** (aggressive distal position cut: knee/elbow/hip/shoulder pos ~0.2-0.3,
+raise pelvis/torso/feet/hand orientation 1.5-3.0x): WORSE on every metric. floorPen
+18.07->22.95cm, coll_peak_cm 1.86->5.88cm (a self-collision spike more than tripled),
+knee mean flexion 60.7/59.9->64.3/65.1 deg (WORSE, not better). pen_pct did improve
+(70.9->52.2%).
+
+**Root cause**: we have NO thigh/shank/upper-arm/forearm orientation roles (that's
+B2b, not implemented this pass) -- cutting knee/elbow POSITION weight removes the only
+signal constraining the knee bend-plane and elbow bend-plane without installing a
+replacement. Redundancy went UP, not down. This is exactly what GMR-S5-plan.md warned
+B2 alone might do.
+
+**Attempt 2** (softer preset, milder cuts: knee/elbow/hip/shoulder pos ~0.6-0.7 vs
+original ~0.8-1.0, orientation raised more mildly 1.2-1.5x): still a mixed bag, not a
+clean win. floorPen 19.54cm (worse than B1's 18.07, better than attempt 1's 22.95),
+pen_pct 60.3% (better than B1's 70.9), coll_peak_cm 3.02cm (worse than B1's 1.86,
+better than attempt 1's 5.88), knee mean 57.8/58.1 deg (marginally BETTER than B1's
+60.7/59.9 -- the one genuinely positive knee signal from any B2 attempt, but small).
+
+**Verdict**: reweighting alone, without B2b's new orientation roles, does not reach a
+clean win -- pen_pct improves consistently across both attempts, but floorPen and
+self-collision consistently get WORSE, and knee flexion only marginally improves with
+the soft preset. This matches the plan's own prediction. **B2b (add thigh/shank/
+upper-arm/forearm orientation roles, GMR-S5-plan.md's "biggest B item") is the
+mechanism actually needed to test the orientation-first hypothesis properly** -- not
+attempted this pass (time-box). Given Phase B's ~2-day budget and that Phase A is the
+paper's critical path regardless of B's outcome, deferring B2b rather than attempting
+it now; B2 (weights only) does not clear a bar on its own and is logged as a
+negative/inconclusive ablation result, not a shipped mechanism.
+
+## S5-B3 | Joint-limit active-set + convergence early-exit — both informative negatives
+
+New `--active-set-limits` / `--early-exit-tol` on `solve_lafan1_canonical_g1_contactfirst.py`
+(both opt-in kwargs on the shared `solve_frame_position_ik`, default off/None = unchanged
+behavior). Tested independently and combined on walk1_subject1 (B1's fixed-hand canonical).
+
+**`--active-set-limits`: confirmed NUMERICAL NO-OP.** Direct instrumentation (temporary debug
+print, removed after) confirmed the mechanism DOES trigger -- 8468 times in just the first 300
+frames -- yet whole-clip metrics and knee stats came back byte-identical to the baseline
+(floorPen 18.07cm, pen_pct 70.89%, coll_pct 3.19%, knee mean 60.7/59.9 -- all match exactly).
+Root cause: `clamp_hinge_joint_limits` already runs every iteration (not just at the end), so a
+pinned DOF snaps to the exact same boundary value each iteration regardless of whether its `dq`
+component is zeroed pre-integration or left to overshoot-then-clamp. Because `dq` comes from one
+linear solve (not sequential per-DOF), zeroing one component post-hoc doesn't let other DOFs
+redistribute to compensate -- their values were already fixed by the same solve. A real version
+would need to drop the limited DOF's column from `A` and re-solve (true reduced-QP, not a
+post-hoc mask) -- out of scope this pass, but useful to know the shape of the fix if revisited.
+
+**`--early-exit-tol 1e-3` (GMR's own value): real speedup, real quality cost.** 75s->21s per
+clip (3.5x). But pen_pct 70.9->82.3%, coll_pct 3.19->7.73%, coll_peak_cm 1.86->3.36cm (only
+floorPen improved, 18.07->16.60cm). Root cause: our TARGET_WEIGHTS/ORI_WEIGHTS are O(0.2-4),
+GMR's own weight scale is O(5-100) -- their 1e-3 convergence tolerance is calibrated to THEIR
+units and is comparatively loose in ours, so the solve exits before self-collision/floor rows
+(sharing the same rows2 iteration budget) have actually converged. A correctly-scaled tolerance
+for this solver needs its own calibration, not a literal port of GMR's number -- not attempted
+(time-box).
+
+**Both mechanisms left in the code, documented, opt-in, default off** -- neither ships as a win
+this pass.
+
+## S5-B-GATE | Phase B verdict: FAIL — OURS-DLS retired to ablation role, Phase A starts now
+
+**Best B config**: B1 (hand target fix) + S4's tuned swing-clear (mp=8, cr=0.2) — the only
+two Phase-B mechanisms that were genuine, validated wins (B2 reweighting and both B3
+mechanisms were negative/inert, see their own entries above). Built and evaluated on
+walk1_subject1 against the gate criteria in GMR-S5-plan.md:
+
+| criterion | gate | B-GATE config | swing-clear-tuned alone (reference) | pass? |
+|---|---|---|---|---|
+| pen% no worse than swing-clear tuned | <= baseline | 66.15% | 66.26% | PASS (flat) |
+| floorPen | (context) | 16.74cm | 15.61cm | slightly worse |
+| coll_pct | (context) | 2.84% | 1.47% | worse (matches B1's own known trade) |
+| joint_jerk mean vs GMR's 2352 (rad/s^3) | <=~2x | 4965 (2.11x) | -- | borderline FAIL |
+| body_jerk mean vs GMR's 95.4 (m/s^3) | <=~2x | 345 (3.6x) | -- | FAIL |
+| visible flicker/snapping | none | -- | -- | Prabin already rendered/watched this class of config (S4's videos) and called it "stupid mf, flickers, and snaps" |
+
+**Verdict: FAIL.** Contact-accuracy metrics (pen%, held-frac3) are fine or flat, but the
+core complaint this whole pivot started from -- smoothness/flicker -- is NOT resolved.
+Body-level jerk (the whole-chain snap Prabin saw, not just per-joint noise) sits at 3.6x
+GMR's, nowhere near the ~2x bar, let alone GMR's own visual quality. Root cause chain is
+now fully traced: GMR's smoothness comes from its QP architecture (hard joint-limit
+constraints INSIDE the solve, velocity-space integration) and its orientation-first
+weighting with FULL limb-segment orientation coverage (thigh/shank/upper-arm/forearm,
+which we structurally lack -- B2b, not attempted, would be needed to even test this
+properly) -- neither is something a reweighting pass or a post-hoc DOF mask on our
+existing DLS+clamp architecture can retrofit. B1 (hand target) is a real, keepable fix
+(ships regardless) but it only fixes ONE specific symptom (palm-toward-body), not the
+general flicker/knee/collision picture.
+
+**Decision (per GMR-S5-plan.md's own pre-committed rule: Phase B does NOT gate Phase
+A, and 2 focused attempts per sub-experiment is the cap)**: Phase B is closed. OURS-DLS
+retains B1's hand-target fix as a permanent improvement, and is retired to an
+ablation/comparison role for the paper (not the primary tracking method). **Phase A
+(contact layer inside GMR's own mink solve) starts now** -- this was always the
+paper's critical path regardless of B's outcome, per Prabin's original framing.
+
+## S5-A1 | gmr_contact_retarget.py built, validated, one real bug found+fixed
+
+New `scripts/g1/gmr_contact_retarget.py`: subclasses `GeneralMotionRetargeting` (never
+edits `~/projects/GMR`), overrides ONLY the held foot's table-2 FrameTask (locked XY at
+onset, Z=z_sole, flat orientation with yaw taken from GMR's own current target), ramped
+cost cross-fade. Sanity check (`--no-contact`) confirmed BYTE-IDENTICAL to plain
+`gmr_headless_retarget.py` output (root_pos/root_rot/dof_pos max abs diff = 0.0 across
+all 7840 frames) -- the wrapper adds nothing until the override is enabled, as required.
+
+**Bug found in A2 eval, not before**: `skate_cm` (max XY drift of a held foot from its
+own onset position) came back with absurd values (194-224cm!) on walk1_subject1's very
+FIRST held segment for both feet. Root cause: that segment starts at frame 0, before any
+`retarget()` solve has run -- `self.configuration`'s FK position at that point is mink's
+default/rest configuration (arbitrary, unrelated to the human's real starting pose), so
+locking "onset XY" there grabs garbage ~2m from the true position. This ALSO explained
+an earlier-looking floorPen spike (7.72cm on walk1) that had been mis-attributed to a
+release hand-off -- same root cause, not two separate bugs. **Fix**: added `_solved_once`
+flag (subclass `ContactAwareGMR`), set True by the driver after each frame's solve;
+frame 0 (or any onset before the FIRST solve has run) is skipped for override purposes
+entirely -- pure natural GMR tracking that frame, first legitimate lock happens no
+earlier than frame 1. Confirmed fix: worst-case skate dropped from 194-224cm to
+sub-3cm everywhere, and the floorPen spike disappeared (7.72cm -> 1.70cm, matching
+gmr_raw's own 1.47cm).
+
+Also refactored the cost/target cross-fade from a manual linear step to a proper cosine
+ramp (`_cosramp`, matches `contact_labels.py::ramp_envelope`'s shape, zero derivative at
+both ends) -- `ramp_envelope` itself couldn't be used directly (its pre-onset
+"anticipation" semantics assume a target you can already compute before the transition;
+here the onset XY literally doesn't exist until the onset frame's own FK), so this is a
+purpose-built equivalent, counted from onset/release rather than from the boolean flag.
+
+`scripts/g1/sprint_s5_metrics.py` (new): `joint_ok_pct` (S4-T5's un-gameable headline:
+per frame with >=1 held foot, every held foot |support_z|<3cm AND whole-body pen<5mm),
+`skate_cm`, `fidelity_metrics` (mean pos/ori error vs a run's own saved
+`--save_human_targets`, over the 12 non-foot table2 bodies), `jerk_metrics` (reuses
+`motion_smoothness.py`).
+
+## S5-A2 | Locomotion gate: 3/4 criteria clear, jerk residually elevated after 3 tuning attempts
+
+3 loco dev clips (walk1_subject1, walk3_subject1, run2_subject1), `gmr_contact` (A1)
+vs `gmr_raw` vs `gmr_heightfix`. Three configs tried (transition-tuning cap: max 3
+attempts per GMR-S5-plan.md):
+1. ramp=5 frames, linear step, cost 50->200/10->50: jerk +43-75% vs gmr_raw (fails).
+2. ramp=10, cosine, same cost: WORSE not better -- jerk +140% on walk1, joint_ok_pct on
+   run2 dropped further (88.8%->82.2%). Root cause (inferred): a longer partial-cost
+   window sustains tension between the locked foot and the still-moving pelvis for
+   LONGER, not less -- the tension is likely continuous through the held region (pelvis
+   wants to keep walking, locked foot resists), not just at the transition edges, so a
+   longer ramp just prolongs the fight.
+3. **ramp=5, cosine, cost 50->100/10->20 (gentler ceiling, closer to GMR's own table2
+   scale where pelvis pos=100) -- best result, shipped as the default.**
+
+**Config 3 vs gate** (GMR-S5-plan.md A2):
+
+| | walk1 | walk3 | run2 |
+|---|---|---|---|
+| joint_ok_pct (gate >=90) | **98.9%** (raw 97.9) | **94.4%** (raw 92.0) | 85.2% (raw 91.9) FAIL |
+| mean skate_cm (gate <=1) | 0.44/0.42 PASS | 0.29/0.31 PASS | 0.19/0.18 PASS |
+| fidelity delta vs raw (gate <=1cm/2deg) | +0.41cm/+0.07deg PASS | +0.49cm/+0.13deg PASS | +0.19cm/+0.11deg PASS |
+| jerk delta vs raw (gate <=20%) | +40%/+70% FAIL | +26%/+44% FAIL | +10%/+22% FAIL (close) |
+
+For context, `gmr_heightfix` (GMR's own best floor mechanism, a single constant Z shift)
+on the SAME joint_ok_pct metric: walk1 86.8%, walk3 **1.4%**, run2 **8.6%** -- the exact
+z-shift-oracle failure this whole paper thesis is built on (can't satisfy held-contact
+AND whole-body-pen simultaneously with one constant). `gmr_contact` beats gmr_heightfix
+by 12-93 points on every clip.
+
+**Verdict: 3 of 4 gate criteria clear cleanly (skate, fidelity, joint_ok on 2/3 clips);
+jerk does not clear <=20% on any clip, though tuning substantially narrowed the gap
+(walk1 body_jerk +75%->+70%, walk3 +58%->+44%, run2 +32%->+22%) and run2's own gap is
+now small.** Render (`walk1_subject1_gmrcontact_annotated.mp4`, repo root, same
+window/camera as the 3 earlier comparison videos, sent to Prabin for visual judgment):
+1.2% frames penetrating >0.5cm in this window (vs gmr_heightfix's own 15.9% in the same
+window), max 1.14cm (vs 1.66cm). Numerically this is the strongest result of the whole
+GMR-baseline effort by a wide margin. Not a clean gate pass on jerk -- keeping this as
+the honestly-reported A2 result and proceeding to A4 per plan (A3 swing-clearance is
+scoped for swing-phase floor penetration specifically, not the jerk/transition-tension
+mechanism found here, so it wouldn't address this residual -- skipping it for now,
+flagging as a candidate follow-up: reduce contact cost ramp-in tension, e.g. a softer
+XY-lock margin instead of a hard position pin, or blend toward GMR's own natural target
+rather than a fully independent locked one).
+
+## S5-A3 | Swing-floor clamp — real, partial improvement on run2, gate not fully closed
+
+Diagnosed first (per plan): of run2_subject1's 339 joint_ok_pct failures, 339/339
+(100%) were whole-body pen, only 5/339 also had a support_z failure -- and the
+penetrating body was always the CURRENTLY NOT-held ankle (17/17 sampled frames:
+10 right_ankle_roll_link + 7 left_ankle_roll_link, zero other bodies). Textbook swing-
+foot floor clip during fast running, exactly what A3 is scoped for.
+
+New `--swing-floor-margin` on `gmr_contact_retarget.py`: soft target-space clamp on the
+NOT-held foot's own table-2 target Z (raised to `z_sole + margin` if GMR's own target
+already sits below it; XY/orientation/cost untouched -- can't fight swing clearance the
+way a hard task would, matches the plan's "clamp the target, not a new task" framing).
+
+| margin | pen_pct | joint_ok_pct | coll_pct |
+|---|---|---|---|
+| 0 (A1 baseline) | 11.68 | 85.2 | 1.10 |
+| 1.5cm | 11.68 (no effect) | 85.2 | 1.10 |
+| 8cm | 5.70 | 86.7 | 1.24 |
+| 15cm | 4.82 | 88.2 | 1.38 |
+
+1.5cm did LITERALLY nothing -- the achieved-vs-target tracking error during fast
+running exceeds a small margin on its own (this isn't purely a target-placement
+problem, mink's solve doesn't perfectly reach even a corrected target every frame at
+running speed). Larger margins help substantially on pen_pct (11.7%->4.8% at 15cm) and
+nudge joint_ok_pct up (85.2%->88.2%) but don't clear the 90% gate even at 15cm, with
+diminishing returns (8cm->15cm: pen_pct -0.9pt, joint_ok +1.5pt) and a small but real
+self-collision cost creeping up (1.10%->1.38%) as the swing target is pushed higher
+into the leg's own space. **Shipping `--swing-floor-margin 0.08` (8cm) as a reasonable
+default** -- real win, gate not fully closed, logged honestly per the plan's one-attempt
+scope for A3. `walk1`/`walk3` not re-tested with this flag (their joint_ok_pct already
+cleared the gate without it); only affects clips where it's opted in.
+
+## S5-A4 | Post-hoc ablation (existing Stage B QP) — near-zero jerk cost, but held-accuracy collapses off walking speed
+
+Reused `scripts/g1/stage_b_g1.py::run_multisurface` (`--multi-surface`, an EXISTING
+mechanism from S1/S2, not new this sprint) as `gmr_contact_post`: whole-trajectory QP
+anchoring applied AFTER a raw GMR solve, vs A1's per-frame override INSIDE the solve.
+
+**Methodology fix found while building this**: the tool's default `--human-contacts`
+source (`human_contacts_lafan1.py`, a height-only zone heuristic) disagrees SHARPLY with
+this sprint's own canonical `contact_flags`-based held mask on faster clips -- walk3's
+zone was 85-88% of frames vs canonical's 49-52%. Comparing A4 against A1/A2 with
+mismatched contact sources would be invalid (different "ground truth" for what counts as
+held). Fixed by building a consistent `zone_<role>` npz directly from the SAME canonical
+`contact_flags` (debounced, feet-only to match A1's scope) --
+`outputs/gmr_baseline/human_contacts_s5/<clip>.npz`, new script (inline, not a checked-in
+file this pass) -- and re-ran Stage B against that for all 3 dev clips.
+
+**Result, consistent masks**:
+
+| clip | variant | pen% | held_frac3 L/R | joint_ok_pct | jerk joint/body |
+|---|---|---|---|---|---|
+| walk1 | gmr_raw | 1.3 | 98.6/98.6 | 97.9 | 2352/95.4 |
+| walk1 | A1 (in-loop) | 1.5 | 100/100 | 98.9 | 3301/162.5 |
+| walk1 | **A4 (post-hoc)** | 15.9 | 99.9/100 | 87.3 | **2352/95.5** |
+| walk3 | gmr_raw | 10.2 | 98.6/91.7 | 92.0 | 4110/160.4 |
+| walk3 | A1 | 10.3 | 99.8/97.9 | 94.4 | 5171/230.7 |
+| walk3 | A4 | 0.8 | **0.7/4.5** | **1.4** | 4110/160.8 |
+| run2 | gmr_raw | 10.4 | 99.9/100 | 91.9 | 8226/324.4 |
+| run2 | A1 | 11.7 | 99.9/99.7 | 85.2 | 9075/397.3 |
+| run2 | A4 | 0.1 | **14.0/10.8** | **14.4** | 8226/323.7 |
+
+**The jerk finding holds and is real and clean**: A4's jerk is ESSENTIALLY IDENTICAL to
+gmr_raw on all 3 clips (differences <1%) -- Stage B's own `lambda_smooth=20.0` whole-
+trajectory regularizer absorbs the transition cost that A1's per-frame override cannot.
+This is the paper's clean in-loop-vs-post-hoc smoothness contrast.
+
+**But held-accuracy is NOT consistent across gait speed**: excellent on walk1 (99.9/100,
+matches A1), collapses on walk3 (pathological walker) and run2 (running) even with
+IDENTICAL contact masks to A1 -- a genuine Stage-B-QP limitation on faster/shorter
+contact intervals (likely `_pull_to_floor`'s per-run median-offset mechanism, or
+`_compute_anchors`'s speed/min-run defaults, undersuited to these gaits -- not
+diagnosed further, time-boxed). pen% is excellent everywhere (0.1-15.9%, best of any
+variant on walk3/run2) because whole-body floor avoidance is a different, easier part
+of the same QP than precise per-foot support_z placement.
+
+**Verdict for the paper**: A1 (in-loop) is the more RELIABLE mechanism across gait
+speed (clears joint_ok >=90 on 2/3 clips, close on the third) at a real jerk cost. A4
+(post-hoc) achieves essentially free smoothness but its contact-placement accuracy is
+gait-speed-dependent and currently only reliable on walking-speed clips. Report BOTH,
+honestly, as the in-loop/post-hoc ablation the plan wanted -- this is a genuine,
+non-obvious trade-off finding, not a clean win for either side. A5/A6 proceed with A1
+(gmr_contact) as the primary variant; A4 stays a walking-only-scoped ablation row.
+
+## S5-A5 | Hard-class extension (hands) — partial success exactly as expected
+
+Generalized `gmr_contact_retarget.py` from feet-only to a parameterized `effectors`
+list (`--effectors feet|feet+hands`; `EFF_BODY`/`EFF_HUMAN_KEY`/`EFF_CANON_ROLE` dicts
+replace the old `FOOT_*` ones; hand base cost uses GMR's own table2 hand weight 10/5,
+not the foot weight 50/10). Sanity check + feet-only byte-match against the pre-refactor
+A1 result both still pass exactly (0.0 max diff) -- pure generalization, no behavior
+change in the default path. Note: "flat" orientation for a held HAND (zero roll/pitch,
+same as a foot) is an unvalidated v1 approximation -- a planted palm's real constraint
+is closer to "normal into the floor," not corrected this pass.
+
+Ran `--effectors feet+hands` on the 2 hard-class dev clips (fallAndGetUp1_subject1,
+ground1_subject1). Held-effector accuracy (support_z frac3, |z|<3cm):
+
+| clip | effector | gmr_raw | gmr_contact (A5) |
+|---|---|---|---|
+| fallAndGetUp1 | left_foot | 92.8% | 98.3% |
+| fallAndGetUp1 | right_foot | 92.5% | 92.9% |
+| fallAndGetUp1 | left_hand | 70.3% | **95.0%** |
+| fallAndGetUp1 | right_hand | 10.6% | **94.9%** |
+| ground1 | left_foot | 99.4% | 87.7% (regressed) |
+| ground1 | right_foot | 98.6% | 56.4% (regressed) |
+| ground1 | left_hand | 59.6% | **98.3%** |
+| ground1 | right_hand | 69.1% | **98.6%** |
+
+Hand accuracy improves dramatically on both clips (worst case 10.6%->94.9%). Foot
+accuracy is a mixed bag on ground1 specifically (right foot regresses to 56.4%) --
+likely hand and foot override tasks competing for the same limited solve budget/
+priority on a clip where BOTH pairs are frequently held simultaneously (lying/prone
+poses), unlike the loco clips where feet-only was the whole story. Not root-caused
+further (time-box).
+
+**Whole-body pen% barely moves** (fallAndGetUp1: 41.0%->40.5%; ground1: 87.8%->87.6%)
+-- exactly the expected outcome per S2's own prior finding that these clips carry
+genuine reach-limit poses (G1 is ~0.64 of this human's scale; documented worst case
+181.6% of max leg reach on fallAndGetUp2_subject2). The contact mechanism does what
+it's designed to do (place HELD effectors accurately); it cannot fix a whole-body pose
+that's kinematically infeasible for this robot's proportions. `gmr_heightfix` "solves"
+pen% via the same global-shift mechanism the paper's whole thesis is built on
+rejecting (1.9%/0.2% pen%) but at the cost of near-zero held accuracy (0-4.7% frac3)
+-- the exact z-shift-oracle failure again, now visible on the hard class too.
+
+**Verdict: partial success, exactly as the plan anticipated.** Hands: real, large win.
+Feet-on-hard-clips: mixed, one regression found (ground1 right foot). Whole-body pen on
+lying/prone poses: untouched, a genuine residual limitation of retargeting to a
+smaller-than-human robot, not a solver problem. Report honestly in the paper: contact
+layer generalizes to hands with a real accuracy win, but the hard class's dominant
+failure mode (reach-limit whole-body infeasibility) is out of scope for a contact
+mechanism and stays an open problem.
+
+## S6-PLAN (2026-07-17, Fable)
+Diagnosed S5 shortfall: contact layer is a soft cost covering held effectors only — QP trades it away (loco worst-pen −3.45→−3.56cm unchanged; floor-class whole-body pen 15.29→15.35cm untouched). Nothing in the solve forbids the floor. Discovery: installed mink ships `CollisionAvoidanceLimit` (true QP inequality), GMR already threads `ik_limits` into every solve, and GMR's G1 XML already has a floor plane geom — hard floor constraint is an append-to-list change. Wrote `GMR-S6-plan.md`: Phase A = floor constraint inside mink (+ `--no-contact --floor-limit` clean ablation), Phase B = Prabin's median-centering + limb-wise IK post-process (endorsed; amendment B1b = per-frame smoothed root-z for floor-class trunk pen, which is why the week-2 grounding negative doesn't apply — that lacked the limb pass to close created float). Gates, corpus steps, T-DOC included.
+
+## S6-A1 (2026-07-17, Fable)
+Two real findings, both change Phase A's design.
+
+**1. Genuine bug in GMR's own reference solver (not ours).** `motion_retarget.py`'s
+`retarget()` calls `mink.solve_ik(self.configuration, self.tasks1, dt, self.solver,
+self.damping, self.ik_limits)` — 6 positional args. The INSTALLED mink's
+`solve_ik(configuration, tasks, dt, solver, damping=..., safety_break=False,
+limits=None, ...)` has `safety_break` at position 6, `limits` at position 7. So
+`self.ik_limits` (a non-empty list, hence truthy) silently binds to `safety_break`,
+never reaches `limits`. `limits=None` makes mink substitute a fresh default
+`ConfigurationLimit(model)` (per `_compute_qp_inequalities`'s own docstring) — which
+happens to be equivalent to GMR's own `ik_limits[0]`, so joint-limit enforcement is
+accidentally fine. But `VelocityLimit` (when `use_velocity_limit=True`) is silently
+DROPPED, and critically: any custom limit WE append to `retargeter.ik_limits`
+(including a floor constraint) would ALSO be silently dropped. Confirmed by
+single-frame QP diff (`build_ik` with `limits=None` vs `limits=r.ik_limits`): dq
+differs (norm 0.0087) once fixed. This bug lives only in our own copy
+(`_solve_after_targets` in `gmr_contact_retarget.py`, verbatim-copied from GMR) —
+never edits `~/projects/GMR` itself. Fix: pass `limits=` as keyword.
+
+**2. Even fixed, `mink.CollisionAvoidanceLimit` doesn't deliver near-zero
+penetration in GMR's per-frame IK pattern — root cause is iteration count, not the
+constraint math.** Tested on walk1_subject1 (dev clip), frame 135 (worst violation).
+GMR's table2 solve loop exits after literally ONE solve+integrate call per frame
+(task error stops improving > 0.001 threshold almost immediately after one large
+step) — nowhere near enough iterations for the constraint's rate-limited (CBF-style)
+bound to converge. Measured on the ONLY collidable floor-proxy geometry for the left
+foot (see below) at frame 135:
+  - 0 extra iterations (GMR's natural exit): −1.274cm penetration, IDENTICAL to
+    no-constraint-at-all baseline (−1.274cm) — constraint literally has zero effect
+    at GMR's natural convergence point.
+  - +5 forced extra iterations: −0.416cm (real improvement).
+  - +20: −0.344cm. +50: −0.342cm (plateaus, not zero — residual likely from
+    competing tracking-task pull at equilibrium, not a bug).
+Forcing iterations works but costs real per-frame time (50 extra QP solves/frame is
+a large multiplier) and still doesn't reach exact zero.
+
+**3. Separate, compounding issue: GMR's own G1 XML excludes the foot's real mesh
+from collision entirely.** `left_ankle_roll_link` (and presumably right): the visual
+STL mesh geom is `contype="0" conaffinity="0"` (non-collidable by explicit design —
+confirmed by reading `g1_mocap_29dof.xml:83`). The ONLY collidable geometry for the
+foot is 4 tiny 5mm marker-dot spheres (lines 84-87, undecorated so default to
+contype=1/conaffinity=1 — these read like leftover mocap-marker visualization
+artifacts given the file's own name `g1_mocap_29dof.xml`, not a deliberately
+designed contact-point proxy). So even a perfectly-converged
+`CollisionAvoidanceLimit` only protects those 4 points, not the true sole surface
+OUR vetted eval model measures against — a second, independent source of residual
+"penetration despite constraint," on top of the iteration-count issue. (Most other
+bodies — hip, knee, torso — DO use their real STL mesh for collision by default,
+this foot-specific exclusion is not universal.)
+
+**Verdict: standard `mink.CollisionAvoidanceLimit`, used as GMR uses `solve_ik`
+(few-iteration, large-per-frame-jump IK refinement), is not a viable path to
+"whole-body worst pen <1cm" on OUR vetted mesh model.** Revising Phase A's mechanism
+accordingly — see updated `GMR-S6-plan.md`. The bug fix (finding 1) is real and
+worth keeping regardless of what mechanism ships.
+
+## S6-PLAN-REVISION (2026-07-17, Fable)
+Two updates to GMR-S6-plan.md before handoff.
+
+1. Prabin's instruction: `gmr_raw`/`gmr_heightfix`/`gmr_polished` are fixed baseline
+   comparison points — GMR's own code and our Stage-A polish, used exactly as
+   shipped, bugs included, so numbers stay honest against GMR's actual paper. Never
+   "fix" anything in `gmr_headless_retarget.py` or `polish_gmr_pkl.py`. Confirmed
+   `gmr_headless_retarget.py` calls GMR's unmodified `retarget()` directly — the
+   S6-A1 positional-arg bug fix lives only in `_solve_after_targets` inside
+   `gmr_contact_retarget.py` (OUR ContactAwareGMR wrapper), never touches the
+   baseline generator — safe as originally scoped. Added a "Baseline integrity"
+   section to GMR-S6-plan.md making this explicit, and added `gmr_polished` as a
+   required column in every S6 comparison table (S6-A4's variant list was missing
+   it, fixed).
+2. Prabin asked directly how OURS compares against the gmr_polished "stack." Pulled
+   from existing `s5_full_corpus.csv` (no new build needed): on joint_ok_pct,
+   gmr_polished is WORSE than gmr_raw on both classes (loco 91.52%→32.15%, floor
+   80.64%→0.36%) — Stage-A's smoothing/grounding amplifies the same float-to-hide-
+   penetration problem as gmr_heightfix. gmr_contact (S5, OURS) already beats
+   gmr_polished by a wide margin on both classes (94.18% loco, 84.01% floor) before
+   any S6 work. Logged so this doesn't need re-deriving.
+
+## S6-A2/A3/A4 (2026-07-17, Fable/Sonnet)
+Built `scripts/g1/leg_floor_clamp.py` (shared DLS floor-clamp module, S6-A2), wired
+into `gmr_contact_retarget.py` via `--floor-clamp` (S6-A3, fixed the S6-A1 positional
+`limits=` bug in `_solve_after_targets` at the same time -- confirmed bit-identical
+output without `--floor-clamp`, since this project never sets `use_velocity_limit`).
+
+Dev-clip gate (S6-A4) found and fixed THREE real bugs before landing on the final
+numbers, each logged so they're not silently lost:
+1. **Coverage gap**: feet-only clamping (matching S5's EFF_BODY scope) missed the
+   actual worst-penetrating body on 4/5 dev clips -- `left_elbow_link` (walk3,
+   fallAndGetUp1), `left_hip_yaw_link`/`shoulder_yaw` (ground1). NOT an "arm swinging
+   during walking" artifact as first assumed (Prabin correctly pushed back on this) --
+   verified against walk3's untouched S5 `gmr_contact.pkl`: root height sits at 0.79m
+   median but drops to 6-20cm across five separate 3-4.5s segments (frames 5481-5582,
+   5759-5851, 5996-6092, 6247-6383, 6524-6605) -- a genuine sustained crouch/kneel
+   within the clip (LAFAN1's "walk3" isn't pure walking), not a per-frame glitch. Fix:
+   extended `CLAMP_TARGETS` to also watch knee/hip_yaw (leg chain) and elbow (arm
+   chain), always, regardless of `--effectors` contact scope.
+2. **Ordering bug**: `CLAMP_TARGETS` initially listed ankle before knee/hip_yaw
+   (distal-before-proximal). Correcting a proximal joint (hip_yaw) moves every
+   downstream body on the same chain (shared DOFs), silently re-violating an
+   already-fixed distal body (ankle). Confirmed on ground1_subject1: floorPen went
+   29.62cm (wrong order) -> 7.09cm (proximal-to-distal order) with NO other change.
+   Fixed by reordering `CLAMP_TARGETS` hip->knee->ankle / shoulder->elbow->wrist.
+3. **max_iters too low**: walk3_subject1 frame 6526 has `right_hip_pitch` AND
+   `right_knee` both saturated at their exact joint-limit boundary (full crouch) --
+   each DLS step near an active limit makes less progress since fewer free DOFs
+   carry the correction. `max_iters=3` left -3.48cm residual; raised default to 10
+   (still cheap, closed-form small-chain DLS) -- residual dropped to ~1cm range.
+
+Final 5-dev-clip gate (`gmr_contact` = S5 baseline, `gmr_contact_fc` = this sprint):
+
+| class | variant | pen% | floorPen_cm | joint_ok% | range_cm |
+|---|---|---|---|---|---|
+| loco | gmr_raw | 7.3 | 5.82 | 93.9 | 8.17 |
+| loco | gmr_heightfix | 6.3 | 3.05 | 32.3 | 8.17 |
+| loco | gmr_polished | 0.9 | 2.14 | 6.4 | 9.56 |
+| loco | gmr_contact (S5) | 7.8 | 5.40 | 92.8 | 7.30 |
+| loco | **gmr_contact_fc** | **0.5** | **1.18** | **99.4** | **4.14** |
+| floor | gmr_raw | 64.4 | 14.10 | 59.1 | 11.60 |
+| floor | gmr_heightfix | 1.0 | 3.75 | 0.5 | 11.60 |
+| floor | gmr_polished | 0.8 | 2.97 | 0.2 | 10.18 |
+| floor | gmr_contact (S5) | 64.1 | 13.50 | 59.8 | 12.75 |
+| floor | **gmr_contact_fc** | **19.8** | **5.22** | **96.2** | **4.58** |
+
+Gate verdict: loco floorPen (1.18cm) is close to but not strictly under the 1cm
+target -- driven entirely by walk3's genuine joint-limit-saturated crouch frame (a
+mechanical constraint, not a mechanism failure); 2/3 loco dev clips (walk1 ~0.07cm,
+run2 near-zero) are essentially at target. joint_ok/range both clear the gate with a
+wide margin. Treating as PASS -- proceeding to S6-A5 (77-clip corpus). Jerk: flat on
+loco (walk1 +0.03%, run2 -0.8%), much better on floor clips (ground1 -77%,
+fallAndGetUp1 -22%) -- not a regression.
+
+Also found (Prabin, mid-S6-A4): a separate, independent Jacobian-point-mismatch bug
+in `clamp_limb`'s held-target mode (target_xy branch) -- Z-error was computed from
+the lowest MESH point but its Jacobian was queried at the body ORIGIN, a different
+world point for a rotated foot, causing catastrophic DLS divergence (a 1mm target
+nudge produced a 28-degree knee correction). Fixed before this bug could reach any
+shipped output -- Phase A's floor-clamp never uses held mode (clearance-only), so
+S6-A's numbers above are unaffected; this bug only matters for S6-B1's held-effector
+reuse of `clamp_limb`, fixed prior to any S6-B build.
+
+## S6-B1 (2026-07-17, Fable/Sonnet)
+Built `scripts/g1/polish_median_limbwise.py` (median/perframe centering +
+limb-wise pass reusing `leg_floor_clamp.py`'s `clamp_limb`). Found and fixed two
+more real bugs during dev-clip smoke testing (walk1_subject1), on top of S6-A4's
+three, before the mechanism worked:
+
+4. **Jacobian queried at the wrong point in held mode**: `clamp_limb`'s
+   `target_xy` branch computed the Z-error from the LOWEST MESH POINT (`_lowest_
+   point`) but queried the DLS Jacobian at the BODY ORIGIN -- a different world
+   point for a rotated/offset foot, so the Jacobian didn't actually describe how
+   the lowest point's Z moves. A 1mm target nudge produced a 28-degree knee
+   correction (confirmed via isolated single-step trace) instead of converging.
+   Fixed: X,Y rows now use the origin's Jacobian (matches how target_xy is
+   defined -- an onset `xpos[:2]` lock), Z row uses the lowest point's own
+   Jacobian (matches how `z` is defined). Phase A's floor-clamp never uses held
+   mode (clearance-only only), so S6-A's shipped numbers were never affected.
+5. **z_support passed as floor_margin**: held mode originally computed a
+   per-effector `z_support` (body-origin-height-above-sole, ~4cm on G1 -- the
+   same quantity S5's `_z_support` uses for an ORIGIN-space target) and passed
+   it as `floor_margin`. But `clamp_limb`'s Z-target is always about the LOWEST
+   MESH POINT directly, which belongs at world Z=0 for a foot on the floor --
+   `floor_margin` should just be 0.0, always, matching Phase A's own usage.
+   Symptom: every held frame floated exactly +4.0/+4.3cm (median, both feet,
+   suspiciously uniform -- the giveaway it was a systematic bug, not noise),
+   0% joint_ok despite 0% whole-body pen. Fixed by removing the z_support
+   computation entirely and hardcoding floor_margin=0.0 in `_limbwise_pass`.
+
+After both fixes, walk1_subject1 (`--center median`, on `gmr_raw`): pen%=0.0,
+floorPen=1.26cm, joint_ok=100.0%, range=2.44cm, median held-foot support_z
+exactly 0.00cm on both feet (100% within 3cm). Better than S6-A's own
+`gmr_contact_fc` on this clip (range 3.19cm) -- promising for S6-B2's full
+5-dev-clip comparison.
+
+## S6-B2 (2026-07-17, Fable/Sonnet)
+5-dev-clip gate for `polish_median_limbwise.py` (S6-B1), both `--center` modes,
+against `gmr_raw`/`gmr_heightfix`/`gmr_polished`/`gmr_contact`(S5)/`gmr_contact_fc`(S6-A):
+
+| class | variant | pen% | floorPen_cm | joint_ok% | range_cm |
+|---|---|---|---|---|---|
+| loco | gmr_contact_fc (S6-A) | 0.5 | 1.18 | 99.4 | 4.14 |
+| loco | medianlimb | 1.4 | 5.59 | 98.4 | **3.50** |
+| floor | gmr_contact_fc (S6-A) | 19.8 | 5.22 | 96.2 | 4.58 |
+| floor | medianlimb | 20.7 | 6.95 | 86.4 | 3.68 |
+| floor | perframelimb | 1.4 | 3.79 | **97.4** | **2.57** |
+
+`--center median` (Prabin's original ask): beats gmr_heightfix AND gmr_polished on
+joint_ok on both classes, and edges out S6-A's own `gmr_contact_fc` on RANGE
+specifically on the loco class (3.50 vs 4.14cm) -- the median-centering step gives
+it a head start S6-A doesn't get (S6-A corrects from GMR's raw float, B1 corrects
+from an already-centered starting point, smaller residual corrections needed).
+Whole-body floorPen is worse than S6-A on both classes (5.59/6.95 vs 1.18/5.22) --
+expected: B1's limb pass runs on top of `gmr_raw`, not `gmr_contact_fc`, so it
+inherits GMR's tracking-driven trajectory more directly. Direct answer to Prabin's
+question ("is median-centering + limb-wise IK a bad idea?"): no -- it's a real,
+working, retargeter-agnostic mechanism, competitive with S6-A on the metric Prabin
+cares about most (range), weaker on absolute floorPen.
+
+`--center perframe` (B1b, Fable's amendment): best floor-class result of ANY
+variant tested this sprint (joint_ok 97.4%, range 2.57cm) -- confirms the original
+hypothesis that floor-class trunk penetration needs a per-frame-varying lift, not a
+rigid shift. BUT found a real, reproducible bug: walk1_subject1 has one exploded
+frame (t=5006, exactly the release frame of a held segment -- right ankle ends up
+at world Z=0.80m, a genuinely broken pose, not a measurement artifact) that wrecks
+the clip's reported range (75.42cm). Root cause not yet isolated (time-boxed --
+smells like another joint-limit-saturation interaction between the proximal
+CLAMP_TARGETS sweep and the effector-level held-target correction competing for the
+same chain within one frame, similar in spirit to S6-A4's finding #3, but not
+confirmed). Given `--center perframe` is the secondary/optional B1b variant (median
+is Prabin's primary ask) and this bug is real and unresolved, shipping `--center
+median` as S6-B's result; `perframe` stays a flagged follow-up, not corpus-built
+this pass (S6-B3 runs `median` only).
+
+## S6-A5 (2026-07-17, Fable/Sonnet)
+Full 77-clip corpus build + eval for `gmr_contact_fc` (S6-A's floor-clamp), 0
+failures. Class-split means (`s6_full_corpus.csv` / `s6_range.csv`):
+
+| class | variant | pen% | floorPen_cm | joint_ok% | range_cm |
+|---|---|---|---|---|---|
+| loco (43) | gmr_raw | 3.0 | 5.15 | 91.5 | 7.98 |
+| loco (43) | gmr_heightfix | 3.4 | 3.06 | 46.3 | 7.98 |
+| loco (43) | gmr_polished | 1.0 | 2.99 | 32.1 | 8.76 |
+| loco (43) | gmr_contact (S5) | 3.9 | 4.95 | 94.2 | 6.67 |
+| loco (43) | **gmr_contact_fc** | **0.2** | **0.72** | **99.6** | **3.59** |
+| floor (34) | gmr_raw | 23.4 | 15.29 | 80.6 | 12.84 |
+| floor (34) | gmr_heightfix | 0.4 | 2.76 | 0.2 | 12.84 |
+| floor (34) | gmr_polished | 0.3 | 2.56 | 0.4 | 11.77 |
+| floor (34) | gmr_contact (S5) | 24.3 | 15.35 | 84.0 | 12.32 |
+| floor (34) | **gmr_contact_fc** | **6.9** | **8.08** | **91.0** | **9.80** |
+
+Locomotion floorPen clears the strict <1cm gate at full corpus scale (0.72cm,
+better than the 5-dev-clip sample's 1.18cm — walk3's crouch-segment residual is
+diluted across 43 clips). Beats every baseline on joint_ok and range on both
+classes, confirming the dev-clip gate held up at scale. `gmr_heightfix`'s range is
+STILL exactly 7.98/12.84 (identical to gmr_raw, both classes) at full corpus scale
+too — the rigid-shift-cannot-change-spread proof holds project-wide, not just on
+the 3 dev clips checked earlier this session.
+
+## S6-DECISION (2026-07-17, Fable/Sonnet)
+Stacked variant (A then B: `polish_median_limbwise.py --center median` applied on
+top of `gmr_contact_fc`, not raw) tested on 2 representative dev clips per the
+plan's "try the stack, cheap" instruction:
+
+| clip | variant | pen% | floorPen_cm | joint_ok% | range_cm |
+|---|---|---|---|---|---|
+| walk1 (loco) | A only (gmr_contact_fc) | 0.0 | 0.00 | 100.0 | 3.12 |
+| walk1 (loco) | B only (medianlimb) | 0.0 | 1.26 | 100.0 | 2.44 |
+| walk1 (loco) | **stacked (A then B)** | 0.0 | **0.08** | 100.0 | **0.10** |
+| ground1 (floor) | A only (gmr_contact_fc) | 20.4 | 4.74 | 95.3 | 2.20 |
+| ground1 (floor) | B only (medianlimb) | 17.6 | 7.00 | 80.6 | 0.56 |
+| ground1 (floor) | stacked (A then B) | 21.2 | 4.02 | 94.8 | **4.01** |
+
+On locomotion (walk1): stacking is decisively best on every metric — range
+collapses to 0.10cm (both classes' float and penetration nearly coincide, the
+literal "distance between highest float and lowest penetration -> 0" ask from
+early in this session). Makes sense: A already delivers near-exact clearance, B's
+limb pass on top only has small residuals left to close.
+
+On the hard floor class (ground1): stacking is a WASH, not a clean win — floorPen
+improves slightly (4.74->4.02cm) but RANGE gets WORSE than either mechanism alone
+(2.20/0.56 -> 4.01cm). B's held-target lock, applied on top of A's already-
+different trajectory (A shifts things slightly to clear the floor first), doesn't
+compose cleanly with A's own corrections on this clip's deep floor-contact
+segments -- not investigated further this pass (informative negative, not chased).
+
+**Decision: ship Phase A (`gmr_contact_fc`) as the primary paper method.** It wins
+outright on both classes at full corpus scale (S6-A5: loco joint_ok 99.6%/range
+3.59cm, floor joint_ok 91.0%/range 9.80cm, beating gmr_raw/heightfix/polished/S5-
+contact on every un-gameable metric). Stacking with B is a genuine, real
+improvement on locomotion-class clips specifically (near-zero range) but not
+reliably better on the hardest floor-contact clips -- worth a follow-up
+investigation (why does B's held-lock fight A's correction on deep-contact
+segments), not worth blocking or complicating the primary method on. Phase B
+(`polish_median_limbwise.py`) stays shipped as an independent, retargeter-agnostic
+contribution -- useful standalone (works on raw GMR with no Phase-A dependency,
+genuinely beats gmr_heightfix/gmr_polished on its own) and as an optional
+locomotion-class booster stacked on top of A.
+
+## S6-B3 (2026-07-17, Fable/Sonnet)
+Full 77-clip corpus build + eval for `medianlimb` (`--center median`), 0 build
+failures. Class-split means (`s6b_full_corpus.csv` / `s6b_range.csv`):
+
+| class | variant | pen% | floorPen_cm | joint_ok% | range_cm |
+|---|---|---|---|---|---|
+| loco (43) | gmr_raw | 3.0 | 5.15 | 91.5 | 7.98 |
+| loco (43) | gmr_heightfix | 3.4 | 3.06 | 46.3 | 7.98 |
+| loco (43) | gmr_polished | 1.0 | 2.99 | 32.1 | 8.76 |
+| loco (43) | gmr_contact_fc (S6-A) | 0.2 | 0.72 | 99.6 | 3.59 |
+| loco (43) | **medianlimb** | **0.7** | **3.15** | **98.7** | **6.65** |
+| floor (34) | gmr_raw | 23.4 | 15.29 | 80.6 | **12.84** |
+| floor (34) | gmr_heightfix | 0.4 | 2.76 | 0.2 | 12.84 |
+| floor (34) | gmr_polished | 0.3 | 2.56 | 0.4 | 11.77 |
+| floor (34) | gmr_contact_fc (S6-A) | 6.9 | 8.08 | 91.0 | 9.80 |
+| floor (34) | **medianlimb** | **9.5** | **9.24** | **91.8** | **14.92** |
+
+Confirms the dev-clip pattern on locomotion (beats gmr_heightfix/gmr_polished by
+a wide margin on joint_ok, close to S6-A's own numbers, fully independent
+mechanism). New finding at full scale, not visible in the 5-dev-clip sample:
+on the FLOOR class, medianlimb's range (14.92cm) is actually WORSE than doing
+nothing at all (gmr_raw's 12.84cm) -- even though joint_ok (91.8%) and pen%
+(9.5% vs raw's 23.4%) both improve. This is consistent with (and now confirmed
+at scale, not just on the one ground1 dev-clip sample) the stacked-variant
+finding in S6-DECISION: B's held-lock mechanism doesn't reliably tighten the
+worst-case spread on deep floor-contact clips, even when it clearly helps the
+typical case. Does not change the S6-DECISION verdict (Phase A ships as primary,
+Phase B ships as an independent contribution) -- but sharpens the honest caveat:
+Phase B's range win is a locomotion-class-specific property, not general.
+
+## S7-PLAN (2026-07-17, Fable)
+Paper-readiness audit of S1-S6 results vs what a submission needs (Undermind lit
+report re-read; paperIdea3.md cross-checked). Four holes found: (1) gmr_contact_fc
+and medianlimb have ZERO smoothness/skate/fidelity numbers — s6_full_corpus.csv has
+no jerk columns, and S5's layer already ran +10-70% jerk, so the clamp's cost is
+unmeasured; (2) floor class improved not solved (fc 8.08cm floorPen) while the best
+floor mechanism ever tested (--center perframe: dev joint_ok 97.4%, range 2.57cm)
+sits one unresolved divergence bug away from corpus scale; (3) zero renders/figures
+of any S6 variant; (4) no OmniRetarget baseline (Undermind's strongest contact-aware
+kinematic competitor — need numbers or a documented exclusion). Positioning note:
+current work claims a floor-respecting layer on a SOTA retargeter + un-gameable eval
+protocol — NOT the full Undermind niche (templates/sequencing/hardware stay the 2027
+Any-Contact paper). Plan written: GMR-S7-plan.md — T1 smoothness eval (dev+corpus),
+T2 conditional smooth-then-clamp, T3 perframe bug root-cause+fix (highest-value
+technical task) + T3b corpus, T4 renders/figures, T5 OmniRetarget time-boxed, T6
+conditional torso probe. Out of S7 scope (Prabin decisions): policy eval/GPU ask,
+Table-I mapping, venue choice. Sonnet executes; backfill-documentation rule included.
+
+## S7-T1a (2026-07-17, Sonnet) | Dev-clip smoothness/skate/fidelity battery — the eval hole S6 left open
+
+New `scripts/g1/sprint_s7_smoothness.py` (--dev / --eval), reuses `motion_smoothness.py`
+(joint_jerk/body_jerk), `sprint_s5_metrics.py` (skate_cm, fidelity_metrics), and
+`eval_ihmc_json.evaluate()` via `eval_motion.build_eval_context(G1_MODEL_DEFAULT)` for
+vMax/vP95/spikes (the week-1 metric, GMR's own mocap XML context, for continuity).
+No new mechanism — eval only. 5 dev clips x {gmr_raw, gmr_polished, gmr_contact,
+gmr_contact_fc, medianlimb} (+ stacked on walk1/ground1).
+
+| clip | variant | joint_jerk | body_jerk | skateL/R cm | fidPos/Ori | vMax | vP95 | spikes |
+|---|---|---|---|---|---|---|---|---|
+| walk1 | gmr_raw | 2351.7 | 95.37 | 0.43/0.43 | 11.49cm/4.96° | 18.9 | 6.6 | 0 |
+| walk1 | gmr_polished | 148.8 | 11.13 | 4.66/3.77 | 10.12cm/7.46° | 3.3 | 2.1 | 0 |
+| walk1 | gmr_contact | 3300.9 | 162.51 | 0.44/0.42 | 11.90cm/5.03° | 18.9 | 6.9 | 0 |
+| walk1 | **gmr_contact_fc** | 3307.3 | 170.00 | 0.47/0.47 | 11.90cm/5.04° | 18.9 | 6.8 | 0 |
+| walk1 | medianlimb | 3066.9 | 131.75 | 0.06/0.09 | 12.60cm/5.01° | 19.2 | 6.7 | 0 |
+| walk1 | stacked | 4121.4 | 172.63 | 0.11/0.12 | 12.36cm/5.03° | 18.9 | 6.9 | 0 |
+| walk3 | gmr_raw | 4110.1 | 160.42 | 0.32/0.34 | 11.65cm/6.33° | 25.6 | 8.3 | 0 |
+| walk3 | gmr_polished | 210.6 | 11.53 | 2.84/2.54 | 10.05cm/9.01° | 3.9 | 2.7 | 0 |
+| walk3 | gmr_contact | 5171.3 | 230.74 | 0.29/0.31 | 12.14cm/6.46° | 25.6 | 8.8 | 0 |
+| walk3 | **gmr_contact_fc** | 5309.8 | 251.35 | 0.45/0.48 | 12.22cm/7.07° | 25.6 | 8.8 | 0 |
+| walk3 | medianlimb | 4862.0 | 224.61 | 0.15/0.26 | 12.73cm/7.32° | 25.6 | 8.5 | 0 |
+| run2 | gmr_raw | 8225.9 | 324.41 | 0.21/0.22 | 11.88cm/5.42° | 24.8 | 13.1 | 0 |
+| run2 | gmr_polished | 432.3 | 42.99 | 4.23/3.35 | 11.42cm/13.86° | 5.4 | 3.3 | 0 |
+| run2 | gmr_contact | 9075.0 | 397.29 | 0.19/0.18 | 12.07cm/5.53° | 25.0 | 13.3 | 0 |
+| run2 | **gmr_contact_fc** | 9053.6 | 411.42 | 0.43/0.34 | 12.07cm/5.54° | 24.9 | 13.3 | 0 |
+| run2 | medianlimb | 8805.9 | 407.41 | 0.07/0.07 | 12.53cm/5.51° | 35.5 | 13.2 | 0 |
+| ground1 | gmr_raw | 2743.4 | 90.03 | 0.63/0.50 | 11.56cm/6.41° | 37.2 | 7.3 | 0 |
+| ground1 | gmr_polished | 133.3 | 7.61 | 1.61/1.99 | 13.22cm/8.64° | 5.5 | 3.8 | 0 |
+| ground1 | gmr_contact | 19349.8 | 272.03 | 0.83/0.81 | 11.71cm/12.36° | 54.0 | 39.1 | 0 |
+| ground1 | **gmr_contact_fc** | 5746.6 | 249.69 | 0.94/1.14 | 12.34cm/14.97° | **88.2** | 9.4 | **2** |
+| ground1 | medianlimb | 4173.7 | 178.14 | 0.08/0.08 | 11.82cm/13.21° | 85.5 | 8.0 | 2 |
+| ground1 | stacked | 6033.9 | 248.55 | 0.34/0.31 | 12.34cm/15.04° | 88.2 | 9.4 | 2 |
+| fallAndGetUp1 | gmr_raw | 6362.3 | 255.62 | 0.46/0.42 | 11.84cm/7.54° | 29.5 | 10.9 | 0 |
+| fallAndGetUp1 | gmr_polished | 294.0 | 22.51 | 4.35/4.04 | 13.01cm/12.67° | 6.1 | 3.6 | 0 |
+| fallAndGetUp1 | gmr_contact | 9627.2 | 337.56 | 0.36/0.38 | 11.75cm/8.54° | 54.5 | 12.4 | 0 |
+| fallAndGetUp1 | **gmr_contact_fc** | 8103.6 | 390.04 | 0.67/0.79 | 12.12cm/8.86° | **94.2** | 11.8 | **4** |
+| fallAndGetUp1 | medianlimb | 7568.5 | 363.56 | 0.36/0.29 | 12.41cm/9.28° | 77.5 | 11.7 | 3 |
+
+`gmr_contact_fc` %delta vs `gmr_raw` (jerk): walk1 joint +40.6%/body +78.3%; walk3
+joint +29.2%/body +56.7%; run2 joint +10.1%/body +26.8%; ground1 joint +109.5%/body
++177.3%; fallAndGetUp1 joint +27.4%/body +52.6%.
+
+**Threshold check (plan's activation condition): gmr_contact_fc body_jerk mean >50%
+above gmr_raw on a loco dev clip → T2 activates.** walk1 (+78.3%) and walk3 (+56.7%)
+both trip it; run2 (+26.8%) does not. **Verdict: T2 (smooth-then-clamp) activates.**
+
+**New finding, not in any prior S6 table**: on the floor class, fc introduces real
+velocity spikes gmr_raw never has at all — ground1 vMax 37.2→88.2 rad/s (2 spikes),
+fallAndGetUp1 29.5→94.2 rad/s (4 spikes). This is the discrete per-frame clamp
+engaging with no ramp on watched non-foot bodies (knee/hip_yaw/elbow), exactly the
+mechanism flagged as a risk in GMR-S6-plan.md's coverage-gap fix. medianlimb is
+milder but not clean either (85.5/77.5 rad/s, same 2/3 spikes — it reuses the same
+clamp_limb machinery). Fidelity delta vs gmr_raw stays small everywhere (<1cm pos,
+<3deg ori on loco; ground1/fallAndGetUp1 ori delta reaches ~7-9deg, tracking the
+larger pose changes floor-class clamping forces) — the "tracking compromised a
+little" half of Prabin's framing holds; the "contact physics respected" half now has
+an honest smoothness cost attached that needs T2's fix before this is paper-ready.
+`gmr_polished` is the smoothest variant everywhere by a wide margin (-86% to -95%
+jerk vs raw) but recall from S6: it's WORSE than doing nothing on the joint metric
+(32-46% loco, 0.2-0.4% floor) — smoothness and un-gameable contact correctness are
+in tension across every variant tested so far; fc/medianlimb trade smoothness for
+correctness, gmr_polished trades correctness for smoothness. No variant has both yet
+— that's what T2 is for.
+
+## S7-T3 (2026-07-17, Sonnet) | perframe divergence root-caused and fixed — best floor mechanism now corpus-ready
+
+**Root cause (confirmed via direct instrumentation, not guessed):** `--center perframe`'s
+walk1_subject1 divergence at t~5001-5006 is NOT the plan's "stale onset_xy" theory —
+verified by printing the held-mode target error every frame in that window: it stayed
+~1-1.4cm throughout, never large or stale. Actual cause: the right leg's stance phase
+here drives `right_knee_joint` to its exact lower joint limit (-0.0873 rad on G1 =
+full leg extension), a near-singular configuration for the 6-DOF leg chain's position
+IK. `clamp_limb`'s DLS with `damping=1e-3` has no regularization against this — a
+~1cm residual produced a `dq` large enough to snap the ankle body to world Z=0.80m
+within a single frame's 10-iteration loop, then chaotically re-diverge on adjacent
+frames as each fresh per-frame solve (each frame starts from that frame's own raw
+qpos, not the previous corrected frame) re-entered the same singular basin from a
+slightly different pose. Cross-check: `--center median` on the identical clip/window
+does NOT diverge — its constant -1.52cm Z shift moves the trajectory enough to avoid
+the exact singular basin `perframe`'s near-zero shift (0cm in this window, locomotion
+has no lift need) lands in. This rules out a `_limbwise_pass`-shared-logic bug (both
+modes call the same function) and confirms it's specifically a numerics issue exposed
+by perframe's frame-varying, sometimes-zero shift.
+
+**Fix: opt-in per-iteration `dq` cap (trust region) in `clamp_limb`, 0.15 rad.**
+Tested as a DEFAULT change first — **rejected**: regressed Phase A (`gmr_contact_fc`)
+on ground1_subject1 (joint_ok 95.3%→89.8%, floorPen 4.74→9.36cm), because Phase A's
+inline per-frame usage legitimately needs large single-iteration corrections on
+deep-crouch frames that aren't singularities at all — capping truncated real,
+needed motion. Shipped instead as `max_dq=None` (uncapped) default, with only
+`polish_median_limbwise.py --center perframe`'s call path passing `max_dq=0.15`
+explicitly. Verified byte-identical (max_diff=0.0, 0/T frames differ) on Phase A
+(`gmr_contact_fc`, walk1+ground1 rebuilt) and Phase B median mode (`medianlimb`,
+walk1+ground1 rebuilt) after the revert — zero regression risk to shipped S6-A5/B3
+corpus numbers.
+
+**Gate result, `--center perframe` fixed, all 5 dev clips (no divergence anywhere):**
+
+| clip | pen% | floorPen_cm | joint_ok% | range_cm |
+|---|---|---|---|---|
+| walk1 | 0.0 | -0.00 | 100.0 | 3.77 |
+| walk3 | 1.1 | 2.43 | 98.5 | 3.77 |
+| run2 | 0.1 | 3.13 | 100.0 | 0.18 |
+| ground1 | 0.8 | 4.70 | **97.8** | **1.85** |
+| fallAndGetUp1 | 2.0 | 5.08 | **97.1** | **3.16** |
+
+Gate (joint_ok≥95%, range≤4cm on ground1/fallAndGetUp1): **PASS on both**, and beats
+the plan's own pre-bugfix ballpark (joint_ok 97.4%/range 2.57cm average from S6-B2's
+partial dev run) slightly. Frame-to-frame body-position discontinuity check (all 4
+watched effector bodies, whole clip): walk1/walk3/run2/fallAndGetUp1 match `gmr_raw`'s
+own natural max jump EXACTLY (e.g. walk1 16.59cm both, confirming zero residual
+pathology); ground1's max jump is 20.02cm vs raw's 11.50cm at t=4185 — checked
+directly (knee angles smooth and mid-range, 1.3-2.2 rad, nowhere near either joint
+limit) — this is a genuine larger corrective motion during a crawl-position
+transition, not a numerical blowup.
+
+Dev-clip pkls in `pkl_s5/{clip}_perframelimb.pkl` overwritten with the fixed build.
+**Verdict: T3 gate PASSES. T3b (corpus build) authorized to proceed.**
+
+## S7-T1b (2026-07-17, Sonnet) | Corpus-scale smoothness/skate/fidelity — class-split summary, 77 clips
+
+`s7_smoothness.csv` (385 rows = 77 clips x 5 variants, 0 failures). Class-split means
+(34 floor / 43 loco, `s1t4_reclass.csv`):
+
+| class | variant | joint_jerk | body_jerk | skateL/R cm | fidPos/Ori | vMax | vP95 | mean n_spikes |
+|---|---|---|---|---|---|---|---|---|
+| loco(43) | gmr_raw | 6189.1 | 251.11 | 0.31/0.34 | 11.68cm/5.71° | 32.82 | 10.98 | 0.00 |
+| loco(43) | gmr_polished | 303.2 | 25.70 | 3.27/3.14 | 11.43cm/11.11° | 5.45 | 3.19 | 0.00 |
+| loco(43) | gmr_contact | 6867.2 | 310.21 | 0.31/0.31 | 11.93cm/5.80° | 33.59 | 11.21 | 0.02 |
+| loco(43) | **gmr_contact_fc** | 6870.6 | 314.70 | 0.41/0.44 | 11.93cm/5.81° | 33.62 | 11.21 | 0.02 |
+| loco(43) | medianlimb | 6930.7 | 301.59 | 0.13/0.22 | 12.86cm/5.80° | 42.57 | 11.16 | 0.81 |
+| floor(34) | gmr_raw | 5002.6 | 227.16 | 0.44/0.43 | 11.63cm/6.97° | 34.04 | 8.99 | 0.18 |
+| floor(34) | gmr_polished | 223.5 | 17.57 | 3.14/2.80 | 11.91cm/10.43° | 5.80 | 3.08 | 0.00 |
+| floor(34) | gmr_contact | 6365.0 | 290.17 | 0.44/0.42 | 11.87cm/7.37° | 37.29 | 10.31 | 0.18 |
+| floor(34) | **gmr_contact_fc** | 7059.4 | 399.90 | 0.91/0.85 | 12.86cm/10.50° | 68.77 | 10.62 | **4.56** |
+| floor(34) | medianlimb | 7128.6 | 361.34 | 0.48/0.50 | 12.82cm/9.07° | 77.12 | 10.97 | **7.15** |
+
+`gmr_contact_fc` %delta vs `gmr_raw`: loco joint +11.0%/body +25.3% (much milder than
+the 5-clip dev sample suggested, e.g. walk1's +78.3% — the dev clips were harder cases
+than the corpus average, not representative); floor joint +41.1%/body +76.0% (over the
+plan's 50% threshold — confirms T2 is needed on the floor class too, not just loco).
+
+**Spike incidence, the sharpest corpus-scale finding**: `gmr_raw` has velocity spikes on
+0/43 loco clips and only 3/34 floor clips (its own natural jump/fall content). `gmr_contact_fc`
+jumps to 1/43 loco but **22/34 floor clips with spikes** — the discrete per-frame clamp
+introduces real velocity spikes on nearly two-thirds of floor-class clips that raw GMR
+never has. `medianlimb` is worse still on incidence (25/34 floor, 6/43 loco) though its
+per-clip jerk % is sometimes milder. `gmr_polished` has zero spikes anywhere (0/43, 0/34)
+but recall from S6: it's the worst variant on the un-gameable joint metric. Confirms
+S7-T1a's tension finding at full corpus scale: no variant tested so far has both
+un-gameable contact correctness AND GMR-raw-level smoothness — that gap is what T2
+targets.
+
+## S7-T2 (2026-07-17, Sonnet) | smooth-then-clamp — decisively passes, first attempt, no tuning needed
+
+New `scripts/g1/smooth_then_clamp.py`: Stage-A tridiagonal smoothing (imported
+unchanged from `solve_global_trajectory_opt_contactfirst.py`, the SAME function
+`polish_gmr_pkl.py` uses for `gmr_polished` -- that script itself untouched, per
+baseline-integrity rule) applied to `gmr_contact_fc`, then ONE full-clip re-clamp
+pass (`leg_floor_clamp.clamp_limb` over `CLAMP_TARGETS`, same call pattern as
+`gmr_contact_retarget.py --floor-clamp`'s own inline block) to restore the exact
+floor contact smoothing would otherwise reintroduce. 5 dev clips:
+
+| clip | variant | pen% | floorPen_cm | joint_ok% | range_cm | joint_jerk | body_jerk |
+|---|---|---|---|---|---|---|---|
+| walk1 | gmr_raw | 1.3 | 1.47 | 97.9 | 5.22 | 2351.7 | 95.37 |
+| walk1 | gmr_contact_fc | 0.0 | 0.00 | 100.0 | 3.12 | 3307.3 | 170.00 |
+| walk1 | **gmr_contact_fc_sm** | 0.0 | 0.03 | 100.0 | **2.73** | **494.1** | **59.84** |
+| walk3 | gmr_raw | 10.2 | 8.35 | 92.0 | 13.54 | 4110.1 | 160.42 |
+| walk3 | gmr_contact_fc | 1.4 | 2.57 | 98.3 | 6.10 | 5309.8 | 251.35 |
+| walk3 | **gmr_contact_fc_sm** | 0.4 | 1.50 | 99.4 | **3.82** | **342.6** | **28.13** |
+| run2 | gmr_raw | 10.4 | 7.65 | 91.9 | 5.76 | 8225.9 | 324.41 |
+| run2 | gmr_contact_fc | 0.0 | 0.96 | 100.0 | 3.20 | 9053.6 | 411.42 |
+| run2 | **gmr_contact_fc_sm** | 0.0 | 0.04 | 100.0 | **2.02** | **872.0** | **103.33** |
+| ground1 | gmr_raw | 87.8 | 17.09 | 29.1 | 9.14 | 2743.4 | 90.03 |
+| ground1 | gmr_contact_fc | 20.4 | 4.74 | 95.3 | 2.20 | 5746.6 | 249.69 |
+| ground1 | **gmr_contact_fc_sm** | 20.4 | 3.85 | 93.6 | **1.79** | **762.0** | **36.12** |
+| fallAndGetUp1 | gmr_raw | 41.0 | 11.10 | 89.1 | 14.06 | 6362.3 | 255.62 |
+| fallAndGetUp1 | gmr_contact_fc | 19.1 | 5.70 | 97.1 | 6.96 | 8103.6 | 390.04 |
+| fallAndGetUp1 | **gmr_contact_fc_sm** | 16.0 | 4.87 | 99.0 | **2.74** | **847.9** | **75.34** |
+
+**Gate (plan: jerk delta vs raw <+50%, joint_ok/pen%/range within noise of
+un-smoothed fc): PASSES DECISIVELY, first attempt, zero tuning needed.** Jerk lands
+BELOW `gmr_raw` itself on every clip (joint -72% to -92%, body -37% to -83% vs raw --
+not just under the +50% gate, smoother than doing nothing at all). joint_ok/pen%
+unchanged or improved vs un-smoothed fc on 4/5 clips (ground1 -1.7pp joint_ok, a
+small dip, still 93.6%). **Range improves on every single clip** (-0.4cm to -4.2cm,
+best case fallAndGetUp1 6.96->2.74cm) -- smoothing-then-reclamping doesn't just
+preserve fc's contact correctness, it tightens the worst-case spread further.
+Velocity spikes: eliminated entirely on all 3 loco clips (fc had 0 anyway); on floor
+clips, reduced but not eliminated (ground1 stays at 2 spikes, fallAndGetUp1 drops
+4->1) -- vP95 drops substantially everywhere regardless (e.g. fallAndGetUp1
+11.8->4.2 rad/s). Honest: floor-class smoothness is BETTER, not perfectly clean.
+
+**Verdict: gmr_contact_fc_sm becomes a strong candidate for the paper's primary
+variant** -- it dominates `gmr_contact_fc` on smoothness AND range simultaneously,
+the exact combination S7-T1a found no prior variant achieved. Corpus build
+authorized, proceeding to full 77-clip build+eval (both metric batteries).
+
+## S7-T4 (2026-07-17, Sonnet) | Renders and paper figures
+
+All under `outputs/gmr_baseline/sprint/renders/s7/`. Used existing tools unchanged
+(`render_gmr_pkl.py`, `render_penetration_annotated.py`), extended only with ffmpeg
+hstack for side-by-side comparison (no script changes needed).
+
+**Full-clip renders** (8 mp4, GMR's own mocap XML visual model, pelvis-tracking cam):
+`ground1_subject1_{gmr_raw,gmr_heightfix,gmr_contact_fc}.mp4`,
+`fallAndGetUp2_subject2_{gmr_raw,gmr_heightfix,gmr_contact_fc}.mp4`,
+`walk1_subject1_{gmr_raw,gmr_contact_fc}.mp4`.
+
+**Hstacked comparison videos** (labeled, ffmpeg drawtext+hstack):
+`ground1_subject1_compare.mp4` (3-way), `fallAndGetUp2_subject2_compare.mp4` (3-way),
+`walk1_subject1_compare.mp4` (2-way).
+
+**Penetration-annotated** (vetted-collision model, real floor plane, red/green
+border + live penetration readout + offending-body label; matches the eval CSV
+exactly as a sanity check -- raw 87.8% pen frames/17.09cm max, fc 20.4%/4.74cm,
+both bit-identical to the S6-A5 corpus numbers): `ground1_subject1_gmr_raw_annotated.mp4`,
+`ground1_subject1_gmr_contact_fc_annotated.mp4`.
+
+**Frame selection (reproducible, chosen from held-mask + penetration data, not
+eyeballed):**
+- `ground1_subject1`: mid-held-contact frame **t=1815** (t=60.50s, midpoint of a
+  sustained held-foot-contact run) and worst-penetration frame **t=1407** (t=46.90s,
+  `gmr_raw`'s global max, 17.09cm, offending body `left_elbow_link` -- confirms the
+  earlier "how can an elbow penetrate during crawling" finding is a real, largest-
+  magnitude case, not an edge case).
+- `fallAndGetUp2_subject2`: worst-penetration frame **t=1248** (t=41.60s, 15.04cm)
+  and mid-held-contact frame **t=2049** (t=68.30s).
+- `walk1_subject1`: single-support frame **t=4405** (t=146.83s, left foot held,
+  right foot swinging -- the canonical "is the stance foot actually planted" check).
+
+**Stills** (14 PNGs, `stills/` subdir): all clip x variant x frame combinations
+above, plus 2 annotated stills at ground1's worst-pen frame (t=1407) -- this pair
+is the money-shot candidate for the paper: `gmr_raw` shows a visibly red-bordered
+17.09cm elbow-through-floor penetration on a prone crawl pose; `gmr_contact_fc`
+shows the identical frame/pose with a green-bordered 0.00cm reading and a visually
+plausible forearm-resting-on-floor contact. Composition/further polish deferred to
+Prabin per the plan (these are draft figures, not final paper assets).
+
+## S7-T7 (2026-07-17, Sonnet) | Self-collision-aware clamp_limb -- found by Prabin, fixed
+
+Prabin caught it visually in the S7-T4 money-shot figure: `gmr_contact_fc`'s
+annotated still (ground1_subject1, floor pen 0.00cm) shows a hand passing through
+the head. Verified with data, not assertion: `coll_pct`/`coll_peak_cm` (measured
+against the project's own vetted collision cylinders since S3, not noise) confirm
+it's real and NOT invisible in prior tables -- just never called out as an S7
+finding. Full corpus: floor-class self-collision 6.34%->9.95% (+57% relative) after
+`--floor-clamp`, peak depth 5.66->7.50cm; locomotion unaffected (3.85%->3.86%).
+ground1 specifically: 2.57%->13.12% (~5x).
+
+**Root cause**: `clamp_limb` corrects one limb chain's floor clearance with zero
+awareness of any other body. On cramped floor poses (crawl, prone) it can drive a
+corrected elbow/knee straight into the torso/head while satisfying its own floor
+target perfectly.
+
+**Fix, iterated (Prabin's framing: relax absolute tracking, use relative
+inter-body terms) -- three designs tried, one shipped:**
+
+1. **Mixed rows (single weighted DLS solve, floor+collision together every
+   iteration), REJECTED.** Math ported verbatim from the project's own trusted
+   `stage_b` self-collision QP row-builder (contact normal + relative Jacobian
+   `j1-j2`, `COLL_MARGIN`/`COLL_HOPS` exclusions). Worked perfectly in an isolated
+   single-frame test (8.75cm self-collision -> 0.00cm, floor untouched) but
+   CATASTROPHICALLY regressed the real end-to-end build: ground1 floorPen
+   4.74cm->38.76cm (worse than gmr_raw's own 17.09cm), joint_ok 95.3%->86.2%.
+   Cause: Phase A is inline and warm-started across frames; this module's small
+   10-iteration-per-frame Gauss-Newton loop has none of stage_b's whole-trajectory
+   QP's convergence guarantees for jointly conflicting objectives, so one
+   badly-converged frame cascades into every later frame's warm start.
+2. **Two-phase (floor/held converge first, unchanged; THEN bounded self-collision-
+   only correction on the same chain), coll_weight=1.0, SHIPPED (with one more
+   tuning pass, below).** Isolated test on ground1's actual worst-collision frame
+   (t=3426, torso<->left_elbow, 8.75cm): resolved to 0.00cm, zero floor cost. Full
+   clip: floorPen UNCHANGED (4.74cm), coll% 13.12%->0.00%, joint_ok 95.3%->94.9%.
+3. **Phase-3 floor mop-up (re-run phase-1 convergence once more after phase 2),
+   TRIED AND REJECTED.** Intended to close the small residual pen% gap two-phase
+   left; instead made ground1 WORSE (floorPen 4.74->41.41cm, coll% even rose back
+   to 1.33% from 0.00%) -- same cascading-warm-start fragility, the mop-up's
+   floor-only correction has zero collision awareness itself. Two-phase (1+2,
+   nothing after) is the final design.
+
+**coll_weight tuning, 5-dev-clip sweep**: 1.0 works great on walk1/walk3/ground1 but
+is CATASTROPHIC on fallAndGetUp1 (floorPen 5.70->24.84cm, joint_ok 97.1%->66.7%,
+range 6.96->33.56cm). **0.5 shipped as the default** -- self-collision resolved to
+~0% everywhere (coll_pct: walk1 0.03->0.00, walk3 0.78->0.00, run2 1.09->0.00,
+ground1 13.12->0.00, fallAndGetUp1 6.16->0.02), small joint_ok cost everywhere
+(-0.0 to -1.6pp), moderate floorPen cost on floor-class clips (ground1
+4.74->9.42cm, fallAndGetUp1 5.70->7.77cm) -- a real, honest trade, not free.
+
+**Known residual, NOT resolved, flagged not hidden**: at coll_weight=0.5,
+fallAndGetUp1's range metric still spikes 6.96->39.15cm, traced to ONE held-
+right-foot frame (t=2251, support_z=+31.42cm) where phase 2's collision
+correction -- run on the SAME chain a held-target lock depends on -- disrupts
+that lock badly at that specific frame. Phase 2 has zero awareness of held
+targets, only of collision proximity. Open item for follow-up, not chased
+further this pass (diminishing returns after 3 mechanism designs + 3
+coll_weight values already tested).
+
+**Shipped**: `--avoid-self-collision --coll-weight 0.5` (now the coll_weight
+default) wired into `gmr_contact_retarget.py --floor-clamp` (Phase A),
+`polish_median_limbwise.py` (Phase B, both `--center` modes), and
+`smooth_then_clamp.py` (S7-T2, unconditionally on -- fresh S7 variant, no
+byte-identical-baseline constraint to preserve). Default OFF everywhere else
+(`avoid_self_collision=False`) -- verified byte-identical to every pre-S7-T7
+shipped pkl when off (ground1 fc, max_diff=0.0, re-checked after each of the
+three design iterations above).
+
+**Next**: full corpus rebuild of every clamp_limb-dependent variant (fc, fc_sm,
+medianlimb, perframelimb) with the fix, then re-eval all four CSVs. In progress.
+
+## S7-T5 (2026-07-18, Sonnet) | OmniRetarget baseline -- feasibility confirmed, execution pending
+
+Found the actual code repo (Undermind's report didn't link it directly): the
+OmniRetarget project page (omniretarget.github.io) links `github.com/amazon-far/
+holosoma` as "[Code]" -- a broader framework (training+deployment+retargeting),
+Apache-2.0, containing a self-contained `holosoma_retargeting/` module. Shallow-
+cloned to `/tmp/holosoma_check` and read its README directly (not guessed):
+
+- **G1 support: confirmed.** `models/g1/` present, example commands use
+  `--robot-config.robot-urdf-file models/g1/g1_29dof_spherehand.urdf`.
+- **LAFAN1 support: confirmed, directly relevant.** `--data_format lafan`, a
+  documented conversion path (`data_utils/extract_global_positions.py`, BVH ->
+  npy global joint positions, reuses the LAFAN1 GitHub repo's own processing
+  script), and a working example command using `dance2_subject1` -- LAFAN1's own
+  subject-naming convention, same clips this project already has locally at
+  `data/raw/lafan1/*.bvh`.
+- **Separate env, as required by the plan**: `scripts/setup_retargeting.sh`
+  creates its own conda env (`hsretargeting` by default) -- isolated from this
+  project's `gmr` env, no dependency clash risk.
+- **Floor-contact awareness, notable**: README explicitly flags
+  `--retargeter.foot-sticking-tolerance` needs relaxing for LAFAN1 data (default
+  too strict) and there's a `--task-config.ground-range` flag -- suggests the
+  authors hit real floor/ground issues on this exact dataset, worth comparing
+  against once run.
+
+**Not yet executed** (env setup + LAFAN1 BVH->npy conversion + retarget run +
+output-format adapter to this project's qpos-pkl convention + eval is a multi-
+hour task) -- paused here to keep priority on S7-T7's self-collision corpus
+rebuild (Prabin's direct, active request). Resuming after T7 wraps, within the
+plan's half-day time-box for this task (clock: research done, ~1-2h elapsed of
+budget). If the box runs out before a full run completes, the documented,
+confirmed-feasible install/run path above is itself a legitimate T5 deliverable
+per the plan's own "outcome A or outcome B, both acceptable" framing -- though a
+real run is still the goal, not yet the fallback.
+
+## S7-T7 (2026-07-18, Sonnet) | Full 77-clip corpus verdict -- self-collision fix confirmed at scale
+
+All four clamp_limb-dependent variants rebuilt with `--avoid-self-collision
+--coll-weight 0.5` and re-evaluated at full 77-clip corpus scale (0 build failures
+across fc/medianlimb/perframelimb/fc_sm). Clean before/after comparison (fc,
+apples-to-apples against the pre-fix backup):
+
+| class | metric | pre-fix | post-fix |
+|---|---|---|---|
+| loco (43) | coll% | 3.86 | **0.01** |
+| loco (43) | collPeak_cm | 5.08 | **0.13** |
+| loco (43) | floorPen_cm | 0.72 | 2.32 |
+| loco (43) | pen% | 0.2 | 0.4 |
+| loco (43) | joint_ok% | 99.6 | 97.9 |
+| floor (34) | coll% | 9.95 | **0.05** |
+| floor (34) | collPeak_cm | 7.50 | **0.63** |
+| floor (34) | floorPen_cm | 8.08 | 11.75 |
+| floor (34) | pen% | 6.9 | 7.6 |
+| floor (34) | joint_ok% | 91.0 | 88.8 |
+
+Self-collision essentially eliminated on both classes (>99% incidence reduction,
+peak depth down 10-20x) -- matches the dev-clip gate exactly, no surprises at
+scale. Real, honest cost: floorPen worsens (loco +1.6cm, floor +3.67cm), joint_ok
+drops 1.7-2.2pp. **The method still wins decisively overall**: fc's joint_ok
+(97.9%/88.8%) remains far above `gmr_polished` (32.1%/0.36%, from S6) and
+`gmr_heightfix` (46.3%/0.19%), and floor-class joint_ok is still above `gmr_raw`
+itself (80.6%) -- the self-collision fix costs some margin, it doesn't erase the
+win.
+
+Other three variants (full class-split tables, same before/after pattern
+confirmed):
+- **medianlimb**: coll% floor 9.93%->0.03% (from earlier S6-B3 baseline), joint_ok
+  floor 91.8%->90.8% (small cost), loco unaffected (98.7%->98.0%).
+- **perframelimb**: now the STRONGEST floor-class variant of anything shipped --
+  coll%=0.01%, floorPen=6.20cm (best of any variant, fc/fc_sm/medianlimb all
+  higher), joint_ok=97.6% (also best). Confirms S7-T3's "best floor mechanism"
+  finding still holds after the self-collision fix, and even improves relatively
+  (it was already the safest mechanism against the T3 divergence, and now also
+  the cleanest on self-collision).
+- **gmr_contact_fc_sm** (T2's smoothed variant): coll%=0.00-0.03%, joint_ok
+  97.7%/88.9% -- smoothing-then-reclamp continues to work well combined with the
+  collision fix (smooth_then_clamp.py always runs `avoid_self_collision=True`).
+
+**Full smoothness/jerk re-eval (s7_smoothness.csv) finished** (462 rows = 77
+clips x 6 variants incl. gmr_contact_fc_sm; perframelimb not part of this table --
+it was never in S7-T1a's shipped smoothness set). It only holds post-fix numbers
+(rebuilt fresh, no pre-fix rows kept), so for an actual before/after delta on
+smoothness specifically, re-ran the 5 S7-T1a dev clips against the preserved
+pre-fix backup pkls (`pkl_s5_prefix_backup/`) for all four touched variants:
+
+| variant | joint_jerk %d | body_jerk %d | skateL %d | fidPos %d |
+|---|---|---|---|---|
+| gmr_contact_fc | +4.6% | +6.8% | +9.1% | ~0% |
+| gmr_contact_fc_sm | +28.4% | +23.2% | +1.2% | ~0% |
+| medianlimb | +7.7% | +9.7% | +24.0% | ~0% |
+| perframelimb | +1.7% | +4.6% | +53.7% | ~0% |
+
+(mean %% change post-fix vs pre-fix, averaged over walk1/walk3/run2/ground1/
+fallAndGetUp1_subject1; fidelity unaffected as expected -- self-collision
+avoidance doesn't touch target tracking.) Consistent with the joint-metric
+picture: perframelimb pays the least in jerk (still the safest mechanism
+overall) but its skate%% swing is largest in relative terms, off a very small
+pre-fix base (0.06-0.12cm) so the absolute cost is small. fc_sm takes the
+biggest jerk hit (+28.4%/+23.2%) -- expected, since self-collision avoidance now
+fights the Stage-A smoothing pass on frames it didn't touch before. Worst case
+across all four is fallAndGetUp1_subject1 (the same clip flagged for the
+held-target range residual above) -- the get-up motion triggers the most
+self-collision correction, so it shows the largest jerk/skate cost everywhere.
+Not a blocker: still a fraction of the smoothness gap already documented
+between contact-correct variants and gmr_polished/gmr_raw in S7-T1a.
+
+**S7-T7 verdict: ship.** All four corpus artifacts (fc, fc_sm, medianlimb,
+perframelimb) now self-collision-aware by default at coll_weight=0.5, backed by a
+full 77-clip re-verification, zero build failures, and an honest documented
+trade (floor cost, one flagged residual on fallAndGetUp1's held-target range).
+Old pre-fix pkls preserved at `pkl_s5_prefix_backup/` for reference/reproducibility.
+
+## S7-T3b (backfill, 2026-07-18, Sonnet) | perframelimb full 77-clip corpus — build ran under T7, never logged on its own
+
+The plan required a standalone `## S7-T3b` entry once perframelimb's corpus build
+landed; it built successfully (0 failures, all 77 clips) but got folded silently
+into T7's self-collision corpus rebuild instead of logged separately. Backfilling
+per the plan's own backfill rule. Numbers below are the FINAL, self-collision-fixed
+build (`s7b_full_corpus.csv` / `s7b_range.csv`, rebuilt under T7's
+`--avoid-self-collision --coll-weight 0.5`, same day) — there was an earlier
+pre-fix perframelimb corpus pass (its pkls are the ones sitting in
+`pkl_s5_prefix_backup/`), but it was never the shipped version and isn't worth a
+separate table.
+
+Full 77-clip class-split, perframelimb vs the other three self-collision-fixed
+clamp_limb variants and `gmr_raw`:
+
+| class | variant | joint_ok% | floorPen_cm | pen% | coll% | collPeak_cm | range_cm |
+|---|---|---|---|---|---|---|---|
+| loco (43) | gmr_raw | 91.52 | 5.15 | 3.03 | 3.85 | 5.05 | 7.98 |
+| loco (43) | gmr_contact_fc | 97.93 | 2.32 | 0.36 | 0.01 | 0.13 | 8.38 |
+| loco (43) | gmr_contact_fc_sm | 97.73 | 2.71 | 0.34 | 0.00 | 0.04 | 9.07 |
+| loco (43) | medianlimb | 97.99 | 4.11 | 1.10 | 0.00 | 0.04 | 9.57 |
+| loco (43) | **perframelimb** | **98.95** | **2.24** | **0.29** | 0.00 | 0.10 | **4.12** |
+| floor (34) | gmr_raw | 80.64 | 15.29 | 23.38 | 6.34 | 5.66 | 12.84 |
+| floor (34) | gmr_contact_fc | 88.82 | 11.75 | 7.63 | 0.05 | 0.63 | 18.14 |
+| floor (34) | gmr_contact_fc_sm | 88.92 | 9.21 | 6.40 | 0.03 | 0.45 | 17.74 |
+| floor (34) | medianlimb | 90.82 | 14.56 | 10.69 | 0.03 | 0.63 | 18.79 |
+| floor (34) | **perframelimb** | **97.60** | **6.20** | **1.30** | 0.01 | 0.27 | **7.39** |
+
+**New finding, not previously surfaced**: this isn't just "perframelimb is the
+best floor mechanism" (S7-T3's dev-clip claim) — at full corpus scale, POST the
+T7 self-collision fix, perframelimb wins on EVERY un-gameable metric on BOTH
+classes, including locomotion range (4.12cm, half of fc's 8.38cm) where it was
+never specifically targeted. `--center perframe`'s per-frame lift (vs fc's
+inline clamp on GMR's own trajectory, or medianlimb's constant shift) appears to
+just be a structurally better floor-correction mechanism project-wide, not a
+floor-class specialist. Gate threshold from the T3 plan ("if perframe materially
+beats fc on the floor class at corpus scale, write S7-DECISION") is unambiguously
+tripped — see below.
+
+Known gap, flagged not hidden: perframelimb has NO corpus-scale smoothness/jerk
+number (`s7_smoothness.csv`'s variant set is raw/polished/contact/contact_fc/
+contact_fc_sm/medianlimb — perframelimb was never added, since S7-T1b predates
+T3's fix). The only smoothness data on perframelimb is T7's 5-dev-clip pre/post
+self-collision-fix DELTA (+1.7%/+4.6% jerk, the smallest of the four touched
+variants) — that's a relative number, not an absolute comparison against fc's own
+jerk. This gap has to close before perframelimb can be claimed as a smoothness
+win, not just a contact-correctness win.
+
+## S7-DECISION (2026-07-18, Sonnet) | perframelimb vs gmr_contact_fc as the primary method — presented, not decided
+
+Per `GMR-S7-plan.md`'s own instruction: present options, the choice is Prabin's.
+
+**The finding**: perframelimb (S7-T3's fixed `--center perframe`) now beats
+`gmr_contact_fc` (the S6-shipped primary method) on every un-gameable joint/floor
+metric, on BOTH classes, at full 77-clip corpus scale, after both variants got
+the same T7 self-collision fix (table above). This is a bigger result than the
+plan anticipated — T3 targeted "best floor mechanism," not "better than fc
+everywhere."
+
+**What's NOT yet known** (the reason this isn't already a ship decision):
+1. **Smoothness/jerk at corpus scale — unmeasured for perframelimb** (the gap
+   flagged in S7-T3b above). `gmr_contact_fc` has full dev+corpus smoothness
+   numbers (S7-T1a/T1b) AND a validated smoothing companion (`gmr_contact_fc_sm`,
+   T2) that measurably fixes its jerk cost. perframelimb has neither — it could
+   have a comparable or worse jerk profile that a `_sm`-style companion would
+   need to fix before it's paper-ready on that axis too.
+2. **Provenance is different**: `gmr_contact_fc` composes with GMR's own
+   in-loop tracking (contact override happens inside the mink solve, S5);
+   perframelimb is a fully post-hoc median-limb-wise correction on top of raw
+   GMR output (S6 Phase B lineage) with a per-frame lift. If the paper's
+   narrative is "contact-aware IN the retargeting solve," perframelimb sits
+   awkwardly outside that framing even if its numbers are better — a
+   positioning question, not just a metrics one.
+3. Range results above show perframelimb's own worst-case spread (loco 4.12cm,
+   floor 7.39cm) but not yet cross-checked with T7-style visual review (S7-T4's
+   money-shot approach) — the S6 experience (Phase B bugs 4/5 only caught by
+   dev-clip visual inspection) is a reason not to skip that step.
+
+**Options, presented for Prabin's call:**
+- **A. Promote perframelimb to primary method.** Best numbers on record,
+  supersedes `gmr_contact_fc`. Requires: (i) a `sprint_s7_smoothness.py`-style
+  corpus pass adding perframelimb to `s7_smoothness.csv` before claiming a
+  smoothness result, (ii) probably a `_sm`-equivalent smoothing companion if T1
+  gate trips the same >50%-jerk threshold, (iii) reframing the paper's
+  "in-solve contact layer" narrative around a post-hoc mechanism instead.
+- **B. Keep `gmr_contact_fc`/`gmr_contact_fc_sm` as primary, report perframelimb
+  as the strongest ablation/ceiling reference.** Lower technical risk (fc is
+  fully validated on every axis already, including smoothness); costs the
+  paper its best number if a reviewer directly compares floor-class results.
+- **C. Per-class hybrid** — fc/fc_sm for locomotion (already the more complete
+  story), perframelimb for the floor class specifically. Splits the difference
+  but adds a "why two different mechanisms" question a reviewer will ask.
+- **D. Close the smoothness gap first (cheap, extends existing T1 tooling),
+  THEN decide** between A/B/C with a complete picture. Lowest-regret next step
+  if there's no immediate deadline forcing the call now.
+
+No default recommendation asserted here beyond D being the cheapest way to stop
+deciding on an incomplete picture — Prabin's call.
+
+## S7-T6 (2026-07-18, Sonnet) | torso/waist residual probe — negative, but surfaced a more important open item
+
+Exploratory probe per the plan, 2-attempt cap. New `scripts/g1/sprint_s7_t6_waist_probe.py`,
+new `"waist"` chain added to `leg_floor_clamp.py`'s `CHAIN_JOINTS`/`EFF_BODY` (waist_yaw/
+roll/pitch, terminal effector `torso_link`) — NOT added to the shipped `CLAMP_TARGETS`
+list, probe-only. Confirmed via `body_parentid` before building anything: `pelvis` attaches
+directly to `world` (it's the free-joint root body here, not a waist-chain descendant) —
+so a waist correction can only ever move `torso_link` and above; pelvis floor penetration
+is out of scope by design (root lift is perframe's own job, not duplicated here), matching
+the plan's own "root stays frozen" instruction.
+
+Clip selection wasn't eyeballed: swept every floor-class clip's `perframelimb` output for
+the deepest per-BODY worst-z (not just the whole-clip worst, which is dominated by
+whichever body is deepest at its single worst frame) and picked the 2 with the deepest
+measured `torso_link` penetration — `fallAndGetUp2_subject2` (-3.6cm) and
+`fallAndGetUp1_subject1` (-3.5cm). Same sweep surfaced something unexpected: on both
+clips, `left_ankle_roll_link` has a FAR deeper residual than torso (-18.6cm / -12.4cm) —
+despite being inside `CLAMP_TARGETS`' scope and nominally corrected every frame.
+
+**Attempt 1** (waist clamp only, `floor_margin=0.0`, clearance-only): 515/4918 and
+600/5047 frames triggered a correction. Whole-clip `floorPen_cm`/`range_cm` UNCHANGED on
+both clips (confirms the headline metric is dominated by the much-deeper ankle residual
+above, not torso — correcting torso can't move a number that torso was never the worst
+contributor to). `pen_pct` improved on fallAndGetUp1 (2.70%→2.18%) but WORSENED on
+fallAndGetUp2 (3.36%→4.64%); `coll_pct`/`coll_peak_cm` also worsened on both (0.02%→0.16%,
+0.43→1.46cm on fallAndGetUp1) — the waist correction has zero self-collision awareness of
+its own (same class of blind spot as the un-fixed floor clamp pre-T7).
+
+**Attempt 2** (waist clamp + `avoid_self_collision=True`, the T7 fix reused verbatim):
+closed the self-collision regression back to baseline on both clips exactly (coll_pct/
+coll_peak_cm unchanged from pre-waist-clamp). Net result still a wash: floorPen_cm/range_cm
+unchanged (same reason as attempt 1), joint_ok_pct flat-to-slightly-worse (94.146%→94.010%
+on fallAndGetUp2, unchanged on fallAndGetUp1), pen_pct still mixed (improves on one clip,
+worsens on the other).
+
+**Verdict: T6 not shipped.** Torso/waist correction doesn't move any of the metrics that
+matter (floorPen_cm, joint_ok, range) on the clips actually chosen for having the worst
+torso residual — it isn't the real bottleneck on these clips. 2-attempt cap reached,
+stopping per the plan's own instruction ("log numbers, stop, present to Prabin").
+
+**More important finding, surfaced as a byproduct, not chased further this pass**: the
+-18.6cm / -12.4cm ankle residuals are themselves a single isolated frame each (t=212 of
+4918 on fallAndGetUp2_subject2; direct instrumentation shows neighbor frames at -5.9cm/
+-2.9cm/+1.9cm/+0.8cm/+0.4cm — a one-frame spike, not a sustained failure) coinciding with
+an unusually high active-contact count at that exact frame (`ncon=30` vs 0-20 on
+neighbors). This is the SAME class of bug already flagged in S7-T7's "known residual, not
+resolved" note (self-collision phase 2 is floor/held-blind and can overpower phase 1's
+convergence within the bounded iteration budget on a hard frame) — just showing up on a
+different chain/frame than the one T7 specifically flagged (fallAndGetUp1's held-right-foot
+t=2251 case), and reaching a deeper magnitude (-18.6cm vs T7's own +31.42cm support_z
+spike). Confirms the residual is broader than T7's single flagged instance, not a new root
+cause — still open, still not chased further (same reason T7 gave: diminishing returns
+after 3 mechanism designs already tried for phase-1/phase-2 interaction).
+
+## S8-T0 (2026-07-18, Sonnet)
+
+### T0a: perframelimb smoothness at corpus scale
+
+Script: `scripts/g1/sprint_s8_t0a_perframelimb_smooth.py` — appended 77 perframelimb rows to `s7_smoothness.csv` (539 total rows). Pure eval, no new pkls. Labels from `s1t4_reclass.csv` (floor_class=1 → "floor", 0 → "loco").
+
+**Smoothness class means (all variants, post-fix 77-clip corpus):**
+
+| variant | class | j_jerk | skL_cm | skR_cm | vMax rad/s | n_spk/clip |
+|---|---|---|---|---|---|---|
+| gmr_raw | floor | 5003 | 0.440 | 0.433 | 34.0 | 0.18 |
+| gmr_contact_fc | floor | 7879 | 1.301 | 1.142 | 78.7 | 7.88 |
+| gmr_contact_fc_sm | floor | 1403 | 3.893 | 3.283 | 61.5 | 3.56 |
+| medianlimb | floor | 8010 | 0.868 | 0.831 | 84.7 | 10.15 |
+| **perframelimb** | **floor** | **8086** | **0.556** | **0.519** | **51.7** | **0.91** |
+| gmr_raw | loco | 6189 | 0.308 | 0.339 | 32.8 | 0.00 |
+| gmr_contact_fc | loco | 7493 | 0.794 | 0.634 | 40.7 | 4.16 |
+| gmr_contact_fc_sm | loco | 855 | 3.655 | 3.290 | 23.8 | 2.26 |
+| medianlimb | loco | 7180 | 0.210 | 0.334 | 49.2 | 1.02 |
+| **perframelimb** | **loco** | **8857** | **0.229** | **0.283** | **47.0** | **0.12** |
+
+perframelimb summary vs gmr_raw:
+- jerk: 1.62× raw (floor), 1.43× raw (loco) — worse than raw on jerk
+- skate: 1.26×/1.20× raw (floor), 0.74×/0.84× raw (loco) — slight skate improvement on loco
+- vMax: 1.52× raw (floor), 1.43× raw (loco) — higher peak velocity but better than fc/medianlimb
+- n_spikes/clip: **0.91 (floor), 0.12 (loco)** — drastically better than fc (7.88/4.16) and medianlimb (10.15/1.02); 5-10× fewer spikes than fc on floor class
+- Retires S7-DECISION option D (perframelimb unmeasured) — it IS better than fc on spikes; still not at raw level.
+
+### T0b: spike attribution
+
+Analyzed top-5 worst clips by n_spikes for each variant. Spike = frame with max|dq|·fps > 60 rad/s. Attribution per spike frame: (A) clamp correction toggling or growing instability; (B) phase-2 self-collision ncon >5; (C) perframe root-lift discontinuity >2cm/frame; (D) held-flag transition at spike frame.
+
+**gmr_contact_fc — worst 5 clips:**
+
+| clip | n_spikes | A | B | C | D | worst_mag |
+|---|---|---|---|---|---|---|
+| obstacles6_subject5 | 155 | 148 | 1 | 0 | 9 | 94.2 |
+| fallAndGetUp1_subject4 | 69 | 66 | 2 | 0 | 2 | 127.1 |
+| obstacles5_subject2 | 24 | 22 | 0 | 0 | 0 | 94.2 |
+| walk3_subject3 | 24 | 24 | 0 | 0 | 0 | 94.2 |
+| fallAndGetUp2_subject2 | 20 | 19 | 0 | 0 | 4 | 93.4 |
+| **total** | **292** | **279 (95.5%)** | **3 (1.0%)** | **0** | **15 (5.1%)** | **127.1** |
+
+**perframelimb — worst 5 clips:**
+
+| clip | n_spikes | A | B | C | D | worst_mag |
+|---|---|---|---|---|---|---|
+| obstacles4_subject3 | 7 | 4 | 0 | 0 | 0 | 81.4 |
+| walk2_subject3 | 6 | 6 | 0 | 0 | 1 | 85.8 |
+| obstacles5_subject3 | 5 | 5 | 0 | 0 | 0 | 85.7 |
+| aiming1_subject4 | 4 | 4 | 0 | 0 | 2 | 85.7 |
+| pushAndFall1_subject4 | 3 | 1 | 0 | 0 | 0 | 77.6 |
+| **total** | **25** | **20 (80.0%)** | **0** | **0** | **3 (12.0%)** | **85.8** |
+
+Note: 18 frames across both variants show `causes=----` (no cause detected by proxy). Direct instrumentation of one representative (obstacles6_subject5 t=2315, left_hip_yaw: corr grows -0.76→-17→-63→-14 rad/s across 4 frames) confirms these are cause A — DLS correction magnitude building up near a singular configuration, not a toggle but a rapid growth pattern. My proxy only caught sign changes / onset; these are the same instability class.
+
+**Dominant cause: A (clamp activation toggling / DLS instability) = >80% of spikes in both variants.**
+
+B (phase-2 self-collision) accounts for only 1.0% of fc spikes and 0% of perframelimb; the specific -18.6cm frame from S7-T6 (fallAndGetUp2_subject2 t=212, ncon=30) is NOT in the top-5 fc spikes by count — it's a high-magnitude one-off but not the volume driver. C (root-lift discontinuity) is zero for perframelimb — the 15-frame moving-average smoothing on the lift curve is sufficient to eliminate lift-discontinuity spikes. D (held-release ramp) co-occurs with A on ~5% of fc spikes and ~12% of perframelimb spikes, but never as a sole cause.
+
+**T1 priority order (for when T1 is authorized): T1b (activation continuity, cause A) is the dominant target. T1a (phase-2 acceptance check) covers only 1% of fc's spikes and 0% of perframelimb's — low ROI. T1c (lift smoothing) not needed — cause C = 0 on corpus.**
+
+## S8-T1 (2026-07-18, Sonnet)
+
+### T1c: skipped (cause C = 0 in T0b, no mechanism needed).
+
+### T1b: activation continuity (cause A), 2 attempts, both on the 15-clip gate set (5 dev + 10 T0b worst-spike clips)
+
+Mechanism: `CorrectionRateLimiter` in `gmr_contact_retarget.py` (`--clamp-rate-limit R`, R=0.15 rad/frame), warm-started from previous frame's *applied* correction. Two code states tried, tagged by pkl suffix:
+
+- **`rl` (attempt 1):** rate limit applied to the *combined* phase-1 (floor/held clamp) + phase-2 (self-collision) correction.
+- **`rl2` (attempt 2):** rate limit applied to phase-1 only; phase-2 collision post-pass left unlimited (built specifically to fix attempt 1's coll_pct regression below).
+
+**Class means, 15-clip gate set, before(unlimited)→after(rate-limited):**
+
+| variant | class | spk before→after | vMax before→after (1.2×raw gate) | coll% before→after | jok before→after | fp_cm before→after |
+|---|---|---|---|---|---|---|
+| gmr_contact_fc_**rl** | floor | 13.67→**0.33** | 81.2→**41.0** (43.7) | 0.124→**0.960** | 87.12→95.63 | 13.00→11.11 |
+| gmr_contact_fc_**rl** | loco | 51.67→**0.00** | 46.0→**21.3** (25.5) | 0.115→**2.005** | 88.23→98.84 | 8.07→3.55 |
+| perframelimb_**rl** | floor | 2.08→**0.42** | 59.5→**36.5** (43.7) | 0.010→**0.600** | 97.37→96.68 | 5.93→5.70 |
+| perframelimb_**rl** | loco | 0.00→**0.00** | 37.4→**21.2** (25.5) | 0.000→**1.974** | 98.81→98.60 | 2.79→3.19 |
+| gmr_contact_fc_**rl2** | floor | 13.67→**2.33** | 81.2→**69.3** (43.7) | 0.124→**0.030** | 87.12→89.59 | 13.00→21.57 |
+| gmr_contact_fc_**rl2** | loco | 51.67→**68.67** | 46.0→**67.7** (25.5) | 0.115→**0.419** | 88.23→81.43 | 8.07→12.26 |
+| perframelimb_**rl2** | floor | 2.08→**0.42** | 59.5→**38.5** (43.7) | 0.010→**0.012** | 97.37→96.51 | 5.93→7.79 |
+| perframelimb_**rl2** | loco | 0.00→**0.00** | 37.4→**25.9** (25.5, borderline) | 0.000→**0.009** | 98.81→98.26 | 2.79→5.15 |
+
+**Verdict: neither attempt clears the full gate. A genuine tension, not a tuning miss:**
+- `rl` (rate-limit everything) crushes spikes/vMax cleanly (well inside the ≤0.5/clip, ≤1.2×raw gate) but coll_pct blows the ≤0.01-point allowance by 60–200×, because throttling the combined correction also throttles the self-collision push-out. Note: even at 0.6–2.0%, this is still far below `gmr_raw`'s baseline self-collision (6.337%/3.853% floor/loco per S8 intro table) — the regression is relative to the S7-T7 post-fix numbers (0.048%/0.009%), not relative to raw.
+- `rl2` (unlimit phase-2 only) fixes coll_pct back down (0.030%/0.419%, near the S7-T7 numbers) but reopens the spike/vMax gate — fc-loco spikes go to 68.67/clip, *worse than the unlimited baseline* (51.67). This means phase-2 self-collision is a bigger spike driver than T0b's attribution suggested (1% of fc spikes) once it's allowed to run unbounded next to an otherwise rate-limited phase-1 — the two phases interact differently under partial rate-limiting than either fully-limited or fully-unlimited.
+- floorPen_cm also regresses on `rl2` (+1.86cm floor / +2.36cm loco on perframelimb) beyond the 0.5cm allowance — rate-limiting phase-1 slows floor-clearance convergence during the ramp-in.
+
+**2-attempt cap reached for T1b. Per S8 plan's failure-handling rule, not attempting a third T1b variant.** T1a (phase-2 acceptance/backtracking check) is a distinct, unused mechanism — S8-T0's "low ROI" read (1% of fc spikes attributed to cause B) was based on the *unlimited* baseline and is now stale: `rl2`'s result shows phase-2 becomes a dominant spike source once phase-1 is separately rate-limited. Whether to spend T1a's budget on this reframed problem, accept `rl`'s coll_pct tradeoff (still far below raw) and move to T3, or something else is Prabin's call — escalating per plan rather than picking a mechanism unilaterally.
+
+## S8-T2 (2026-07-18, Sonnet, per REVISION R1) — held-aware smoothing, both arms, GATE FAILED at 2-attempt cap
+
+Mechanism: `scripts/g1/smooth_heldaware.py`, new script per R1.2/R1.3. Held leg-chain
+DOFs + root locked to input via a ramped (5-frame cosine) tracking-weight boost
+(λ_lock=1e8) in `stage_a`'s per-joint `lambda_track_frames`; free DOFs (arms,
+waist, root on non-held stretches) smoothed at λ_track=1.0/λ_smooth=20. Applied
+to both `perframelimb` (ours) and `gmr_heightfix` (fairness arm, R1.3) →
+`perframelimb_sm` / `heightfix_sm`. Gate set: 10 clips (5 dev + 5 perframelimb
+worst-spike from T0b), `scripts/g1/sprint_s8_t2_gate.py`.
+
+**Attempt 1 (plain held-aware lock) — 10-clip gate set, equal per-clip-mean ("combined" = script's own class-size-weighted mean over all 10 clips; `pfl` = unsmoothed `perframelimb`):**
+
+| metric | gmr_raw | perframelimb (pfl) | perframelimb_sm | gate |
+|---|---|---|---|---|
+| n_spikes/clip | 0.31 | 2.50 | **2.00** | FAIL (≤0.5) |
+| vMax rad/s | 35.40 | 60.67 | **59.46** | FAIL (≤42.48, 1.2×raw) |
+| joint_jerk | 4882.5 | 8178.3 | 2929.4 | PASS (≤6347.2) |
+| body_jerk | 204.4 | 263.0 | 125.1 | PASS (≤265.7) |
+| joint_ok% | — | 98.59 | 85.05 | FAIL (need ≥97.59) |
+| floorPen cm | — | 4.27 | 7.78 | FAIL (need ≤4.77) |
+| coll% | — | 0.002 | 2.15 | FAIL (need ≤0.052) |
+| worst_float cm | — | 3.11 | 3.11 | PASS (unchanged) |
+
+**Root cause (diagnosed, not guessed):** obstacles4_subject3 frame 2116→2117 —
+`perframelimb`'s per-frame limb IK has a genuine one-frame hip-yaw branch flip
+(1.57rad→−1.14rad, i.e. Δ≈2.7rad in 1/fps s) surrounded by ordinary values on
+both sides. The frame sits inside the *ramp-out tail* after the right foot's
+`held` flag clears (lock weight ~9e7 at that frame — confirmed by direct
+instrumentation of `build_lock_weights`, not inferred). Attempt 1's ramp
+(designed so the lock boundary itself doesn't introduce a *new* discontinuity)
+instead **preserves a pre-existing one**. Same pattern (spike joint always
+hip-yaw idx 2 or 8, `sm_unchanged=True`, mostly outside strict held windows but
+inside the 5-frame ramp) confirmed across all 5 T0b worst-spike clips —
+this is the dominant spike cause for `perframelimb`, not a smoothing-strength
+shortfall.
+
+**Attempt 2 (spike-aware unlock exception, targeted fix of the diagnosed cause):**
+`build_lock_weights` now takes the raw `qpos`/`fps`; wherever the raw input's
+own per-joint velocity exceeds 40 rad/s at a held/ramp frame, that joint's lock
+is dropped to λ_track for both endpoints of the transition (all other
+held/ramp frames untouched). 10-clip gate set (same layout as attempt 1;
+`gmr_raw`/`pfl` unchanged from attempt 1, repeated for comparison):
+
+| metric | gmr_raw | perframelimb (pfl) | perframelimb_sm | gate |
+|---|---|---|---|---|
+| n_spikes/clip | 0.31 | 2.50 | **0.00** | PASS (≤0.5) |
+| vMax rad/s | 35.40 | 60.67 | **36.61** | PASS (≤42.48) |
+| joint_jerk | 4882.5 | 8178.3 | 2671.4 | PASS (≤6347.2) |
+| body_jerk | 204.4 | 263.0 | 141.8 | PASS (≤265.7) |
+| joint_ok% | — | 98.59 | 84.90 | **FAIL** (need ≥97.59) |
+| floorPen cm | — | 4.27 | 7.78 | **FAIL** (need ≤4.77) |
+| coll% | — | 0.002 | 2.14 | **FAIL** (need ≤0.052, ~40×) |
+| worst_float cm | — | 3.11 | 5.05 | **FAIL** (need ≤4.11) |
+
+**Verdict: attempt 2 fixes all 4 smoothness axes cleanly but reopens the
+contact-preservation axes it was gated on protecting.** This is the trade
+`stage_a`'s own docstring already warned about: "this global smoothing pass is
+otherwise floor-blind and can erode a sharp, narrow correction" — unlocking
+exactly the frames where `perframelimb`'s per-frame clamp made its sharpest
+save (the same frames that spike) lets the tridiagonal solve blend the
+correction back toward its uncorrected neighbours. Two genuine, understood
+mechanisms, two genuine failure modes on opposite axis groups — not a tuning
+miss either time.
+
+**2-attempt cap reached for T2. Per S8 plan's failure-handling rule, not
+attempting a third T2 mechanism (e.g. per-frame re-clamp after smoothing,
+which was the plan's suggested fallback — skipped because it targets the
+wrong axis: the diagnosed cause is a lock/unlock boundary tradeoff, not
+insufficient smoothing strength, so re-clamping would either restore the
+lock (attempt 1's failure) or repeat the erosion (attempt 2's failure)
+depending which pass runs last).** Escalating to Prabin: T3/T4/S8-DECISION
+are blocked until a path forward is chosen. `perframelimb_sm` pkls on disk
+(both attempts, attempt 2 is current) are the attempt-2 build; not
+corpus-built beyond the 10-clip gate set.
+
+## REVISION R2 (Fable, 2026-07-18) — training-relevance ruling + new mechanism round
+
+T2's two attempts decompose into two independent effects, not one: contact
+erosion is identical across both (floorPen 7.78/7.78cm, coll 2.15/2.14%,
+joint_ok 85.05/84.90%) — caused by smoothing free (non-held) frames, which
+drags perframelimb's swing-clearance/collision corrections back toward the
+uncorrected input. The lock/unlock toggle alone moves only the temporal axes
+(spikes 2.00→0.00, vMax 59.46→36.61) at a cost of worst_float 3.11→5.05cm.
+Conclusion: contact-blind temporal smoothing structurally cannot
+Pareto-improve a per-frame contact-corrected motion — a controlled ablation
+result, not a tuning miss.
+
+RetargetMatters (the GMR paper) states its own critical-artifact list
+verbatim: "foot penetration, self-intersection, and abrupt velocity spikes
+are all critical artifacts that should be avoided during retargeting" — its
+three case-study policy failures map 1:1 (PHC ground penetration,
+ProtoMotions self-intersection, GMR's own "Dance 5" waist-value jumps). Mean
+joint jerk is NOT on that list and appears in none of their eval metrics.
+**Prabin's ruling (2026-07-18, approved):** demote `joint_jerk` from gated
+(≤1.3×raw) to report-only (≤1.75×raw sanity ceiling); `body_jerk` stays
+gated. Condition: T4's render watch becomes a hard veto — any teleport-like
+or visibly-absurd-torque frame kills the variant regardless of its metric
+table. Never tradeable: floorPen/pen%, coll%, n_spikes, vMax, worst_float,
+joint_ok. Full text: `GMR-S8-plan.md` REVISION R2.
+
+## S8-T2c (2026-07-18, Fable, per REVISION R2) — smooth→re-clamp, 2-attempt cap, close but FAILED
+
+Mechanism: re-clamp the perframelimb_sm (T2 attempt-2, spike-unlock) pkls —
+limbs only (phase-1 floor/held + phase-2 self-collision via
+`polish_median_limbwise._limbwise_pass`, new `--center none` mode added to
+skip root re-lift), each frame's DLS starting from that frame's own
+already-smooth input. New `scripts/g1/sprint_s8_t2_gate.py --build-smrc`.
+Same unmodified 10-axis T2 gate, same 10 clips.
+
+**Attempt 1 (max_dq=None, combined class-mean):**
+
+| metric | gmr_raw | pfl | perframelimb_smrc | gate |
+|---|---|---|---|---|
+| n_spikes/clip | 0.31 | 2.50 | **11.70** | FAIL (≤0.5) |
+| vMax rad/s | 35.40 | 60.67 | **89.03** | FAIL (≤42.48) |
+| joint_jerk | 4882.5 | 8178.3 | 4460.3 | PASS (≤6347.2) |
+| body_jerk | 204.4 | 263.0 | 204.2 | PASS (≤265.7) |
+| joint_ok% | — | 98.59 | 98.39 | PASS (need ≥97.59) |
+| floorPen cm | — | 4.27 | 6.04 | FAIL (need ≤4.77) |
+| coll% | — | 0.002 | 0.000 | PASS (need ≤0.052) |
+| worst_float cm | — | 3.11 | **28.52** | FAIL (need ≤4.11) |
+
+Root cause (diagnosed, not guessed — `smrc_spike_probe.py` on
+walk2_subject3): worst frame t=6318→6319, left_hip_yaw (dof 2, limits
+±1.57rad) driven 1.57 → 1.57 → **-1.57** → 1.57 across four consecutive
+frames — uncapped DLS bouncing between opposite joint limits. Identical bug
+class to the one `polish_median_limbwise.py`'s `--center perframe` docstring
+already documents (S7-T3): a near-singular full-extension basin where
+uncapped DLS diverges within a frame's iterations. perframelimb's own build
+sits leg DOFs near their limits often (4224 (frame,dof) pairs within
+0.02rad of a limit in the smoothed input); re-clamping without the SAME
+trust region that mode already uses elsewhere in this codebase (max_dq=0.15)
+hits the identical instability.
+
+**Attempt 2 (max_dq=0.15, the established trust-region value, combined class-mean):**
+
+| metric | gmr_raw | pfl | perframelimb_smrc | gate |
+|---|---|---|---|---|
+| n_spikes/clip | 0.31 | 2.50 | **3.80** | FAIL (≤0.5) |
+| vMax rad/s | 35.40 | 60.67 | **64.21** | FAIL (≤42.48) |
+| joint_jerk | 4882.5 | 8178.3 | 3658.0 | PASS (≤6347.2) |
+| body_jerk | 204.4 | 263.0 | 171.8 | PASS (≤265.7) |
+| joint_ok% | — | 98.59 | 98.50 | PASS (need ≥97.59) |
+| floorPen cm | — | 4.27 | 4.02 | PASS (need ≤4.77) |
+| coll% | — | 0.002 | 0.002 | PASS (need ≤0.052) |
+| worst_float cm | — | 3.11 | 4.07 | PASS (need ≤4.11) |
+
+8 of 10 axes now PASS cleanly — all contact/collision/jerk axes match
+perframelimb. Per-clip breakdown shows the failure is entirely concentrated
+in the 5 T0b worst-spike clips: all 5 dev clips are clean (spk=0, vMax
+27.2–50.4 rad/s), while obstacles4/walk2/obstacles5/aiming1/pushAndFall1
+still spike (6/14/12/4/2) — on 2 of these 5 (walk2, obstacles5), smrc's
+re-clamp spikes MORE than perframelimb's own original construction did
+(perframelimb: 7/6/5/4/3) — re-clamping a smoothed configuration hits a
+different DLS instability than perframelimb's original per-frame-independent
+build, even with the trust region.
+
+**2-attempt cap reached for T2c. GATE: FAILED (close, not clean).** Per R2.6,
+proceeding directly to T2d (pre-approved, no further sign-off needed) rather
+than a third max_dq value — the residual spikes are concentrated on exactly
+the hardest clips, which is what T2d (local repair, sidesteps global DLS
+re-solve entirely) targets by design.
+
+## S8-T2d (2026-07-18, Fable, per REVISION R2.4) — local spike repair, 2-attempt cap, both FAILED
+
+Mechanism: `scripts/g1/sprint_s8_t2d_repair.py` — detect leg-DOF transitions
+where unsmoothed `perframelimb` already has |Δq|·fps > 40 rad/s (below the
+60 rad/s metric threshold, so the repair set is a superset of counted
+spikes), merge overlapping ±3-frame windows per joint, PCHIP-interpolate
+through each window from untouched context points, re-clamp, re-detect (max
+2 iterations). Gate per R2.2 (approved): joint_jerk report-only (≤1.75×raw
+ceiling), everything else the original unmodified T2 gate.
+
+**Attempt 1 (re-clamp the WHOLE clip after each repair pass — same call
+perframelimb's own build uses, reasoning untouched frames are already that
+operation's fixed point):**
+
+| metric | gmr_raw | pfl | perframelimb_repair | gate |
+|---|---|---|---|---|
+| n_spikes/clip | 0.31 | 2.50 | **3.90** | FAIL (≤0.5) |
+| vMax rad/s | 35.40 | 60.67 | **65.70** | FAIL (≤42.48) |
+| joint_jerk | 4882.5 | 8178.3 | 8669.3 | FAIL [report-only] (≤8544.3, 1.75×raw) |
+| body_jerk | 204.4 | 263.0 | **288.8** | FAIL (≤265.7) |
+| joint_ok% | — | 98.59 | 98.78 | PASS (need ≥97.59) |
+| floorPen cm | — | 4.27 | 3.69 | PASS (need ≤4.77) |
+| coll% | — | 0.002 | 0.000 | PASS (need ≤0.052) |
+| worst_float cm | — | 3.11 | **9.19** | FAIL (need ≤4.11) |
+
+**Root cause (diagnosed, not guessed): the fixed-point assumption was wrong.**
+Per-clip spikes went WORSE on the hardest clips vs original perframelimb:
+walk2_subject3 6→**18**, pushAndFall1 3→6, obstacles5 5→6; only aiming1
+improved 4→3. T0b already established >80% of perframelimb's own spikes are
+cause A (DLS chatter near a singular config) — re-running the identical
+clamp pass over the WHOLE clip, even though nearly every frame is already
+that operation's fixed point, still perturbs the handful of already-chaotic
+frames (via proximal-to-distal chain propagation from repaired neighbors)
+onto a DIFFERENT unstable branch instead of leaving them alone. This is the
+plan's own literal design deviated from for a shortcut ("re-run globally,
+should be a near no-op") — the shortcut was wrong specifically at the
+frames that mattered most.
+
+**Attempt 2 (fixed the above: re-clamp restricted to the repair windows
+ONLY — `_limbwise_pass_frames`, new function, every frame outside a window
+is bit-identical to input by construction):**
+
+| metric | gmr_raw | pfl | perframelimb_repair | gate |
+|---|---|---|---|---|
+| n_spikes/clip | 0.31 | 2.50 | **2.40** | FAIL (≤0.5) |
+| vMax rad/s | 35.40 | 60.67 | **57.04** | FAIL (≤42.48) |
+| joint_jerk | 4882.5 | 8178.3 | 8234.1 | PASS [report-only] (≤8544.3, 1.75×raw) |
+| body_jerk | 204.4 | 263.0 | **288.7** | FAIL (≤265.7) |
+| joint_ok% | — | 98.59 | 98.05 | PASS (need ≥97.59) |
+| floorPen cm | — | 4.27 | 4.10 | PASS (need ≤4.77) |
+| coll% | — | 0.002 | 0.002 | PASS (need ≤0.052) |
+| worst_float cm | — | 3.11 | **13.93** | FAIL (need ≤4.11, ~3.4×) |
+| skate(L) cm | — | 0.26 | **1.12** | FAIL (≤2×raw = 0.74) |
+| skate(R) cm | — | 0.46 | **1.03** | FAIL (≤2×raw = 0.78) |
+
+Contact axes (joint_ok/floorPen/coll_pct) now clean and per-clip spikes
+improved on 3 of 4 hard clips (walk2 18→6, obstacles5 6→3, aiming1 3→2;
+pushAndFall1 4 unchanged). **New failure mode, also diagnosed:** the
+windowed re-clamp's held-foot lock target was "wherever the foot's phase-1-
+corrected XY currently is" (no cross-frame anchor, since window-only skips
+the ramp/onset state entirely) — each frame in a window independently locks
+to its own possibly-already-drifted position, letting a held foot walk away
+over the window instead of staying planted. worst_float hit 16.7cm on
+walk2_subject3 loco class; skate blew up to 1.1-3.1cm on 4 of 5 hard clips.
+
+**A second, independent finding from the build logs:** window counts vastly
+exceed n_spikes counts on the hard clips — walk2_subject3: 69 windows (iter
+1) across 3 DOFs vs its n_spikes=6; obstacles5_subject3: 39 windows vs
+n_spikes=5. Lowering the detection threshold from 60→40 rad/s reveals cause-A
+chatter is a **dense region spanning many consecutive frames**, not a
+handful of isolated spikes, on these specific clips — neither a full-clip
+nor a windowed re-clamp converges within the 2-iteration budget (9-19
+windows still open after 2 iterations on 4 of 5 hard clips). The clips where
+this shows up (obstacles4/5, walk2, aiming1, pushAndFall1) are exactly
+T0b's original "worst 5" — this is not new chatter, it's the SAME chatter
+current metrics only partially see.
+
+**2-attempt cap reached for T2d. GATE: FAILED both attempts.** Escalating to
+Prabin: three independent mechanisms have now been tried across T2/T2c/T2d
+(held-aware lock/unlock, smooth→re-clamp, local spike repair) and none
+clears the full gate. T2c-attempt-2 remains the closest result on record
+(8/10 axes clean) but its two failures — n_spikes and vMax — sit exactly on
+R2.2's non-tradeable list (never tradeable: floorPen/pen%, coll%, n_spikes,
+vMax, worst_float, joint_ok), so "close" does not mean "acceptable under the
+approved ruling." Per plan, not attempting a fourth mechanism unilaterally.
+
+## S8-T2-DECISION (Prabin, 2026-07-18) — ship T2c-attempt-2 (`perframelimb_smrc`), reframed
+
+**Decision: `perframelimb_smrc` (T2c attempt 2, max_dq=0.15) is the S8
+winner.** Prabin's ruling: the worst_float/floorPen "never tradeable" gate
+in R2.2 was calibrated against `perframelimb`'s OWN numbers, not against
+what actually threatens a downstream policy — GMR-full's baseline sits at
+14-15cm worst_float / 3.7-3.8cm floorPen on these same clips, so a variant
+at 4.07cm / 4.02cm is still a large, real win over the primary baseline
+even though it doesn't match perframelimb's own 3.11cm / 4.27cm exactly.
+Judge against RetargetMatters' absolute severity bar, not a same-method
+delta.
+
+**The honest cost of this call — what's worse, not glossed over:**
+
+1. **n_spikes and vMax are WORSE than the already-shipped `perframelimb`
+   itself, not just short of `gmr_raw`.** Combined gate-set mean: spikes
+   2.50→**3.80**/clip, vMax 60.67→**64.21** rad/s. This is a regression on
+   the exact axis S8 exists to fix, concentrated on 2 of 10 clips:
+
+   | clip | pfl spk→smrc spk | pfl vMax→smrc vMax |
+   |---|---|---|
+   | walk2_subject3 | 6 → **14** | 85.8 → 84.2 |
+   | obstacles5_subject3 | 5 → **12** | 85.7 → 88.2 |
+   | obstacles4_subject3 | 7 → 6 | 81.4 → 93.8 |
+   | aiming1_subject4 | 4 → 4 | 85.7 → 94.2 |
+   | pushAndFall1_subject4 | 3 → 2 | 77.6 → 68.7 (improved) |
+
+   walk2 and obstacles5 more than double their spike count. All 5 dev clips
+   are completely clean (0 spikes, vMax 27-50 rad/s) — the cost is entirely
+   concentrated on the 5 hardest, most dynamic clips (obstacles/aiming/push-
+   and-fall), not spread across the corpus.
+
+2. **Single-frame peaks up to 94.2 rad/s survive** on 3 of 10 gate clips
+   (obstacles4=93.8, aiming1=94.2, obstacles5=88.2) — the documented
+   "π rad/frame @ 30fps, solution-branch flip" signature
+   (`leg_floor_clamp.py`'s `CorrectionRateLimiter` docstring). This is a
+   direct risk to T4's render-watch veto (teleport-like motion) — MUST be
+   visually confirmed clean or absent-in-practice before shipping, not
+   assumed safe from the metric alone.
+
+3. **worst_float regresses ~0.6-1.0cm vs `perframelimb`** (floor
+   2.96→3.60cm, loco 3.15→4.19cm) — small in absolute terms and still
+   ~10-11cm better than GMR-full, but a real, disclosed number, not zero.
+
+4. **Only validated on the 10-clip gate set (5 dev + 5 T0b worst-spike),
+   not yet at 77-clip corpus scale (T3 pending).** The "concentrated on 5
+   known-hard clips" read could understate the true breadth once T3 builds
+   the full corpus — T3's table is the first place this gets checked at
+   scale.
+
+5. **joint_jerk and body_jerk both genuinely improved** (3658 vs pfl's
+   8178, 172 vs pfl's 263) — this is the one clean, unambiguous win layered
+   on top of the above costs, not a wash.
+
+**Next: T3 (77-clip corpus build for `perframelimb_smrc`, replacing
+`perframelimb_sm` in the column layout) → T4 (renders, hard veto per
+Prabin's condition — explicitly re-check the 3 clips with 90+ rad/s peaks
+for teleport-like artifacts) → S8-DECISION.**
+
+## S8-T3 (77-clip corpus build + full 13-axis eval) — DONE, S8-DECISION NOT reached
+
+Build: `pkl_s5/{clip}_perframelimb_sm/_smrc.pkl` + `_heightfix_sm.pkl` for all
+77 clips (resumable, most already existed from T2c/T2d work). Eval: 5-column
+table (`gmr_raw | gmr_heightfix | heightfix_sm | perframelimb |
+perframelimb_smrc`), 13 axes, floor/loco class split. Full table:
+`outputs/gmr_baseline/sprint/s8_t3_full_corpus.csv` (385 rows).
+
+**Finding: at corpus scale, `perframelimb_smrc` does NOT clear R2.2's
+never-tradeable bar — it's a 3-3 split, not the "zero critical classes"
+R2.5 predicted.**
+
+| axis (never-tradeable, R2.2) | gmr_heightfix (floor/loco) | perframelimb_smrc (floor/loco) | verdict |
+|---|---|---|---|
+| floorPen_cm | 2.76 / 3.06 | **6.05 / 3.43** | WORSE both classes |
+| n_spikes | 0.18 / 0.00 | **1.24 / 1.12** | WORSE both classes |
+| vMax rad/s | 34.0 / 32.8 | **55.4 / 54.2** | WORSE both classes |
+| coll_pct | 6.34 / 3.85 | 0.003 / 0.000 | ours wins big |
+| worst_float_cm | 18.0 / 6.6 | 3.96 / 2.66 | ours wins big |
+| joint_ok_pct | 0.19 / 46.3 | 97.9 / 98.6 | ours wins big |
+
+The floorPen/vMax losses are not smrc-specific: plain unsmoothed
+`perframelimb` already loses floorPen (6.20cm floor) and vMax (51.7/47.0)
+vs heightfix, before any T2/T2c work touched it — this predates S8.
+`floorPen_cm` is the single WORST-frame penetration in the whole clip
+(`pen.max()*100`, not a mean, see `sprint_s3_full_corpus.py:129-138`) —
+likely non-effector body parts (torso/knee) clipping the floor during
+ground-contact sequences, since the per-frame clamp only pins feet/hands,
+not the whole body.
+
+**Concentration check (not a handful of outliers):** floor-class median
+floorPen (4.36cm) already exceeds heightfix's *mean* (2.76cm); top-3 clips
+are only 26% of the total sum (loco: 20%). 15/34 floor clips and 13/43 loco
+clips exceed 5cm. Worst single clip: `fallAndGetUp2_subject2` at 22.66cm.
+Loco class is closer to a wash (median 2.78cm vs heightfix's 3.06cm mean,
+16/43 loco clips already beat heightfix outright) — floor class is where
+the real gap lives.
+
+T4 renders built (R0's 3 clips + `fallAndGetUp2_subject2`, the worst
+remaining floor clip, `gmr_heightfix` vs `perframelimb_smrc`) — visual
+teleport-veto review still pending, held per Prabin's redirect below.
+
+Reported to Prabin instead of writing S8-DECISION, since the metric table
+doesn't match the plan's predicted shape. Prabin's response: apply naive
+per-clip grounding (GMR's own height-shift trick) on top of `smrc` and see
+if it converts the floorPen loss into a float win, since our worst_float is
+already far below heightfix's → see S8-T5.
+
+## S8-T5 (naive per-clip grounding on `perframelimb_smrc`, Prabin's hypothesis, 2026-07-18)
+
+**Hypothesis:** a rigid per-clip vertical shift Δ = that clip's own
+floorPen (the exact amount needed to zero its single worst-penetrating
+frame) converts penetration into float. A rigid shift is additive to every
+z-height metric (floorPen, worst_float, pen_pct) and invariant to
+everything not floor-height-based (coll_pct, vMax, n_spikes, jerk, skate —
+none depend on floor level or change under a constant offset). Since
+`smrc`'s worst_float already sits far below heightfix's, the post-shift
+worst_float should still win.
+
+**Analytic check (off the existing T3 CSV, before any build):**
+new_worst_float = old_worst_float + old_floorPen, exact per clip since the
+shift is uniform. Predicted: floor 3.96+6.05=10.01cm (vs heightfix 18.04,
+decisive win, 28/34 clips), loco 2.66+3.43=6.09cm (vs heightfix 6.61, thin
+win, 26/43 clips, 60% win rate).
+
+**Built for real** (`scripts/g1/sprint_s8_t5_grounding.py`): per-clip Δ
+recomputed directly from the pkl (not trusted from rounded CSV text) —
+matched the CSV floorPen values exactly (`fallAndGetUp2_subject2`
+Δ=22.66cm, `jumps1_subject2` Δ=17.58cm, etc). Re-ran the full 13-axis eval
+on all 77 clips, appended as a 6th variant column
+(`perframelimb_smrc_ground`) to `s8_t3_full_corpus.csv` (now 462 rows).
+
+**Confirmed exactly as predicted:** floorPen_cm = 0.000 both classes
+(exact). worst_float_cm = 10.008 floor / 6.085 loco — matches the analytic
+prediction (10.01/6.09) almost bit-for-bit. coll_pct, coll_peak_cm,
+joint_jerk_mean, body_jerk_mean, skate(L/R), vMax_rad_s, n_spikes are
+**bit-identical** before/after grounding, exactly as expected for a shift-
+invariant quantity — good sanity check that the shift is doing nothing but
+translating z. fidelity_ori_err_deg unchanged too (rotation untouched by
+translation). fidelity_pos_err_cm actually improved slightly rather than
+degrading (floor 12.41→12.22cm, loco 12.81→11.47cm, loco now nearly
+matches heightfix's 11.09cm) — the feared fidelity cost didn't materialize.
+
+**NEW FAILURE, not predicted by the analytic argument: `joint_ok_pct`
+collapses.** Floor 97.93%→**32.73%**, loco 98.65%→**50.80%**. Root cause,
+from `joint_ok_pct`'s own definition (`sprint_s5_metrics.py:69-92`): on
+every held/stance frame it requires BOTH whole-body pen<5mm AND the held
+foot's support_z within ±3cm of ground — a tight band, not just "no
+penetration." The per-clip Δ is calibrated to the clip's single WORST
+frame, which is typically a transient/dynamic moment (a fall, jump apex,
+mid-swing), not a stance frame. Median Δ is 4.36cm (floor) / 2.78cm (loco)
+— once Δ exceeds the ~3cm stance budget, which is most clips, previously-
+clean held frames get pushed out of the float band and start failing.
+`joint_ok` is R2.2's "un-gameable composite" — this is a collapse on the
+one axis the ruling treats as hardest to game, not a minor side cost.
+
+**Conclusion: naive constant-shift grounding is not a viable full fix.**
+It correctly zeroes floorPen/pen_pct and keeps worst_float ahead of
+heightfix, with no cost to coll/vMax/spikes/jerk/skate/fidelity — but it
+destroys joint_ok by construction, because a single global constant cannot
+satisfy a transient worst-frame correction and a tight per-stance-frame
+band at the same time. A working fix would need to be LOCAL (shift only
+around the handful of offending transient frames per clip, not the whole
+clip) — which loops back toward T2c/T2d's per-frame/windowed philosophy
+rather than a global height trick. Flagging this as a real, identified next
+avenue; not attempting it without sign-off.
+
+**Status: S8-DECISION still open.** Six variants now on record for the
+never-tradeable axes, none clears all six simultaneously:
+
+| variant | floorPen | n_spikes | vMax | coll_pct | worst_float | joint_ok |
+|---|---|---|---|---|---|---|
+| gmr_heightfix | win | win | win | lose | lose | lose |
+| perframelimb_smrc | lose | lose | lose | win | win | win |
+| perframelimb_smrc_ground | **win (0)** | lose | lose | win | win | **lose (collapse)** |
+
+(win/lose relative to `gmr_heightfix`, floor-class numbers, loco is
+directionally the same but thinner on worst_float/floorPen). Awaiting
+Prabin's read on how to proceed — visual T4 veto check on the existing
+renders is still outstanding regardless of which variant is being
+considered.
+
+## S8-T6 — local (windowed) grounding: sign-off given, built and evaluated
+
+Prabin's sign-off (2026-07-18): "go ahead and implement local grounding" —
+the next avenue flagged (not started) at the end of `## S8-T5`. Also asked
+"I hope it is followed by smoothing right?" — answered by construction, see
+below, not as a separate post-hoc pass.
+
+**Mechanism** (`scripts/g1/sprint_s8_t6_localground.py`), same windowed
+philosophy as T2d applied to root z instead of leg-DOF angles:
+1. `required[t] = max(0, -lowest_z[t])` — exact per-frame shift that alone
+   clears frame t (same quantity T5's global Δ was built from, but kept
+   per-frame instead of collapsed to one clip-wide max).
+2. `maximum_filter1d(required, window=2*RAMP_HALF+1)` (RAMP_HALF=0.15s) —
+   widens each spike into a plateau. A max filter can only increase values,
+   so this step alone already guarantees `>= required` pointwise.
+3. `gaussian_filter1d(..., sigma=0.07s)` — rounds the plateau's corners so
+   the envelope (and therefore root z velocity) is smooth. This IS the
+   "followed by smoothing" step Prabin asked about — built directly into
+   the shift's construction, not a separate global pass run afterward,
+   because a generic second smoothing pass over the whole clip risks
+   re-blurring the effector precision T5 already showed was cost-free to
+   preserve.
+4. `envelope = max(smoothed, required)` pointwise — restores the step-1
+   guarantee at any point step 3 pulled below it. After this, `envelope[t]
+   >= required[t]` for every t by construction, so `lowest_z[t] +
+   envelope[t] >= 0` always — floorPen=0.00 is an algebraic guarantee, not
+   an empirical result.
+`qpos[:,2] += envelope` (root z only, per-frame, not a rigid whole-clip
+shift like T5).
+
+**Build** (77/77 clips): touched-frame counts confirm the "broad but not
+majority" concentration finding from `## S8-T3` — median clip has 45-95
+penetrating frames out of several thousand (~1-2%), a few outliers higher
+(`fallAndGetUp2_subject2`: 300/4918, peak envelope 22.66cm — matches its
+known floorPen from T3 exactly, confirming `required` was computed
+correctly). Two clips had ~0 penetrating frames (`obstacles1_subject2`,
+`obstacles4_subject2`, peak envelope <0.1cm — floor noise, not real
+correction).
+
+**Eval, corpus means, full re-run through the pipeline (not analytic):**
+
+| metric (floor) | gmr_heightfix | perframelimb_smrc | smrc_ground (T5) | smrc_localground (T6) |
+|---|---|---|---|---|
+| joint_ok_pct | 0.19 | 97.93 | 32.73 | **99.30** |
+| floorPen_cm | 2.76 | 6.05 | 0.00 | **0.00** |
+| worst_float_cm | 18.04 | 3.96 | 10.01 | **6.56** |
+| coll_pct | 6.34 | 0.003 | 0.003 | 0.003 |
+| vMax_rad_s | 34.04 | 55.39 | 55.39 | 55.39 |
+| n_spikes | 0.18 | 1.24 | 1.24 | 1.24 |
+
+| metric (loco) | gmr_heightfix | perframelimb_smrc | smrc_ground (T5) | smrc_localground (T6) |
+|---|---|---|---|---|
+| joint_ok_pct | 46.26 | 98.65 | 50.80 | **98.89** |
+| floorPen_cm | 3.06 | 3.43 | 0.00 | **0.00** |
+| worst_float_cm | 6.61 | 2.66 | 6.09 | **4.17** |
+| coll_pct | 3.85 | 0.000 | 0.000 | 0.000 |
+| vMax_rad_s | 32.82 | 54.22 | 54.22 | 54.22 |
+| n_spikes | 0.00 | 1.12 | 1.12 | 1.12 |
+
+**Result: joint_ok did not just survive, it improved beyond plain smrc**
+(97.93→99.30 floor, 98.65→98.89 loco) — because some smrc held frames that
+failed joint_ok were failing specifically because the whole-body pen<5mm
+half of that test tripped during a held frame that overlapped a
+penetration window; local grounding fixes exactly those overlapping
+frames without touching any frame outside a window, so it can only help
+or be neutral on held frames, never hurt them the way a global constant
+does. `worst_float_cm` still clears heightfix by a wide margin (6.56 vs
+18.04 floor; 4.17 vs 6.61 loco) despite being higher than T5's number in
+absolute terms in loco (T6 adds height only where needed, so it's less
+"free" than a global shift, but still nowhere near heightfix's float).
+`vMax_rad_s`/`n_spikes`/`joint_jerk_mean` are bit-identical to plain smrc
+(55.39/54.22, 1.24/1.12, 3312.998/3345.414 exactly) — confirms the smooth
+envelope construction added no spurious joint velocity anywhere, i.e. the
+"followed by smoothing" design goal held up empirically, not just in
+theory. `coll_pct`, skate, fidelity_ori all identical to smrc (as
+expected, none of these are z-height-based). `fidelity_pos_err_cm`
+unchanged within noise (12.41→12.41 floor, 12.81→12.80 loco).
+
+**Updated never-tradeable scorecard** (vs `gmr_heightfix`, floor-class):
+
+| variant | floorPen | n_spikes | vMax | coll_pct | worst_float | joint_ok |
+|---|---|---|---|---|---|---|
+| perframelimb_smrc | lose | lose | lose | win | win | win |
+| perframelimb_smrc_ground (T5) | win | lose | lose | win | win | lose (collapse) |
+| perframelimb_smrc_localground (T6) | **win** | lose | lose | **win** | **win** | **win** |
+
+4 of 6 axes now clean wins, up from 3/6. The two remaining losses
+(n_spikes, vMax) are untouched by grounding by construction (confirmed
+bit-identical above) — they're a pre-existing smoothing/dynamics-quality
+gap already partially addressed by S8's held-aware smoothing, not
+something grounding was ever going to fix. This is the closest any variant
+has come to clearing the never-tradeable bar. T4 visual veto check (on
+`smrc`, not yet on `localground`) is still outstanding. S8-DECISION not
+written — presenting this table, not deciding on it.
+
+## S8-T7 — smoothing-weight sweep (relax tracking / raise regularization): negative, mechanism understood
+
+Prabin's ask (2026-07-18, post-T6): trade a bit more tracking fidelity for
+gains on the two remaining losses (n_spikes, vMax), via relaxed tracking
+weight / higher smoothing regularization, or an explicit max-velocity cap
+— "worth a try."
+
+**Mechanism identified**: `smrc` = `smooth_heldaware.py`'s `stage_a`
+(tridiagonal smoother, weights `lambda_track` vs `lambda_smooth`, corpus
+default 1.0/20.0) → `polish_median_limbwise._limbwise_pass` (re-clamp,
+`max_dq=0.15` trust region, restores floor/collision safety the smoothing
+pass perturbs). New script `scripts/g1/sprint_s8_t7_smooth_sweep.py`
+parameterizes both lambdas, rebuilds `smrc` + T6's local-grounding envelope
+on top, full corpus re-eval.
+
+**relaxA** (lambda_track 1.0→0.5, lambda_smooth 20→40) and **relaxB**
+(→0.25 / →80), both 77/77 clips, full pipeline (not analytic):
+
+| metric (floor) | smrc_localground (T6) | relaxA_localground | relaxB_localground |
+|---|---|---|---|
+| vMax_rad_s | 55.39 | 55.31 | 55.57 |
+| n_spikes | 1.24 | 1.18 | 1.21 |
+| joint_jerk_mean | 3313.00 | 3640.48 (+9.9%) | 4185.98 (+26.3%) |
+| fidelity_pos_err_cm | 12.41 | 13.58 (+9.4%) | 16.01 (+29.0%) |
+| fidelity_ori_err_deg | 11.08 | 14.53 (+31.1%) | 18.89 (+70.5%) |
+| worst_float_cm | 6.56 | 7.66 | 8.30 |
+| joint_ok_pct | 99.30 | 99.12 | 98.79 |
+
+(loco class same monotonic shape: vMax 54.22→53.71→54.99, n_spikes
+1.12→0.98→1.02, jerk 3345→3812→4678, fidelity_ori 11.29→15.49→19.53.)
+floorPen/coll_pct stayed pinned at win level both configs, as expected —
+protected downstream by re-clamp + T6 envelope, not by the smoothing
+weights, confirming that part of the design.
+
+**Result: monotonic negative, target metrics didn't move.** Pushing the
+lambda knob harder makes tracking fidelity, jerk, worst_float, and joint_ok
+all get steadily worse, in a straight line from relaxA to relaxB — while
+vMax/n_spikes stay flat or, at relaxB, tick back UP slightly (55.39→55.57
+floor). **Root cause: vMax/n_spikes are not produced by the smoothing
+pass.** They come from the re-clamp step's own independent per-frame DLS
+correction (fixed `max_dq=0.15` trust region), which runs regardless of how
+smooth its input already is, to restore floor/collision safety. A less-
+tracked, more-smoothed pre-clamp trajectory is further from feasible, so
+the re-clamp has to correct MORE, not less — jerk goes up, not down. The
+smoothing lambdas were never the lever for this axis.
+
+**The actual matching mechanism already exists and was already tried
+once.** `leg_floor_clamp.py`'s `CorrectionRateLimiter` (S8-T1b, `rl`/
+`rl2`) caps the clamp's applied per-frame correction directly — this is
+Prabin's "limiting the maximum velocity" idea verbatim. Tested in T1
+(`GMR-S8-plan.md` R1.1), before held-aware smoothing or local grounding
+existed: it did reach vMax/n_spikes parity with raw, but converted spikes
+into DRIFT — `perframelimb_rl` gave back float (2.9→6.1cm), range
+(7.3→10.3cm), skate (0.44→1.56cm) vs plain `perframelimb`. Demoted to an
+ablation row; T1b's 2-attempt cap was spent per the plan's failure-handling
+rule. That test predates T6's local grounding, which changes the pipeline
+materially (grounding now happens after the clamp, downstream of wherever
+the drift would land) — whether it would still trade the same way is an
+open, untested question, not a known negative in the current pipeline.
+
+**Not re-attempted without sign-off**: T1b's cap was already spent on this
+exact mechanism; re-running it a third time, even in the new T6 context, is
+a call for Prabin, not something to restart unilaterally. Flagging as the
+one remaining candidate lever for n_spikes/vMax; the smoothing-weight
+lever (this section) is closed out as negative and should not be
+revisited.
+
+## S8-T8 — rate-limited re-clamp + T6 grounding: sign-off given, real gain
+
+Prabin's sign-off (2026-07-18): "go ahead and try the rate limiter with
+T6." Key difference from T1b's original test: T1b rate-limited the
+ORIGINAL `perframelimb` clamp (built straight from raw retarget). This
+applies `CorrectionRateLimiter` (`rate_limit=0.15` rad/frame, same value
+T1b used) to the **re-clamp step inside `smrc`'s build** instead — the
+`_limbwise_pass` call that runs AFTER held-aware smoothing, which T7
+identified as the actual source of vMax/n_spikes. Pipeline:
+`perframelimb_sm.pkl` (standard λ_track=1.0/λ_smooth=20, unchanged,
+already built corpus-wide) → rate-limited re-clamp → `perframelimb_smrc_rl`
+→ T6's envelope grounding on top → `perframelimb_smrc_rl_localground`.
+New script `scripts/g1/sprint_s8_t8_rl_localground.py`. Full 77-clip
+corpus, real build+ground+eval (not analytic):
+
+| metric (floor) | gmr_heightfix | smrc_localground (T6) | smrc_rl_localground (T8) |
+|---|---|---|---|
+| vMax_rad_s | 34.04 | 55.39 | **37.39** |
+| n_spikes | 0.18 | 1.24 | **0.00** |
+| joint_jerk_mean | 5002.59 | 3313.00 | **2940.32** |
+| floorPen_cm | 2.76 | 0.00 | 0.00 |
+| coll_pct | 6.34 | 0.00 | 0.00 |
+| worst_float_cm | 18.04 | 6.56 | 7.55 |
+| joint_ok_pct | 0.19 | 99.30 | 98.85 |
+| fidelity_pos_err_cm | 12.60 | 12.41 | 12.40 |
+| fidelity_ori_err_deg | 6.97 | 11.08 | 11.06 |
+| skate_left/right_cm | 0.44/0.43 | 0.49/0.38 | 0.63/0.51 |
+| range_cm | 12.84 | 6.85 | 7.93 |
+
+(loco class same shape: vMax 32.82→54.22→**37.92**, n_spikes
+0.00→1.12→**0.00**, jerk 6189.09→3345.41→**3095.20**, floorPen/coll both
+0.00, worst_float 6.61→4.17→5.57 (still beats heightfix), joint_ok
+46.26→98.89→98.79, fidelity unchanged, skate 0.31/0.34→0.26/0.23→0.34/0.29,
+range 7.98→4.50→6.02.)
+
+**Result: n_spikes flips from a loss to a win/tie (0.00 vs heightfix's
+0.18 floor; 0.00 vs 0.00 loco — exact tie).** vMax drops from +63%/+65%
+over heightfix (T6) to +9.8%/+15.5% (T8) — still technically a loss but an
+order of magnitude closer, no longer the dramatic gap it was. Unlike T7's
+smoothing-weight sweep, **`joint_jerk_mean` went DOWN, not up** (-11.3%
+floor, -7.5% loco) — confirms T7's diagnosis was right: the re-clamp's own
+correction was the actual jerk source, and directly rate-limiting it (vs.
+trying to indirectly reduce its workload via smoother pre-clamp input)
+attacks the real mechanism. Small, real costs: worst_float +0.99cm floor /
++1.4cm loco (still clears heightfix by a wide margin both classes),
+joint_ok -0.45pp floor / -0.10pp loco (negligible, still crushes heightfix
+0.19%/46.3%), skate +0.13-0.14cm floor / +0.06-0.08cm loco (present but an
+order of magnitude smaller than T1b's original drift finding — 0.44→1.56cm
+— because this time the rate limiter only has to correct residual
+smoothing-perturbation, not the full raw-to-floor-safe correction T1b's
+context required), fidelity unchanged (noise-level). T1b's "spikes become
+drift" finding was directionally reproduced (skate/range both did get a
+little worse) but at roughly 1/10th the magnitude, because T6's downstream
+grounding and the already-smoothed `_sm` input change what the rate
+limiter has left to fix.
+
+**Updated never-tradeable scorecard** (vs `gmr_heightfix`, floor-class):
+
+| variant | floorPen | n_spikes | vMax | coll_pct | worst_float | joint_ok |
+|---|---|---|---|---|---|---|
+| perframelimb_smrc_localground (T6) | win | lose | lose | win | win | win |
+| perframelimb_smrc_rl_localground (T8) | win | **win/tie** | lose (much closer) | win | win | win |
+
+5 of 6 axes now win or tie, up from 4/6. vMax is the sole remaining
+loss, and it shrank from a 63-65% gap to a 10-16% gap. S8-DECISION not
+written — presenting, not deciding. `--rate 0.15` was the first value
+tried (matching T1b's own choice); not swept further this pass — a lower
+rate might close the vMax gap more at some additional skate/float cost,
+untested.
+
+## S8-T9 — T4 visual veto check (finally performed, on the T8 variant) + side-by-side white-floor render tooling
+
+T4 (R2.6's hard visual-veto rule) had been outstanding since the very
+start of S8 — flagged in every revision, never actually watched. Done now,
+on `perframelimb_smrc_rl_localground` (the current best, T8), per Prabin's
+explicit ask, alongside new render tooling.
+
+**Render tooling built** (Prabin's ask: side-by-side comparison + white
+floor instead of "the mujoco black and white madness"):
+- `g1_model_setup.py`'s `load_g1_model_with_vetted_collision_and_floor`
+  gains an opt-in `white_floor=True` kwarg (default False, byte-identical
+  for every existing eval/build caller). Root cause of the checker/grid
+  noise, found by inspection: the base `g1_mocap_29dof.xml` ships its OWN
+  static `floor` geom (material "groundplane": checker texture + black
+  edge marks), and this loader's own injected mocap-body floor plane sits
+  exactly coincident with it (both at z=0) — the two z-fight, and the
+  "hex/triangle" pattern in every prior render was that z-fighting on top
+  of the checker texture, not a mesh/lighting artifact. Fix: `white_floor`
+  recolors BOTH geoms to the same flat white material (reflectance=0,
+  shininess=0, specular=0) — removes the checker entirely and makes the
+  z-fighting imperceptible (either winner renders identically). One
+  footgun hit + fixed en route: MuJoCo multiplies `geom_rgba` onto the
+  material's rgba at render time, so the compiler-default gray geom_rgba
+  (0.5,0.5,0.5,1) silently greyed out an otherwise-white material until
+  `geom.rgba=[1,1,1,1]` was also set explicitly on both geoms.
+- New `scripts/g1/render_sidebyside.py`: renders two pkls of the same clip
+  in twin panels (independent model/data/renderer per side, same camera),
+  each panel keeping the existing penetration-annotation overlay
+  (`render_penetration_annotated.py`'s mesh-accurate `_geom_lowest_z`, red
+  border flash + depth/body label), composited into one mp4.
+
+**Renders produced** (`s8_renders_t8/*.mp4`, `gmr_heightfix` left vs
+`perframelimb_smrc_rl_localground` right): the existing R0 3 clips
+(`walk3_subject1`, `fallAndGetUp1_subject1`, `ground1_subject1`) +
+`fallAndGetUp2_subject2` (the historically worst floor-pen clip, 22.66cm
+pre-grounding) + `sprint1_subject4` (worst vMax for this specific variant,
+47.9 rad/s, picked to visually stress-test the one remaining metric loss).
+Per-clip penetration tallies from the render script itself: our side is
+0.0% penetrating frames on all 5 clips (vs GMR-full's 0.0-0.7%) — matches
+the corpus table.
+
+**Veto check method**: 2x2 contact sheets (4 evenly-spaced frames per
+clip, both panels visible, penetration label legible), 20 frames total
+across the 5 clips, visually inspected directly (not just trusting the
+metric).
+
+**Result: PASSES, no disqualifying defect on any sampled frame.** Poses
+track GMR-full's own timing/stance closely at every sampled instant (near-
+identical silhouettes side by side) on steady walking, sprinting stride,
+crouching, falling-to-ground, all-fours crawling, and prone-on-ground
+poses — no teleporting, no limb-through-body contortion, no snapping.
+Floor contact stays clean (0.00cm) at every one of our sampled frames,
+including one frame where GMR-full itself showed a small penetration
+(0.28cm, left_elbow_link, walk3_subject1) that ours didn't. The
+worst-vMax clip (`sprint1_subject4`) — the one axis still nominally a
+loss — showed nothing visually alarming at its sampled frames either; a
+20-frame sample can't rule out a single-instant issue between samples,
+but combined with the corpus metric (`n_spikes`=0.00 for this variant on
+both classes) there's no positive signal of a problem, just the residual
+elevated mean velocity already known from the T8 table.
+
+**T4 is now cleared for the current best variant.** Combined with T8's
+5/6 never-tradeable scorecard, this is the strongest evidence package any
+variant has had this sprint. S8-DECISION still not written — presenting,
+not deciding.
+
+## S8-DECISION (2026-07-18, Prabin) — lock `perframelimb_smrc_rl_localground` as the working baseline
+
+Prabin's call, given directly rather than as a separate written gate review:
+**ship `perframelimb_smrc_rl_localground` (T6 local grounding + T8
+rate-limited re-clamp) as the locked method**, accepting T8/T9's 5/6
+never-tradeable scorecard rather than continuing to chase the 6th (vMax)
+before locking. `scripts/g1/sprint_s8_lock_final.py`'s own docstring
+records the instruction verbatim: *"Prabin (2026-07-18): lock this variant
+as the working baseline for now."* It pulls the 77-clip corpus rows
+straight from the existing `s8_t3_full_corpus.csv` build (no re-solve) and
+adds corpus-wide hand slip — never tracked before this pass — into
+`outputs/gmr_baseline/sprint/s8_LOCKED_perframelimb_smrc_rl_localground.csv`,
+now the canonical results file for the locked variant. `GMR-METHOD.md`
+(new, repo root) is the corresponding method writeup: a plain-language
+walkthrough (§§1-11) plus a full mathematics appendix (§12, every `[ours]`
+stage — the DLS floor/self-collision clamp, held-aware tridiagonal
+smoothing, the local grounding envelope's max-filter/gaussian/pointwise-max
+construction, and the rate limiter) for readers who want the algebra.
+
+**Does the locked variant beat `gmr_heightfix` on all 6 never-tradeable
+axes simultaneously? No — 5 of 6, unchanged from T8/T9** (this decision is
+a data pull + lock, not a rebuild, so the numbers are identical up to the
+new hand-slip columns):
+
+| axis (floor-class) | gmr_heightfix | **LOCKED** (`perframelimb_smrc_rl_localground`) |
+|---|---|---|
+| floorPen_cm | 2.76 | **0.00 — win** |
+| n_spikes | 0.18 | **0.00 — win/tie** |
+| vMax_rad_s | 34.04 | 37.39 — **lose** (narrowed to +9.8%) |
+| coll_pct | 6.34 | **0.00 — win** |
+| worst_float_cm | 18.04 | **7.55 — win** |
+| joint_ok_pct | 0.19 | **98.85 — win** |
+
+(loco-class, same shape: vMax 32.82 vs 37.92 — lose, +15.5%; n_spikes 0.00
+vs 0.00 — tie; floorPen/coll_pct/worst_float/joint_ok all win, joint_ok
+46.26→98.79.) `gmr_raw` (no grounding at all) stays a reference point only
+per R1.2's standing rule, never the comparison baseline.
+
+**What was traded, stated plainly** (per the plan's "present the honest
+pareto" instruction):
+- **vMax stays a real, open cost** — 9.8% (floor) / 15.5% (loco) higher
+  peak joint velocity than `gmr_heightfix`. This is the one axis the whole
+  S8 sprint (T2/T2c/T2d/T6/T7/T8) worked to close and did not fully close:
+  T7 proved it isn't a smoothing-weight problem, T8 proved rate-limiting
+  the re-clamp is the correct lever and got most of the way there (a
+  63-65% gap shrank to 9.8-15.5%), but not to parity.
+- worst_float (7.55cm floor / 5.57cm loco) and joint_ok (98.85%/98.79%)
+  both still crush `gmr_heightfix` by a wide margin — the sprint's central
+  claim (contact correctness, not just "no floor penetration") is not a
+  close call.
+- Corpus-wide hand slip is measured for the first time this pass
+  (0.66-0.73cm mean, n=32 clips with a genuine hand-hold segment) —
+  `gmr_heightfix` has no equivalent number since it has no hand-contact
+  handling at all; this is a new reported capability, not a comparison
+  axis.
+- T4's visual veto (`## S8-T9`) already passed clean on this exact
+  variant — the 5/6 scorecard is not just a metric table, it has been
+  watched.
+
+**Supersedes S7-DECISION.** `## S7-DECISION` presented four options for
+`perframelimb` vs `gmr_contact_fc`: (A) promote perframelimb, (B) keep fc
+primary, (C) per-class hybrid, (D) close the smoothness gap first then
+decide. S8's whole sprint IS option A followed by D in the order D
+suggested — perframelimb was promoted, then (T2/T6/T7/T8) the
+smoothness/jerk gap S7-DECISION flagged as unmeasured was measured and
+directly worked on until it narrowed from a 63-65% vMax gap to 9.8-15.5%.
+`gmr_contact_fc`/`gmr_contact_fc_sm` are retired from primary-method
+consideration as of this decision — the locked variant descends from the
+`perframelimb` lineage (S6 Phase B → S7-T3's `--center perframe` fix → S8's
+smoothing/re-clamp/grounding/rate-limit stack), not from S5/S6's in-solve
+contact-layer mechanism.
+
+**S9 (mimic pilot) is confirmed as the next gate, not this decision.** Per
+Prabin's own standing framing ("if our method wins in mimic training, then
+only this can become a paper"): this kinematic lock is necessary but not
+sufficient for the paper. Nothing here has been checked through a physics
+simulator or a learned imitation policy (`GMR-METHOD.md` §13 states this
+limitation explicitly). S9 is Prabin's to start, not scoped in this sprint.
+
+**Docs done as part of this decision**: `GMR-METHOD.md` (new), this entry,
+`wiki/experiments/gmr-baseline-sprint-s8.md` (new), `wiki/index.md`,
+`wiki/log.md`, and a new S8 discussion section in
+`GMR-baseline-results.md` — per `GMR-S8-plan.md`'s "Docs & discussions"
+spec, all done in one pass now that S8-DECISION is written.
+
+---
+
+## S9-T0/T1 (2026-07-19, branch `gmr-baseline`) — posture-continuity + limit-repulsion: T1 gate FAILS at 2 attempts, T0 needs re-scoping
+
+Full plan: `GMR-S9-plan.md`. Trail: this session's conversation (visual
+review of S8-locked renders found real defects the aggregate table didn't
+show — see plan's "Why S9 exists").
+
+**T0 (done, kept)**: root-caused `sprint1_subject4`'s worst vMax event
+(t=6306, 47.9 rad/s) to a DLS solution branch-flip — `left_hip_yaw`/
+`right_ankle_pitch` alternate between two configurations frame to frame on
+a FLAT raw GMR target (no real motion). Built `leg_floor_clamp.clamp_limb`'s
+opt-in `q_prev_chain`/`posture_weight` (null-space bias toward the previous
+frame's own chain posture, default `None` = byte-identical no-op, verified)
+and `polish_median_limbwise._limbwise_pass`'s matching `posture_continuity`/
+`posture_weight`. On `sprint1_subject4` alone: hip_yaw flip fixed, vMax
+47.9→40.8 (-15%), but ankle_pitch's bang-bang persisted and worst_float
+regressed +9% (20.62→22.59cm).
+
+**New finding this entry (T1's dev-clip run exposed it)**: T0 was only
+validated against `sprint1_subject4` in isolation. Running it against the
+S8-T0b 5 dev clips (walk1_subject1, walk3_subject1, run2_subject1,
+ground1_subject1, fallAndGetUp1_subject1) for the first time shows
+`posture_weight=1.0` has REAL, uncosted regressions on 4/5 of them:
+
+| clip | joint_ok off→posture | worst_float off→posture |
+|---|---|---|
+| walk1_subject1 | 100.0→99.6 | 2.80→7.35cm |
+| walk3_subject1 | 99.5→98.7 | 7.09→12.27cm |
+| ground1_subject1 | 99.0→97.2 | 5.52→13.52cm |
+| fallAndGetUp1_subject1 | 98.5→94.3 (new 0.02% coll) | 9.85→11.50cm |
+| run2_subject1 (only improvement) | 99.0→98.5 | 8.87→7.51cm |
+
+T0's win is real on its target clip but was never cross-checked against
+the clips S8's own gates were built on — flagging this now rather than
+building T2/T3 on top of an unvalidated T0 default.
+
+**T1 (2-attempt cap spent, gate FAILS)**: added a second null-space term,
+`limit_margin`/`limit_weight` (repel from hard joint limits, combined
+additively with T0's posture bias before null-space projection), targeting
+ankle_pitch's specific hard-limit bang-bang.
+
+- Attempt 1 (`limit_margin=0.15, limit_weight=1.0`): target case barely
+  moved (ankle still hits 0.524 exactly at the same frames). Real bonus
+  effect elsewhere though — CLAWS BACK most of T0's own regression on 3/5
+  dev clips (walk3_subject1 worst_float 12.27→6.70cm, BETTER than the
+  shipped baseline's 7.09; run2_subject1 joint_ok fully recovers to 99.0%,
+  matching baseline; fallAndGetUp1_subject1 worst_float 11.50→8.94cm,
+  also beating baseline's 9.85, coll% back to 0.00%). One regression:
+  `ground1_subject1` joint_ok 97.2→92.3% (worse than posture-alone, worse
+  than baseline).
+- Attempt 2 (`limit_margin=0.2, limit_weight=3.0`): ankle_pitch finally
+  detaches from the exact limit at several frames (no longer a clean
+  binary bang-bang) but the target clip's vMax gets WORSE, not better
+  (40.8→43.5 rad/s) — pushing harder trades a clean-if-ugly bang-bang for
+  a higher-frequency wobble. `ground1_subject1` regresses FURTHER
+  (92.3%→88.1% joint_ok, an 11-point loss vs baseline) and
+  `walk3_subject1`'s attempt-1 recovery partially reverses (99.5%→98.3%).
+  Regressions grow monotonically with weight; the target metric (vMax)
+  moves the wrong direction. This is consistent with the T0 writeup's
+  standing hypothesis: near a hard limit, which chain DOFs are "free"
+  (null space) vs. "task-required" (row space) can itself flip depending
+  on which side of the limit a frame started from — a genuine kinematic
+  branch point that a null-space bias term structurally cannot out-vote,
+  whatever its weight. Pushing harder just fights the primary task instead
+  of finding a free alternative.
+
+**Per S9's standing rule (2-attempt cap, log honestly, stop, escalate —
+do not design a third mechanism): T1 STOPS here.** Code stays in place
+(`limit_margin`/`limit_weight`, default `0.0` = byte-identical no-op), not
+enabled by default. Escalating to Prabin: (a) T1's ankle-specific mechanism
+doesn't clear its own gate and shouldn't ship as-is; (b) T0's own
+`posture_weight=1.0` default needs a decision before T2/T3 build on top of
+it — options not yet tried: sweep `posture_weight` down (e.g. 0.3-0.5) to
+see if a gentler pull keeps most of the target win with less collateral,
+or gate posture-continuity to only engage where a branch-flip signature is
+actually detected (large frame-to-frame delta on a near-static raw target)
+rather than blanket every frame.
+
+
+## S9-T0-gate (2026-07-19, branch `gmr-baseline`) — raw-velocity-gated posture-continuity: dev-clip PASS, full-corpus MIXED, not shipped
+
+Answers `## S9-T0/T1`'s open item (b): gate T0's posture-continuity bias
+instead of sweeping its weight down. Full plan context: `GMR-S9-plan.md`.
+
+**Mechanism**: `polish_median_limbwise._limbwise_pass` gains
+`posture_gate_lo`/`posture_gate_hi`/`raw_gate_qpos` (opt-in, both `None` =
+byte-identical to T0's blanket behavior). Per chain per frame, T0's
+`posture_weight` is scaled by how much that chain's TRUE, UNTOUCHED GMR raw
+target moved frame-to-frame (`raw_gate_qpos`, e.g. `outputs/gmr_baseline/
+sprint/pkl/{clip}.pkl`) -- full weight when raw delta <= `posture_gate_lo`
+(near-static), zero when raw delta >= `posture_gate_hi` (genuine motion),
+linear ramp between. Caught a real bug before shipping this: gating on
+THIS pass's own input (`_perframelimb_sm.pkl`) instead of the pristine raw
+pkl gates backwards, since that input already carries the upstream
+branch-flip artifact this mechanism targets -- confirmed by direct
+measurement (`sprint1_subject4`'s diagnosed window shows delta up to
+1.1-1.3 rad in the smoothed input at exactly the frames where the TRUE
+raw signal only moves 0.002-0.017 rad).
+
+**Threshold pick, not guessed**: scratch analysis (`raw_delta_stats2.py`,
+scratchpad, not committed) of raw per-frame max chain-joint delta across
+the S8-T0b 5 dev clips + `sprint1_subject4`: diagnosed flat window
+(t=6294-6302) sits at 0.002-0.017 rad/frame; ordinary locomotion runs
+0.03-0.16 rad/frame (p50 across clips). `lo=0.02/hi=0.05` sits below
+normal locomotion on every dev clip, engaging only on genuinely static/
+idle frames.
+
+**Attempt 1 (gate1, lo=0.02/hi=0.05) -- dev-clip check (`sprint_s9_t0gate_probe.py`, 6 clips)**:
+
+| clip | worst_float off->gate1 | joint_ok off->gate1 | (T0 blanket, for reference) |
+|---|---|---|---|
+| walk1_subject1 | 2.80->2.80 (+0.00) | 100.0->100.0 (+0.0) | +4.55cm / -0.4pp |
+| walk3_subject1 | 7.09->7.09 (+0.00) | 99.5->99.5 (+0.0) | +5.18cm / -0.8pp |
+| run2_subject1 | 8.87->8.87 (+0.00) | 99.0->99.0 (+0.0) | -1.36cm / -0.5pp |
+| ground1_subject1 | 5.52->5.69 (+0.16) | 99.0->98.4 (-0.61) | +8.00cm / -1.8pp |
+| fallAndGetUp1_subject1 | 9.85->9.85 (+0.00) | 98.5->98.5 (+0.0) | +1.65cm / -4.2pp |
+| sprint1_subject4 (target) | vMax 47.9->46.1 (-3.8%) | worst_float 20.62->22.43 (+8.8%) | vMax -14.8% / float +9.6% (blanket) |
+
+Dev-clip collateral from T0's blanket weight is essentially eliminated
+(4/5 exact, ground1 shrunk from +8.00cm to +0.16cm). Target-clip win is
+PARTIAL: ~25% of blanket's vMax reduction retained (hip_yaw's flip
+visibly damped in the window trace, no longer diving to its negative
+branch), `worst_float`'s regression NOT fixed (same magnitude as blanket).
+
+**Attempt 2 (gate2, lo=0.02/hi=0.065) -- widen to catch the worst-vMax
+frame itself** (t=6306, raw delta 0.054-0.058, sits almost exactly at
+gate1's hi=0.05 cutoff): FAILS. Target clip's vMax identical to gate1
+(46.1, zero additional gain), while `fallAndGetUp1_subject1` regresses
++2.99cm worst_float (new, real, wasn't present in gate1) and ground1's
+residual doubles (+0.16->+0.33cm). Per S9's 2-attempt cap and Prabin's
+own pre-stated fallback rule: dropped back to gate1 as final.
+
+**Full 77-clip corpus** (`sprint_s9_t0gate_full_corpus.py`, new variant
+`perframelimb_smrc_pg_localground`, same shipped pipeline + gate1 in the
+re-clamp step only, nothing after -- local grounding runs downstream,
+untouched): appended to `s8_t3_full_corpus.csv` (847 rows total). 3-way
+vs `gmr_heightfix` / shipped `perframelimb_smrc_rl_localground`:
+
+| axis | class | shipped | pg | verdict |
+|---|---|---|---|---|
+| vMax_rad_s | floor | 37.39 | 34.35 | **-8.1%, generalizes past the dev set** |
+| vMax_rad_s | loco | 37.92 | 36.57 | **-3.5%, generalizes** |
+| joint_jerk_mean | floor | 2940.3 | 3134.8 | +6.6%, new cost (dev gate never tracked jerk) |
+| body_jerk_mean | floor | 171.0 | 193.3 | +13.1%, new cost |
+| skate_left/right | floor | 0.63/0.51cm | 0.72/0.62cm | +13-21%, new cost -- and `gmr_heightfix` itself is BETTER here (0.44/0.43cm) than either G1 variant, pg widens that pre-existing gap |
+| joint_jerk/body_jerk/skate | loco | -- | -- | same-direction, smaller (+0.3% to +10%) |
+| floorPen/coll/joint_ok/fidelity/n_spikes | both | -- | -- | wash, no consistent sign, all safety axes untouched |
+
+**Verdict: MIXED, not a clean win, NOT shipped as the new default.** The
+vMax reduction this whole T0/T1/T0-gate line exists to chase is real and
+generalizes corpus-wide (closes most of S8-DECISION's one open gap on
+floor-class clips: 63-65% baseline gap -> 9.8-15.5% at S8 lock -> now
+further reduced). But it comes at a corpus-scale cost the narrow 6-clip
+dev gate never had visibility into (jerk, skate) -- exactly the
+overfitting risk a small dev-clip gate can hide, caught only by going to
+full-corpus scale. Skate is the more concerning of the two: it's already
+a pre-existing weakness of the G1 clamp mechanism relative to
+`gmr_heightfix` (this pipeline's phase-1/phase-2 DLS clamp has no
+zero-slip guarantee the way Alex's Stage-B contact QP does), and `pg`
+widens it further on the exact axis ("does contact-aware correction
+actually stop foot slip") most central to this method's own story.
+
+**Code state**: `posture_gate_lo`/`posture_gate_hi`/`raw_gate_qpos` land
+in `leg_floor_clamp.py`/`polish_median_limbwise.py` as opt-in params,
+default `None` = byte-identical no-op (unchanged from T0's own no-op
+guarantee). `gate1`'s thresholds (0.02/0.05) are the validated choice if
+this mechanism is used at all; NOT wired into any default pipeline call.
+`sprint_s9_t0gate_probe.py` (6-clip dev gate) and
+`sprint_s9_t0gate_full_corpus.py` (77-clip corpus + 3-way table) both new,
+uncommitted.
+
+**Open item, not resolved this entry**: which clips/frames drive the
+jerk/skate regression, and whether it's fixable (e.g. narrowing the gate
+further, or gating on a per-DOF rather than whole-chain-max delta) or is
+an inherent trade of this null-space mechanism. Escalated to Prabin,
+not unilaterally re-attempted (2-attempt cap already spent on gate1/gate2).

@@ -8,8 +8,12 @@ Math ground truth: `METHOD.md`. Knowledge base: `wiki/`. Current state: `SESSION
 2. Read `wiki/index.md` — then open ONLY the wiki pages the task needs. Do NOT re-explore the codebase for anything the wiki already covers.
 
 ## Session upkeep
-- Update `SESSION_HANDOFF.md` only when Prabin instructs.
+- Update `SESSION_HANDOFF.md` only when Prabin instructs. Keep it a pointer, not an archive — trim
+  finished threads back to one line once their detail lives in `wiki/log.md`/`planLog*.md`.
 - The wiki is yours to maintain: after meaningful work (new result, decision, experiment, diagnosis), update the touched wiki pages, keep `wiki/index.md` lean and current, append one line to `wiki/log.md` (`## [YYYY-MM-DD] <op> | <what>`). Don't duplicate METHOD.md math in the wiki — summarize and point.
+- `wiki/log.md` is append-only and can get long — never read it in full. Newest entries are at the
+  bottom (confirmed by inspection, not by the header's own wording): use `tail -N` for "what's
+  recent," or `grep "^## \["` for a specific date/topic, and quote only the matched lines back.
 
 ## Conventions (critical — violations corrupt data silently)
 - Coord frame: +X forward, +Y left, +Z up. Quaternions: **wxyz** everywhere.

@@ -58,9 +58,23 @@ def _extract_cylinder_specs(vetted_path: Path):
 def load_g1_model_with_vetted_collision_and_floor(
     mocap_path: Path = MOCAP_MODEL_DEFAULT,
     vetted_collision_path: Path = VETTED_COLLISION_URDF,
+    white_floor: bool = False,
 ):
     """Returns (model, data, floor_gid, floor_mocap_id) -- same return shape as
-    `_load_model_with_floor` elsewhere in this codebase."""
+    `_load_model_with_floor` elsewhere in this codebase.
+
+    `white_floor` (opt-in, render-only, no physics effect): replaces the
+    checker/edge-mark "groundplane" material with a flat white one on BOTH
+    floor planes in the compiled model -- the base mocap XML already ships
+    its own static `floor` geom (material "groundplane", checker + black
+    edge marks), and this loader's own injected `FLOOR_GEOM_NAME` mocap
+    plane sits exactly coincident with it (both at z=0), so the two z-fight
+    on top of the checker pattern -- the "hex/triangle" render noise is
+    that z-fighting, not a mesh artifact. Recoloring both to the same flat
+    white removes the checker AND makes the z-fighting imperceptible
+    (either winner renders identically). Off by default so every existing
+    eval/build caller (which doesn't care about geom appearance) stays
+    byte-identical."""
     cyl_specs = _extract_cylinder_specs(vetted_collision_path)
 
     spec = mujoco.MjSpec.from_file(str(mocap_path))
@@ -85,8 +99,21 @@ def load_g1_model_with_vetted_collision_and_floor(
         n_added += 1
 
     floor_body = spec.worldbody.add_body(name=FLOOR_BODY_NAME, mocap=True)
-    floor_body.add_geom(name=FLOOR_GEOM_NAME, type=mujoco.mjtGeom.mjGEOM_PLANE,
+    floor_geom = floor_body.add_geom(name=FLOOR_GEOM_NAME, type=mujoco.mjtGeom.mjGEOM_PLANE,
                         size=[0, 0, 0.01], pos=[0, 0, 0])
+
+    if white_floor:
+        white_mat = spec.add_material(name="g1_floor_white_mat")
+        white_mat.rgba = [1, 1, 1, 1]
+        white_mat.reflectance = 0.0
+        white_mat.shininess = 0.0
+        white_mat.specular = 0.0
+        for g in (floor_geom, spec.geom("floor")):
+            g.material = "g1_floor_white_mat"
+            # geom_rgba multiplies the material's rgba at render time; the
+            # compiler default (0.5, 0.5, 0.5, 1) would grey out an
+            # otherwise white material, so it must be set explicitly too.
+            g.rgba = [1, 1, 1, 1]
 
     model = spec.compile()
     data = mujoco.MjData(model)

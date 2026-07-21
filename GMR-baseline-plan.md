@@ -750,3 +750,18 @@ Standing rules that bit us this session (violating these silently corrupts numbe
    (GMR-polished +13cm vs contact-in-the-solve -3cm). Also always carry the caveat: float% counts
    genuinely airborne frames (jumps, mid-fall flight) — it indicts a reference only where support
    is expected.
+
+## SUPERSEDED (2026-07-17) — "Next actions" above is stale
+
+S3 finished long ago (`planLogGMR.md ## S3-*`) and killed the framing this whole plan
+was building toward: a per-clip constant Z-shift on `gmr_polished` beats OURS-DLS on
+held-frame-within-3cm AND max floorPen — the only un-gameable target is the JOINT
+metric (held contact AND whole-body pen, simultaneously), which nothing passed. S4
+(`GMR-S4-plan.md`, also superseded) tried to fix OURS-DLS's penetration directly; best
+result (tuned `--swing-clear`) never cleared the gate. S5 (`GMR-S5-plan.md`, CURRENT)
+pivoted after Prabin visually compared renders: GMR's own tracking is the base now,
+with a minimal contact layer on top. `knee_bias` root-cause (item 2 above) and the
+local/adaptive over-reach correction (item 3) were never revisited under this framing
+and are not currently planned — OURS-DLS is retired to an ablation role, not the
+primary method. Current state: `planLogGMR.md ## S5-*`, results:
+`GMR-baseline-results.md`'s Sprint S5 section.

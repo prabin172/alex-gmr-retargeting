@@ -1,5 +1,12 @@
 # GMR Sprint S4 plan — fix OURS floor penetration, then re-earn the corpus claim
 
+> **SUPERSEDED 2026-07-17 by `GMR-S5-plan.md`.** T1–T4 were executed (see
+> `planLogGMR.md ## S4-*`; best result: tuned `--swing-clear`, mean pen% 55.9 — gate
+> pen%≤10 not cleared). T5/T6 will never run under this plan: after visual comparison
+> of the annotated renders, Prabin pivoted to GMR's mink-based tracking as the base
+> with a contact layer on top. The joint metric (T5) and oracle-shift baseline carry
+> over into S5 unchanged. Kept for reference only — do not execute.
+
 Execution plan for a lower model. Self-contained: read this fully before touching anything.
 Branch: `gmr-baseline`. All Python via `conda run -n gmr python ...` from repo root.
 
