@@ -76,8 +76,10 @@ outputs/ihmcJsons50hz/<clip>.json                           Stage 6b output (50 
 Stages 1–2 are skipped automatically if the `*_with_orient.npz` already exists (safe to re-run).
 Stage 3 is skipped if `*_contactfirst.npz` already exists. Stages 4–6 always re-run.
 
-Useful env overrides (all optional): `LAMBDA_SMOOTH=320`, `N_OUTER=6`, `GROUND_MODE=constant-contact`,
-`RENDER_MESH=visual|collision|<path>`, `RENDER=0` (skip render), `CLIPS_MATCH=<substring>` (run subset).
+Useful env overrides (all optional): `LAMBDA_SMOOTH=320`, `N_OUTER=6`, `GROUND_MODE=constant-contact`
+(use `local` for fall/get-up clips whose lying/crouch phase sinks through the floor under a single
+shift — cheapest fix that still guarantees zero penetration), `RENDER_MESH=visual|collision|<path>`,
+`RENDER=0` (skip render), `CLIPS_MATCH=<substring>` (run subset).
 Full list with defaults and trade-offs: **[PARAMETERS.md](PARAMETERS.md)**.
 
 ## Conventions
@@ -95,6 +97,11 @@ interpenetration). The Mimic-ready contact-labels export is not yet wired on the
 
 ## Branches
 
-`main` — current contact-first + fullmesh line. `initialBaseline` — the earlier posori/worlddelta baseline
-(tag `baseline-posori-worlddelta-v1`) kept for reference. `feature/fbx-kinematic-canonical-v2` — a parallel
-solver with different segment assumptions, kept for exploration.
+`main` — current contact-first + fullmesh line for Alex (this repo's primary target). `gmr-baseline` —
+a separate retargeting line for the Unitree G1, feeding a paper on floor-contact retargeting; independent
+robot, independent pipeline, not merged into `main`. `phasic-v2` — a full pipeline redesign, closed:
+real idea, results didn't clear the ship bar (Prabin's call) — not merged, kept for reference only.
+`develop` — older floor-collision experiments, superseded in spirit by work now in `main`. `feature/fbx-
+kinematic-canonical-v2` — a parallel solver with different segment assumptions, kept for exploration.
+The earlier posori/worlddelta baseline branch (`initialBaseline`) has been deleted — its state is
+preserved at tag `baseline-posori-worlddelta-v1`.

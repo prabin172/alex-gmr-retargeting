@@ -77,8 +77,10 @@ Registers the trajectory to the floor plane (z=0). Detail: `wiki/concepts/ground
 
 | Knob | Default | What it does | Trade-off / when to touch |
 |---|---|---|---|
-| `GROUND_MODE` | `constant-contact` | **`constant-contact`** = ONE vertical shift keyed to the **planted-foot soles** ⇒ no bobbing, feet stay down. **`perframe`** = plant the lowest contact every frame (wanders 7–9 cm as the lowest contact migrates hands→knees→feet). **`constant`** = one shift to the global-lowest geom. | `constant-contact` is right for **clips that end standing**. **Fall clips** (kneelingFall_02/03) punch a late free foot through the floor under a single shift — those want `perframe`/hybrid. Pick by whether the clip ends on its feet. |
-| `GROUND_SMOOTH` | `80` | `perframe` only: tridiagonal smoothing on the per-frame shift series. | **∝ fps² → ×16 vs 30 Hz value of 5.** Unused by `constant-contact`. |
+| `GROUND_MODE` | `constant-contact` | **`constant-contact`** = ONE vertical shift keyed to the **planted-foot soles** ⇒ no bobbing, feet stay down. **`perframe`** = plant the lowest contact every frame (wanders 7–9 cm as the lowest contact migrates hands→knees→feet). **`constant`** = one shift to the global-lowest geom (at `GROUND_PERCENTILE=0` this is the **heightfix** — guarantees zero penetration for the whole clip, at the cost of floating every other frame by the clip's single worst violation). **`hybrid`** = `constant-contact` base shift + a per-frame QP lift capped so a still-planted foot is never floated — real improvement, but the cap can starve the lift a different, deeply-penetrating body part needs in the same frame (doesn't close the gap on the worst clips). **`local`** = `constant-contact` base shift + a per-frame envelope top-up with **no cap** (ported from G1/`gmr-baseline`'s `sprint_s8_t6_localground.py`) — guarantees zero penetration like heightfix, but only floats the frames that actually need it. On the two Luigi clips this cut average float from heightfix's 9.6/16.7 cm to **0.7 cm**. | `constant-contact` is right for **clips that end standing**. **Fall/get-up clips** (kneelingFall_02/03, Luigi clips) that punch a late free foot or a lying/crouch phase through the floor under a single shift — use `local`, not `perframe`/`hybrid`: it's the only mode validated to close the gap cheaply (see `wiki/concepts/grounding.md`). `local`'s ramp width/smoothing (`--local-ramp-half-sec`/`--local-ramp-sigma-sec`) and `hybrid`'s lift smoothing (`--lift-smooth`/`--lift-float-tol`) aren't currently pipeline-env-overridable — call `post_process_ground_contactfirst.py` directly if you need to sweep them. |
+| `GROUND_SMOOTH` | `80` | `perframe` only: tridiagonal smoothing on the per-frame shift series. | **∝ fps² → ×16 vs 30 Hz value of 5.** Unused by `constant-contact`/`hybrid`/`local`. |
+
+**Final safety-net top-up (always on, no knob)**: after whichever `GROUND_MODE` computes its shift, the script unconditionally checks the result and adds one more constant clip-wide top-up if anything is still below the floor — closing `hybrid`'s per-plant-cap gap or any mode with no guarantee of its own. Typically a no-op after `constant`/`local` (already at or near zero); a real correction after `perframe`/`constant-contact` alone. Saved as `ground_final_topup_m` in the output NPZ. Design rationale ("penetration is worse than float"): `METHOD.md` §7.
 
 ## Stage 5 / 6 — render + export
 
@@ -110,7 +112,7 @@ Full table + derivation: `wiki/concepts/pipeline.md` § "Solve rate". If you eve
 | Less self-collision | `N_OUTER`↑, or `COPLANAR_FEET_MODE=mean`, or `FLOOR_WEIGHT`↓. |
 | Smoother / less jittery motion | `LAMBDA_SMOOTH`↑ (remember it's already ×16-scaled). |
 | Feet flatter / more planted | `FLOOR_WEIGHT`↑ with `GROUND_MODE=constant-contact`. |
-| Fix a **fall** clip sinking through the floor | `GROUND_MODE=perframe` for that clip (constant-contact can't hold a late free foot). |
+| Fix a **fall/get-up** clip sinking through the floor | `GROUND_MODE=local` for that clip (constant-contact can't hold a late free foot or a long lying phase; `local` closes it at ~10-25x less float cost than a blanket heightfix). |
 | Faster batch (no video) | `RENDER=0`. |
 | Contact flicker on a noisy clip | `--contact-min-run`↑ / `PLANT_MIN_RUN`↑ (frame counts). |
 
