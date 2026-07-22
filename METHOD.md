@@ -752,10 +752,35 @@ Only floor/worldbody geoms (`bodyid = 0`) and non-colliding geoms are excluded. 
   the feet but the per-frame shift wanders on get-ups (= bobbing in a fixed world frame).
 - **`constant`**: a single `Δ = −percentile_p(z_min(t))` over **any** geom — zero wander, but
   grounds on whatever is globally lowest (early hands/knees on a get-up → the final feet float,
-  +9.8 cm on standup_02). Superseded by `constant-contact`.
+  +9.8 cm on standup_02). At `p = 0` this is a **heightfix**: the shift guarantees zero
+  penetration everywhere in the clip (sized to its single worst frame), at the cost of floating
+  every other frame by that same fixed amount. Superseded by `constant-contact` as the shipped
+  default, but see the design note below.
+- **`hybrid`** (branch `p0-grounding`): `constant-contact`'s base shift, plus a per-frame
+  non-negative lift solved as a banded QP (`min ||x−need||² + smooth·‖D²x‖²` s.t. `0 ≤ x ≤ cap`,
+  `need` = post-shift penetration depth, `cap` = a still-planted foot's own penetration +
+  tolerance, so a plant is never lifted off the floor). Real improvement over `constant-contact`
+  alone (never worse) but does not close the gap on the worst clips: when the deepest-penetrating
+  body part at a frame is different from the nearby still-planted foot that bounds the lift, the
+  plant's tiny cap starves the correction the other part needs. Same structural "two body parts
+  disagree within one frame" limit as the single-shift modes, just moved to per-frame
+  granularity — closing it needs per-limb correction, not a scalar lift. Full derivation and
+  measured residuals: `wiki/concepts/grounding.md`.
 
 `qpos[:,2] ← qpos[:,2] + Δ`. The pre-grounding trajectory is kept as `qpos_ungrounded`;
 `ground_shift`, `ground_lowest_before/after` are saved.
+
+**Design decision (2026-07-22): penetration is worse than float.** Between a shift that leaves
+some penetration and one that guarantees zero penetration but floats more, prefer the latter —
+penetration is a physically impossible state for a training sim, float is a quality cost, not a
+correctness one. Concretely this means a `constant`-mode heightfix (`p = 0`) is the safety net of
+choice when `constant-contact`/`hybrid` leave any residual, accepting whatever float cost results.
+Quantified on the two Luigi clips (`wiki/concepts/grounding.md` has the full table and a caveat
+about the shift sometimes floating the clip's functionally-important standing phase to fix a
+brief lying-phase violation): heightfix costs 9.6cm/16.7cm average planted-foot float on
+`luigi_standProne_03`/`luigi_standSupine_08` respectively, versus 3.5cm on a locomotion-style clip
+(`shovel_fronthard_02`) — the cost scales with how bad the pre-existing `constant-contact`
+penetration already was on that clip.
 
 *(A separate `post_process_grounding_contacts.py` produces the Mimic-ready
 `contact_labels (T,11)` over 11 bodies — feet, shins, thighs, pelvis, torso, head, both
@@ -773,6 +798,13 @@ the shipped `STRIDE = 1` that is `120 / 1 = 120` Hz, so with **no `--fps`** the 
 native 120 Hz with no resample (`--fps X` would resample to `X`). The downstream
 `json_to_npz --output_fps 50` performs the only downsample (§6.4). The pipeline writes
 `outputs/ihmcJsons-native120hz/<clip>.json`.
+
+**Key schema (updated 2026-07-22)**: the inner DDS message keys are camelCase
+(`desiredJointAngles`, `desiredRootPosition`, etc.) and the inner DDS type string is
+`us::ihmc::robotDataLogger::KinematicsToolboxOutputStatus`, matching a Java-side rebuild of the
+DDS bindings. Full before/after key list and which fields are verified vs. inferred:
+`wiki/concepts/ihmc-export.md`. JSON exported before this change is stale against the current
+`json_to_npz.py` and will not parse there.
 
 ---
 

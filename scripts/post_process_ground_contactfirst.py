@@ -7,6 +7,22 @@ the v2 model uses convex-hull meshes on the fists/limbs), and shifts the free
 root Z so the clip rests on the ground plane z=0.
 
 Modes:
+  local     — per-frame envelope, ported 2026-07-22 from the G1/gmr-baseline
+            pipeline's `sprint_s8_t6_localground.py` (validated there at 77-clip
+            corpus scale: floorPen=0 guaranteed, joint_ok_pct IMPROVED rather than
+            merely survived, jerk/vMax/spikes bit-identical to the pre-grounding
+            baseline). Construction: (1) required[t] = max(0, -lowest_z[t]) — the
+            exact shift frame t alone would need; (2) widen each spike into a
+            plateau with a causal-symmetric maximum filter (never DECREASES a
+            value, so this step alone can't undershoot); (3) Gaussian-smooth the
+            plateau's corners (CAN pull values below the local max — smoothing
+            alone does not guarantee the invariant); (4) envelope =
+            max(smoothed, required) pointwise, restoring the guarantee at the
+            rare points step 3 undershot. After this, envelope[t] >= required[t]
+            everywhere, so floorPen=0 is algebraic, not empirical. Unlike hybrid
+            below, there is NO per-plant cap — frames far from any actual
+            penetration event get exactly zero shift (untouched), rather than
+            being floated to satisfy a clip-wide or QP-capped constraint.
   hybrid    — constant-contact base shift + a smooth NON-NEGATIVE per-frame lift
             solved as a small banded QP. The lift raises frames whose whole-body
             lowest point is below the floor (the between-phase sink: a get-up's
@@ -15,7 +31,11 @@ Modes:
             cap keeps every STILL-PLANTED foot pinned to the floor (it may only
             lift as far as that foot's own penetration + --lift-float-tol, so
             plants never float). Smoothness term prevents bobbing/spikes; lift is
-            0 wherever the base shift already clears the floor.
+            0 wherever the base shift already clears the floor. The per-plant cap
+            is exactly why this mode can fail to close the gap on the worst clips
+            (Discussion: a nearby still-planted foot's few-mm cap can block
+            lifting an unrelated, deeply-penetrating body part in the same
+            frame) — `local` above does not have this failure mode.
   constant-contact — ONE shift for the whole clip, but the floor is
             registered to the PLANTED FEET (sole-corner sites on frames where a
             foot is contact-labelled), not the global lowest geom. Fixes the two
@@ -27,7 +47,9 @@ Modes:
   constant  — ONE shift for the whole clip: floor = a low percentile of per-frame
             lowest-Z (ANY geom); shift all frames by -floor. Preserves every bit of
             vertical motion, never adds jitter, but grounds on whatever is lowest —
-            wrong reference during get-ups (see above).
+            wrong reference during get-ups (see above). At --percentile 0 this is
+            the "heightfix": guarantees zero penetration everywhere at the cost of
+            floating every OTHER frame by the clip's single worst violation.
   perframe  — shift each frame so its lowest point sits exactly at 0 (full
             plant, both up and down). Optional --smooth-shift to de-jitter. Plants
             the feet but the per-frame shift wanders (~7-9 cm on get-ups) = bobbing
@@ -48,6 +70,7 @@ from pathlib import Path
 
 import mujoco
 import numpy as np
+from scipy.ndimage import gaussian_filter1d, maximum_filter1d
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MODEL_DEFAULT = REPO_ROOT / "assets/alex/alex_floating_base_with_sites.xml"
@@ -201,6 +224,18 @@ def _robot_lowest_z(model, data, mesh_cache, geom_ids):
     return min(_geom_lowest_z(g, model, data, mesh_cache) for g in geom_ids)
 
 
+def _envelope(required, fps, ramp_half_sec, ramp_sigma_sec):
+    """Widen -> smooth -> pointwise-max-restore. Ported 2026-07-22 from
+    scripts/g1/sprint_s8_t6_localground.py (gmr-baseline branch), unchanged in
+    construction — only the caller-supplied `required` array (this pipeline's own
+    _robot_lowest_z-based per-frame need) differs by robot."""
+    half = max(1, round(ramp_half_sec * fps))
+    sigma = max(0.5, ramp_sigma_sec * fps)
+    widened = maximum_filter1d(required, size=2 * half + 1, mode="nearest")
+    smoothed = gaussian_filter1d(widened, sigma=sigma, mode="nearest")
+    return np.maximum(smoothed, required)
+
+
 def _smooth1d(x, w):
     """Tridiagonal (implicit) smoothing: (I + w L) y = x. Endpoints natural."""
     n = len(x)
@@ -234,7 +269,7 @@ def main():
     ap.add_argument("--npz", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--model", type=Path, default=MODEL_DEFAULT)
-    ap.add_argument("--mode", choices=["hybrid", "constant-contact", "constant", "perframe"],
+    ap.add_argument("--mode", choices=["local", "hybrid", "constant-contact", "constant", "perframe"],
                     default="constant-contact")
     ap.add_argument("--percentile", type=float, default=1.0,
                     help="constant mode: floor = this percentile of per-frame lowest-Z. Low (1) so "
@@ -253,6 +288,12 @@ def main():
     ap.add_argument("--lift-float-tol", type=float, default=0.005,
                     help="hybrid mode: a still-planted foot may be lifted at most its own "
                          "penetration + this (m) — bounds plant float introduced by the lift.")
+    ap.add_argument("--local-ramp-half-sec", type=float, default=0.15,
+                    help="local mode: maximum-filter half-width (s) — widens each penetration "
+                         "spike into a plateau before smoothing. Matches the G1 T6 default.")
+    ap.add_argument("--local-ramp-sigma-sec", type=float, default=0.07,
+                    help="local mode: Gaussian sigma (s) rounding the plateau's corners. Matches "
+                         "the G1 T6 default.")
     ap.add_argument("--still-speed", type=float, default=0.05,
                     help="constant-contact: a contact-labelled foot only anchors the floor registration "
                          "on frames where its body moves slower than this (m/s) — the STILL-plant "
@@ -281,12 +322,19 @@ def main():
 
     floor_src = "lowest-geom"
     lift = None
-    if args.mode in ("hybrid", "constant-contact"):
+    gfps = float(data_dict["fps"]) if "fps" in data_dict else 120.0
+    if args.mode in ("local", "hybrid", "constant-contact"):
+        # All three share the same constant-contact BASE shift (corrects the large,
+        # systematic pre-grounding offset — e.g. Alex's world-origin rest-alignment
+        # artifact, ~0.6-0.9m — that has nothing to do with local per-frame
+        # violations). `local` and `hybrid` then each apply a different per-frame
+        # TOP-UP on the residual; `local`/`hybrid` alone (without this base shift)
+        # would spend their whole per-frame budget re-deriving that constant offset
+        # instead of fixing the actual between-phase residual.
         eff_names = [str(x) for x in data_dict["contact_effector_names"]] \
             if "contact_effector_names" in data_dict else []
         cflags = np.asarray(data_dict["contact_flags"], dtype=bool) \
             if "contact_flags" in data_dict else None
-        gfps = float(data_dict["fps"]) if "fps" in data_dict else 120.0
         plant_data = _foot_plant_frames(model, data, qpos, cflags, eff_names,
                                         fps=gfps, still_speed=args.still_speed)
         samples = _planted_foot_sole_samples(plant_data)
@@ -299,7 +347,11 @@ def main():
             floor = float(np.percentile(lowest, args.percentile))
         shift = np.full(N, -floor)
 
-        if args.mode == "hybrid":
+        if args.mode == "local":
+            required = np.maximum(0.0, -(lowest + shift))
+            lift = _envelope(required, gfps, args.local_ramp_half_sec, args.local_ramp_sigma_sec)
+            shift = shift + lift
+        elif args.mode == "hybrid":
             need = np.maximum(0.0, -(lowest + shift))
             cap = np.full(N, np.inf)
             for d in plant_data.values():
@@ -316,16 +368,31 @@ def main():
         if args.smooth_shift > 0:
             shift = _smooth1d(shift, args.smooth_shift)
 
+    # Final safety-net top-up (always applied, every mode, 2026-07-22): penetration is
+    # worse than float, so whatever residual any mode above leaves — algebraic
+    # guarantees can still miss real residual from geom-set/tolerance mismatches with
+    # downstream eval, and modes like constant-contact/hybrid/perframe make no
+    # guarantee at all — gets closed here by one more constant clip-wide shift sized
+    # to the single worst remaining frame. Cheap when the mode above already did most
+    # of the work (a few mm-cm top-up, e.g. after `local`), expensive only when it
+    # ends up doing all the work itself (e.g. after `perframe` with no prior mode).
+    grounded_lowest = lowest + shift
+    worst_residual = float(grounded_lowest.min())
+    topup = max(0.0, -worst_residual)
+    if topup > 0:
+        shift = shift + topup
+        grounded_lowest = grounded_lowest + topup
+
     qpos_grounded = qpos.copy()
     qpos_grounded[:, 2] += shift
 
-    grounded_lowest = lowest + shift
     data_dict["qpos_ungrounded"] = qpos
     data_dict["qpos"] = qpos_grounded
     data_dict["ground_shift"] = shift
     data_dict["ground_mode"] = args.mode
     data_dict["ground_lowest_before"] = lowest
     data_dict["ground_lowest_after"] = grounded_lowest
+    data_dict["ground_final_topup_m"] = topup
     if lift is not None:
         data_dict["ground_lift"] = lift
 
@@ -334,7 +401,12 @@ def main():
 
     print(f"[ground] {args.npz.name}  N={N}  mode={args.mode}")
     print(f"  lowest-Z before: min={lowest.min():+.4f} med={np.median(lowest):+.4f} max={lowest.max():+.4f}")
-    if args.mode == "hybrid":
+    if args.mode == "local":
+        touched = (lift > 1e-4).mean() * 100
+        print(f"  floor({floor_src})={floor:+.4f}  base shift={-floor:+.4f} m")
+        print(f"  envelope lift: max={lift.max():+.4f} m  frames touched: {touched:.1f}%  "
+              f"(ramp_half={args.local_ramp_half_sec}s sigma={args.local_ramp_sigma_sec}s)")
+    elif args.mode == "hybrid":
         gfps_v = float(data_dict["fps"]) if "fps" in data_dict else 120.0
         peak_v = float(np.max(np.abs(np.diff(lift)))) * gfps_v if N > 1 else 0.0
         print(f"  floor({floor_src})={floor:+.4f}  base shift={-floor:+.4f} m")
@@ -344,6 +416,9 @@ def main():
         print(f"  floor({floor_src})={floor:+.4f}  constant shift={shift[0]:+.4f} m")
     else:
         print(f"  perframe shift: min={shift.min():+.4f} max={shift.max():+.4f} smooth={args.smooth_shift}")
+    if topup > 0:
+        print(f"  final safety-net top-up: +{topup:.4f} m (mode's own result still had "
+              f"{worst_residual:+.4f} m residual — always applied, penetration worse than float)")
     print(f"  lowest-Z after : min={grounded_lowest.min():+.4f} med={np.median(grounded_lowest):+.4f}")
     print(f"  -> {args.out}")
 

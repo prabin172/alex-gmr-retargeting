@@ -10,7 +10,7 @@ import numpy as np
 
 
 MAIN_KEY = "toolbox_msgs.msg.dds.KinematicsToolboxOutputStatus"
-INNER_KEY = "toolbox_msgs::msg::dds_::KinematicsToolboxOutputStatus_"
+INNER_KEY = "us::ihmc::robotDataLogger::KinematicsToolboxOutputStatus"
 
 ISAAC_JOINT_NAMES_FULLBODY = [
     "LEFT_HIP_X",
@@ -411,27 +411,27 @@ def main():
     messages = []
     for i in range(qpos.shape[0]):
         status = {
-            "sequence_id": int(i),
-            "current_toolbox_state": 3,
-            "joint_name_hash": -1087810655,
-            "desired_joint_angles": [float(x) for x in isaac_joint_pos[i]],
-            "desired_root_position": vec3(root_pos[i]),
-            "desired_root_orientation": quat_xyzw_from_wxyz(root_quat_wxyz[i]),
-            "desired_joint_velocities": [float(x) for x in joint_vel[i]],
-            "desired_root_linear_velocity": vec3(root_lin_vel[i]),
-            "desired_root_angular_velocity": vec3(root_ang_vel[i]),
-            "support_region": [],
-            "desired_joint_velocities_publishing_period": [float(x) for x in joint_vel[i]],
-            "desired_root_linear_velocity_publishing_period": vec3(root_lin_vel[i]),
-            "desired_root_angular_velocity_publishing_period": vec3(root_ang_vel[i]),
-            "desired_torso_position": vec3(root_pos[i]),
-            "desired_torso_orientation": quat_xyzw_from_wxyz(root_quat_wxyz[i]),
-            "com_offset": float(args.com_offset),
-            "left_foot_in_contact": bool(left_foot[i]),
-            "right_foot_in_contact": bool(right_foot[i]),
-            "left_hand_in_contact": bool(left_hand[i]),
-            "right_hand_in_contact": bool(right_hand[i]),
-            "solution_quality": float(solution_quality[i]),
+            "sequenceId": int(i),
+            "currentToolboxState": 3,
+            "jointNameHash": -1087810655,
+            "desiredJointAngles": [float(x) for x in isaac_joint_pos[i]],
+            "desiredRootPosition": vec3(root_pos[i]),
+            "desiredRootOrientation": quat_xyzw_from_wxyz(root_quat_wxyz[i]),
+            "desiredJointVelocities": [float(x) for x in joint_vel[i]],
+            "desiredRootLinearVelocity": vec3(root_lin_vel[i]),
+            "desiredRootAngularVelocity": vec3(root_ang_vel[i]),
+            "supportRegion": [],
+            "desiredJointVelocitiesPublishingPeriod": [float(x) for x in joint_vel[i]],
+            "desiredRootLinearVelocityPublishingPeriod": vec3(root_lin_vel[i]),
+            "desiredRootAngularVelocityPublishingPeriod": vec3(root_ang_vel[i]),
+            "desiredTorsoPosition": vec3(root_pos[i]),
+            "desiredTorsoOrientation": quat_xyzw_from_wxyz(root_quat_wxyz[i]),
+            "comOffset": float(args.com_offset),
+            "leftFootInContact": bool(left_foot[i]),
+            "rightFootInContact": bool(right_foot[i]),
+            "leftHandInContact": bool(left_hand[i]),
+            "rightHandInContact": bool(right_hand[i]),
+            "solutionQuality": float(solution_quality[i]),
         }
         messages.append(json.dumps({INNER_KEY: status}, separators=(",", ":")))
 

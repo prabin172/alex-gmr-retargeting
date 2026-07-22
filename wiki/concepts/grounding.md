@@ -54,3 +54,40 @@ limit M5's `refine_limbs_contactfirst.py` (phasic-v2 branch) already hit on whol
 better on average) but should not be presented as solving the between-phase/swing-clip gap.
 
 > The Mimic-ready `contact_labels (T,11)` export (11 bodies, 2 cm threshold) lives in `scripts/legacy/post_process_grounding_contacts.py` — built for the RETIRED pipeline, not yet wired into the contact-first path. See [[open-questions]].
+
+### Design decision (2026-07-22): penetration is worse than float
+
+Prabin's call: between a clip that floats and a clip that penetrates, floating is the
+acceptable failure mode — penetration is a physically impossible state for the training sim,
+floating is merely a visual/tracking-quality cost. This settles which side of the trade-off
+`--mode constant` (§ above) and the still-open `hybrid` residual (below) should land on when in
+doubt: prefer a larger, guaranteed-safe shift over a smaller one that leaves any penetration.
+
+**Heightfix, quantified on the two Luigi clips** (`--mode constant --percentile 0` — i.e. the
+whole-clip shift sized to the single deepest-penetrating frame in the clip, over ANY geom, run
+directly on the pre-grounding Stage-4 output): guarantees zero penetration everywhere, by
+construction, at the cost of planted-foot float during the *rest* of the clip.
+
+| clip | shipped default (`constant-contact`) | heightfix (`constant`, p0) |
+|---|---|---|
+| `luigi_standProne_03` | plantPen 0.6cm/13.0%, anyPen 10.1cm/25.7%, float 0.4cm | plantPen 0.0/0.0%, anyPen 0.6cm/0.6%, **float 9.6cm** |
+| `luigi_standSupine_08` | plantPen 0.8cm/2.1%, anyPen 14.0cm/67.1%, float 0.4cm | plantPen 0.0/0.0%, anyPen 0.0/0.0%, **float 16.7cm** |
+
+(For scale: the same method on `shovel_fronthard_02` cost only 3.5cm float — see `wiki/log.md`
+2026-07-22. Luigi's cost is much larger because the shipped default's `anyPen` is already severe
+on both clips — 10–14cm, up to 67% of frames on `standSupine_08` — reflecting the pre-existing
+between-phase diagnosis above: the lying phase sits well below the standing-phase floor
+reference the `constant-contact` shift is keyed to.)
+
+**Important nuance, specific to these two clips, before treating 9.6/16.7cm as a settled
+number**: the heightfix shift is sized to fix the clip's single WORST frame, which on both Luigi
+clips is a brief moment in the lying/prone phase — not the standing phase, which is the
+functionally important part of an assistive-device/teleop demo (most of the clip's duration and
+the part a viewer/mentor will actually judge). A blanket heightfix floats the *important* phase
+to fix the *brief* one. This is exactly the case the "principled general fix (unbuilt)" above
+(register to the highest-root-z/standing window specifically, `--contact-percentile` ~70 for
+get-ups) was designed for — worth trying before committing to blanket heightfix as the shipped
+default for Luigi-style clips specifically, since it would likely recover most of that float cost
+during standing at the price of accepting the (already off-floor, non-weight-bearing) lying phase
+staying imperfect. Not re-tested this session; flagged as the next thing to try if 9.6/16.7cm
+float during standing looks wrong on render.
