@@ -91,3 +91,70 @@ default for Luigi-style clips specifically, since it would likely recover most o
 during standing at the price of accepting the (already off-floor, non-weight-bearing) lying phase
 staying imperfect. Not re-tested this session; flagged as the next thing to try if 9.6/16.7cm
 float during standing looks wrong on render.
+
+**This nuance turned out to already be solved — `local` mode below, built the same session, is
+exactly that "principled general fix," just per-frame rather than a single percentile choice.**
+
+### `local` mode (2026-07-22): ported from G1, ships the standing-vs-lying trade-off for free
+
+Direct port of `scripts/g1/sprint_s8_t6_localground.py` (branch `gmr-baseline`, validated there at
+77-clip corpus scale: floor penetration eliminated by construction, `joint_ok_pct` IMPROVED
+rather than merely survived, jerk/vMax/spikes bit-identical to the pre-grounding baseline). The
+underlying mesh-exact `_build_mesh_cache`/`_robot_lowest_z` functions are byte-identical between
+the two branches' `post_process_ground_contactfirst.py`, so the port is a new mode in the same
+file, not a rewrite: `_envelope()` — (1) `required[t] = max(0, -lowest_z[t])`, the exact shift
+frame `t` alone would need; (2) widen each spike into a plateau with a maximum filter (can only
+increase values, never undershoots); (3) Gaussian-smooth the plateau's corners (can pull values
+below the local max — this step alone does not guarantee the invariant); (4)
+`envelope = max(smoothed, required)` pointwise, restoring the guarantee wherever step 3
+undershot. `envelope[t] >= required[t]` everywhere by construction, so zero penetration is
+algebraic there, not empirical — and because it's local, frames far from any actual violation get
+exactly zero shift, unlike a clip-wide constant.
+
+**One porting correction, found by testing, not assumed**: applying `_envelope()` directly to the
+RAW pre-grounding `lowest` array (as a standalone replacement for the other modes, mirroring how
+T6 runs on G1) gave "100% of frames touched" — because Alex's raw Stage-4 output sits below z=0
+*everywhere* by construction (the world-origin rest-alignment artifact, ~0.6–0.9m constant
+offset; see [[globalopt]]), unlike G1's GMR-based output which already tracks absolute human
+height and only deviates locally. `local` mode is therefore structured like `hybrid`: the same
+`constant-contact` BASE shift first (corrects the systematic offset), then `_envelope()` as a
+per-frame TOP-UP on the *residual* need after that base shift — this is what makes the local
+property (untouched frames stay untouched) actually show up in the result.
+
+**Real numbers, both Luigi clips** (`--mode local`, defaults `--local-ramp-half-sec 0.15
+--local-ramp-sigma-sec 0.07`, matching G1's T6):
+
+| clip | shipped default | heightfix (blanket) | **local** |
+|---|---|---|---|
+| `luigi_standProne_03` | anyPen 10.1cm/25.7%, float 0.4cm | anyPen 0.6cm/0.6%, float 9.6cm | anyPen 0.7cm/1.7%, **float 0.7cm** |
+| `luigi_standSupine_08` | anyPen 14.0cm/67.1%, float 0.4cm | anyPen 0.0/0.0%, float 16.7cm | anyPen 0.5cm/0.3%, **float 0.7cm** |
+
+Float cost drops from 9.6/16.7cm (heightfix) to 0.7cm on both — a ~14–24x reduction — while
+`plantPen` stays exactly 0.0 on both. `standSupine_08`'s lying phase is 757 of 1163 frames (65%
+of the clip), so "100% of frames get some non-zero envelope" is expected and not a red flag: it
+just means the *amount* is calibrated per-frame rather than blanket, so the standing phase (the
+part that matters) settles near its own natural low value instead of being dragged up by the
+clip's single worst moment. Joint limits, self-collision, and slip are byte-identical to the
+shipped default (grounding only ever modifies root Z). Frame-to-frame root-position jump checked
+directly on the final output: max 0.83cm (`standProne_03`) / 0.90cm (`standSupine_08`), of which
+the grounding envelope itself contributes at most ~0.28cm — the rest is the underlying solve's
+own root motion, not a grounding-introduced artifact.
+
+**Known residual, not yet closed**: `eval_artifacts_corpus.py` still reports a small `anyPen`
+(0.5–0.7cm) after `local` mode + the final top-up (below) report exactly zero residual by this
+script's own `_robot_lowest_z`/`geom_ids` definition. The two tools disagree slightly on which
+collision geoms count — a real, small (sub-cm) cross-tool inconsistency, not investigated further
+this session. Worth reconciling the two geom-set definitions before treating either as ground
+truth for a corpus-scale report.
+
+### Final safety-net top-up (2026-07-22): always applied, every mode
+
+Direct consequence of the "penetration is worse than float" decision above: after whichever mode
+computes its shift, `post_process_ground_contactfirst.py` now unconditionally checks the
+resulting `lowest + shift` and, if anything is still negative, adds one more constant clip-wide
+shift sized to the single worst remaining frame — closing the gap `hybrid`'s per-plant cap or any
+other mode's own guarantee (or lack of one) might have left open. `constant`/`local` are already
+usually at (or very near) zero going in, so this is typically a no-op or a few-mm top-up; a mode
+with no guarantee at all (e.g. `perframe`, or `constant-contact` alone) would have this stage do
+the bulk of the work instead. Saved as `ground_final_topup_m` in the output NPZ for transparency.
+Not a substitute for choosing a good primary mode — a cheap, mandatory backstop on top of one.

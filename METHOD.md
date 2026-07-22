@@ -734,7 +734,7 @@ needed). Primitives use closed-form lowest-extent formulas rather than bounding 
 - Box: `center_z − |R_{20}|h_x − |R_{21}|h_y − |R_{22}|h_z` (support function).
 - Cylinder: `min(center_z ± axis_z·half_len) − r·√(1 − axis_z²)`.
 
-Only floor/worldbody geoms (`bodyid = 0`) and non-colliding geoms are excluded. Three modes:
+Only floor/worldbody geoms (`bodyid = 0`) and non-colliding geoms are excluded. Five modes:
 
 - **`constant-contact`** (shipped default): a **single** `Δ` for the whole clip, registered to
   the **planted feet** rather than the global-lowest geom. Sample each foot's min sole-corner Z
@@ -766,6 +766,17 @@ Only floor/worldbody geoms (`bodyid = 0`) and non-colliding geoms are excluded. 
   disagree within one frame" limit as the single-shift modes, just moved to per-frame
   granularity — closing it needs per-limb correction, not a scalar lift. Full derivation and
   measured residuals: `wiki/concepts/grounding.md`.
+- **`local`** (branch `p0-grounding`, ported 2026-07-22 from the G1/`gmr-baseline` pipeline's
+  `sprint_s8_t6_localground.py`, validated there at 77-clip corpus scale): `constant-contact`'s
+  base shift, plus a per-frame envelope top-up with no cap at all — `required[t] = max(0,
+  -\text{residual}(t))`, widened into a plateau by a maximum filter (can only increase values),
+  Gaussian-smoothed, then `\max(\text{smoothed}, \text{required})` pointwise to restore the
+  zero-penetration guarantee wherever smoothing undershot. Frames far from any actual violation
+  get exactly zero top-up — no clip-wide or per-plant floor is imposed on them. On the two Luigi
+  clips this reduces the average planted-foot float from heightfix's 9.6/16.7 cm to **0.7 cm on
+  both**, a ~14–24× reduction, at zero cost to joint limits, self-collision, or slip (grounding
+  only ever touches root Z). Full derivation, the porting correction needed for Alex's larger
+  systematic pre-grounding offset, and the residual cross-tool discrepancy: `wiki/concepts/grounding.md`.
 
 `qpos[:,2] ← qpos[:,2] + Δ`. The pre-grounding trajectory is kept as `qpos_ungrounded`;
 `ground_shift`, `ground_lowest_before/after` are saved.
@@ -773,14 +784,20 @@ Only floor/worldbody geoms (`bodyid = 0`) and non-colliding geoms are excluded. 
 **Design decision (2026-07-22): penetration is worse than float.** Between a shift that leaves
 some penetration and one that guarantees zero penetration but floats more, prefer the latter —
 penetration is a physically impossible state for a training sim, float is a quality cost, not a
-correctness one. Concretely this means a `constant`-mode heightfix (`p = 0`) is the safety net of
-choice when `constant-contact`/`hybrid` leave any residual, accepting whatever float cost results.
-Quantified on the two Luigi clips (`wiki/concepts/grounding.md` has the full table and a caveat
-about the shift sometimes floating the clip's functionally-important standing phase to fix a
-brief lying-phase violation): heightfix costs 9.6cm/16.7cm average planted-foot float on
-`luigi_standProne_03`/`luigi_standSupine_08` respectively, versus 3.5cm on a locomotion-style clip
-(`shovel_fronthard_02`) — the cost scales with how bad the pre-existing `constant-contact`
-penetration already was on that clip.
+correctness one. This does not mean "always take the biggest safety-net shift and accept whatever
+float results" — on the two Luigi clips, `local` mode gets the zero-penetration guarantee at 0.7cm
+average float, versus a blanket heightfix's 9.6/16.7cm, by only floating the frames that actually
+need it rather than the whole clip. Prefer `local` over blanket heightfix where available; the
+"penetration worse than float" rule decides the remaining, unavoidable trade-offs (e.g. any
+residual `hybrid`'s cap or an unguaranteed mode leaves behind), not the primary design choice.
+
+**Final safety-net top-up (2026-07-22, always applied, every mode)**: after whichever mode above
+computes its shift, one more check — if `lowest + shift` is still negative anywhere, add a single
+constant clip-wide top-up sized to the worst remaining frame. Unconditional, mode-agnostic, and
+typically a no-op or a few-mm correction after `constant`/`local` (which are already at or near
+zero); it exists to guarantee the invariant even for modes with no such guarantee on their own
+(`perframe`, `constant-contact` alone), or where a mode's own guarantee has a gap (`hybrid`'s
+per-plant cap). Saved as `ground_final_topup_m`.
 
 *(A separate `post_process_grounding_contacts.py` produces the Mimic-ready
 `contact_labels (T,11)` over 11 bodies — feet, shins, thighs, pelvis, torso, head, both
