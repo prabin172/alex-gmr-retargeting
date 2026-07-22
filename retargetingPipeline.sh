@@ -4,9 +4,9 @@
 #   Stage 2.5  canonical-human grounding + persisted contact labels (phasic-v2
 #              M1: floor = z=0 by construction upstream, one detector shared by
 #              every downstream stage instead of each re-estimating its own;
-#              always recomputed, never skip-if-exists -- see planLog.md M1 for
-#              why: Stage 3's skip-if-exists caused a stale-cache confound
-#              during this milestone's own gate testing)
+#              always recomputed, never skip-if-exists -- Stage 3's skip-if-exists
+#              caused a stale-cache confound during this milestone's own gate
+#              testing; full trail: branch phasic-v2's planLog.md, section M1)
 #   Stage 3    contact-first IK  (skipped if the NPZ already exists)
 #   Stage 4    GlobalOPT Stage-A smoothing (spikes->0, collisions down)
 #   Stage 4.5  Z-grounding (plant lowest contact point on the floor z=0)
@@ -76,18 +76,17 @@ COPLANAR_FEET_MODE="${COPLANAR_FEET_MODE:-mean}"
 # Stage-3 fullmesh robot-vs-floor repulsion. This is the proper upstream fix
 # path for swing feet / hands below the floor: Stage 3 can move the root, unlike
 # Stage 4's joint-only collision cleanup. MILD DEFAULT ON (phasic-v2 M2/T2.2,
-# 2026-07-10): plan.md's own Risks section anticipated needing this fallback
-# ("re-enable mild Stage-3 repulsion (weight ~5) default-on WITH ramp") after
-# T2.1's target-only correction alone proved insufficient for
-# luigi_standProne_03 (tested: zero Stage-3 floor flags -> Stage-4 output
-# regresses to 14.29cm pen + 3 spikes, vs. the historical 2.4cm/0 spikes -- see
-# planLog.md M2). The "ramp" is `--floor-refine` (already default ON, see
-# below) -- proven-safe, unchanged mechanism, just no longer gated behind a
-# per-clip flag. Weight tuned 5->10 (5 left 3-4 residual spikes on
+# 2026-07-10): anticipated needing this fallback ("re-enable mild Stage-3
+# repulsion (weight ~5) default-on WITH ramp") after target-only correction
+# alone proved insufficient for luigi_standProne_03 (tested: zero Stage-3 floor
+# flags -> Stage-4 output regresses to 14.29cm pen + 3 spikes, vs. the
+# historical 2.4cm/0 spikes). The "ramp" is `--floor-refine` (already default
+# ON, see below) -- proven-safe, unchanged mechanism, just no longer gated
+# behind a per-clip flag. Weight tuned 5->10 (5 left 3-4 residual spikes on
 # luigi_standProne_03; 10 reaches 0). NOT fully "ONE config yet": both Luigi
 # clips still carry ONE small non-floor per-clip flag (contact-preroll /
-# floor-phase-aware respectively) -- see their CLIPS[] entries and
-# planLog.md M2 T2.2-continued for what remains open.
+# floor-phase-aware respectively) -- see their CLIPS[] entries. Full milestone
+# trail (M1-M6, H1-H2): branch phasic-v2's planLog.md.
 S3_FLOOR_WEIGHT="${S3_FLOOR_WEIGHT:-10}"
 S3_FLOOR_MARGIN="${S3_FLOOR_MARGIN:-0}"
 S3_FLOOR_GAIN="${S3_FLOOR_GAIN:-5}"
@@ -99,7 +98,8 @@ S3_FLOOR_GAIN="${S3_FLOOR_GAIN:-5}"
 # retired-approaches.md) NOR floor non-penetration (CONFIRMED BROKEN if
 # combined with this tier -- a 44-metre divergence on standup_natural_01,
 # see solve_fbx_canonical_alex_contactfirst.py's --floor-hard help text and
-# planLog.md H2 -- floor stays soft/rows2 regardless of this flag). Default
+# branch phasic-v2's planLog.md section H2 -- floor stays soft/rows2 regardless
+# of this flag). Default
 # OFF, verified byte-identical no-op via two consecutive off-runs, and
 # verified non-blowup on standup_natural_01 (the exact clip the original
 # --hierarchical regression named) when on.
@@ -140,13 +140,13 @@ FLOOR_MODE="${FLOOR_MODE:-estimate}"      # estimate (lower foot's ground) | zer
 # self-collision soft-slack QP machinery against it. Unlike FLOOR_WEIGHT (soft
 # pin, planted feet only), this stops ANY fullmesh geometry — swing feet,
 # hands, a tilted toe mid-get-up — from passing through the floor. on|off.
-FLOOR_COLLISION="${FLOOR_COLLISION:-off}"   # validated on 1 clip only so far — opt-in pending corpus validation, see collision.md
+FLOOR_COLLISION="${FLOOR_COLLISION:-off}"   # validated on 1 clip only so far — opt-in pending corpus validation, see wiki/concepts/globalopt.md
 # Foot-scoped Stage-A floor-sensitivity threshold (default = SENS_MIN_PEN, i.e.
 # no-op/inert): lowers protection threshold ONLY for leg/foot floor contacts
 # (and only boosts leg/ankle joint columns) so Stage A's tridiagonal smoothing
 # doesn't drag an unprotected, borderline swing-foot dig into a much deeper one
 # -- root cause of the get-up-class swing-foot floor penetration (see
-# wiki/results/tradeoffs-limits.md and planLog.md). Opt-in pending corpus test.
+# wiki/results/tradeoffs-limits.md). Opt-in pending corpus test.
 SENS_MIN_PEN="${SENS_MIN_PEN:-0.015}"
 SENS_FOOT_MIN_PEN="${SENS_FOOT_MIN_PEN:-0.015}"
 RENDER_EXTRA="${RENDER_EXTRA:-}"          # extra render flags, e.g. "--fixed-cam"
@@ -179,7 +179,8 @@ GR="${GR_DIR:-outputs/grounded_contactfirst}"
 # design (independently ablatable); consumes the grounded NPZ, output feeds
 # render/export in place of it when enabled. On already-clean Stage 4/4.5
 # output this is a verified near-no-op (0 spikes, RMS<=0.1cm on all 20 clips,
-# see planLog.md M4) — it only engages when a real violation exists.
+# see branch phasic-v2's planLog.md section M4) — it only engages when a real
+# violation exists.
 PHYSICS_PASS="${PHYSICS_PASS:-off}"        # on|off
 PH="${PHYSICS_DIR:-outputs/physics_plausibility}"
 # Stage 4.7 — per-limb cleanup solver (phasic-v2 M5, scripts/refine_limbs_contactfirst.py).
@@ -219,7 +220,7 @@ echo "Render mesh: $RENDER_MESH -> $RMODEL   |  ground: $GROUND_MODE (smooth=$GR
 # 5th (phasic-v2 M1): extra Stage-2.5 GROUNDING/detection flags -- e.g. a clip's
 # contact-detection onset-hysteresis tuning now lives here (Stage 3 consumes
 # PERSISTED labels, it no longer re-detects, so a detection-flag override has to
-# reach Stage 2.5, not Stage 3 -- see planLog.md M1/T1.3).
+# reach Stage 2.5, not Stage 3 -- see branch phasic-v2's planLog.md section M1/T1.3).
 # ALL EMPTY by design — one retargeter config for all actions; the fields exist for experiments only.
 CLIPS=(
   "standup_01|data/raw/inhouse/get_up_from_ground/fbx/standup_01.fbx|||"
@@ -282,8 +283,8 @@ for entry in "${CLIPS[@]}"; do
   # Stage 2.5 — canonical grounding + persisted contact labels (phasic-v2 M1).
   # ALWAYS recomputed (no skip-if-exists): cheap (pure numpy, no MuJoCo), and
   # Stage 3's skip-if-exists already caused a stale-cache confound during this
-  # milestone's own gate testing (see planLog.md M1/T1.1) -- not repeating that
-  # risk here for a step this fast.
+  # milestone's own gate testing (see branch phasic-v2's planLog.md section
+  # M1/T1.1) -- not repeating that risk here for a step this fast.
   echo "  [ground] canonical grounding ${ground_extra:+(extra: $ground_extra) }..."
   python scripts/ground_canonical_human.py \
     --in-npz "$src" --out-npz "$cg" \
